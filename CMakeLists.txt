@@ -1,4 +1,4 @@
-﻿cmake_minimum_required (VERSION 3.8)
+cmake_minimum_required (VERSION 3.24)
 
 # Enable Hot Reload for MSVC compilers if supported.
 if (POLICY CMP0141)
@@ -11,6 +11,13 @@ project(${PROJECT_NAME} VERSION 0.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+include(FetchBoost)
+include(FetchEigen)
+include(FetchSpdlog)
+include(FetchMagicEnum)
 
 add_executable(${PROJECT_NAME}
   "src/main.cc"
@@ -28,14 +35,12 @@ add_executable(${PROJECT_NAME}
   "src/utils/time_utils.hh"
 )
 
-find_package(Boost REQUIRED)
-find_package(Eigen3 REQUIRED)
-find_package(spdlog REQUIRED)
-find_package(magic_enum REQUIRED)
-
-target_link_libraries(${PROJECT_NAME} PRIVATE 
-	Boost::boost
-	Eigen3::Eigen
-	spdlog::spdlog_header_only
-	magic_enum::magic_enum
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    Boost::asio
+    Boost::pool
+    Boost::circular_buffer
+    Boost::program_options
+    Eigen3::Eigen
+    spdlog::spdlog_header_only
+    magic_enum::magic_enum
 )

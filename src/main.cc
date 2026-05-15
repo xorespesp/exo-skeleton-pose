@@ -1,6 +1,6 @@
 ﻿#include "core/pose_estimator.hh"
 
-#include <magic_enum.hpp>
+#include <magic_enum/magic_enum.hpp>
 
 #include <iostream>
 #include <signal.h>

@@ -3,6 +3,7 @@
 #include "ebrcv24g_proto.hh"
 
 #include <boost/asio/serial_port.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/pool/pool.hpp>
 #include <boost/pool/pool_alloc.hpp>
 
@@ -129,7 +130,7 @@ namespace core
 			if (!_session_stats.flag_session_alive) { return; }
 
 			auto self{ shared_from_this() };
-			_io_strand.dispatch(
+			boost::asio::dispatch(_io_strand,
 				[this, self, ec = ec]() {
 					LOG_INFO("close start.. (ec = %d)", ec.value());
 
@@ -178,7 +179,7 @@ namespace core
 		void init_device()
 		{
 			auto self{ shared_from_this() };
-			_io_strand.dispatch(
+			boost::asio::dispatch(_io_strand,
 				[this, self]() {
 					LOG_INFO("init device...");
 

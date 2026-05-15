@@ -9,8 +9,8 @@ __pragma(warning(disable:4127))
 __pragma(warning(disable:4819))
 // https://eigen.tuxfamily.org/index.php?title=Main_Page
 // https://eigen.tuxfamily.org/dox-devel/group__QuickRefPage.html
-#include <eigen3/Eigen/Dense>
-#include <eigen3/unsupported/Eigen/EulerAngles>
+#include <Eigen/Dense>
+#include <unsupported/Eigen/EulerAngles>
 __pragma(warning(pop))  // ^^^ Supress Eigen's internal warning C4127, C4819 ^^^
 
 namespace core::math

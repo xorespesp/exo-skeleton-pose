@@ -3,8 +3,8 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
-# Vcpkg
-/dependency/vcpkg_installed/
+# FetchContent download/build cache
+/dependency/
 
 # User-specific files
 *.rsuser

@@ -44,3 +44,57 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     spdlog::spdlog_header_only
     magic_enum::magic_enum
 )
+
+########################################################################################
+# Install
+########################################################################################
+
+include(GNUInstallDirs)
+
+# Default install prefix → <source>/install when caller didn't set one explicitly
+# (CMakePresets.json's installDir takes precedence over this fallback)
+if(DEFINED CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX
+        "${CMAKE_CURRENT_SOURCE_DIR}/install"
+        CACHE PATH "Install prefix" FORCE
+    )
+endif()
+message(STATUS "CMAKE_INSTALL_PREFIX: ${CMAKE_INSTALL_PREFIX}")
+
+# Install the executable
+install(TARGETS ${PROJECT_NAME}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install PDB next to the exe on MSVC for Debug / RelWithDebInfo builds
+if(MSVC)
+    install(FILES $<TARGET_PDB_FILE:${PROJECT_NAME}>
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        CONFIGURATIONS Debug RelWithDebInfo
+        OPTIONAL
+    )
+endif()
+
+# Bundle runtime DLLs that the exe depends on (no-op for fully-static deps).
+# Requires CMake 3.21+; this project already needs 3.24.
+install(TARGETS ${PROJECT_NAME}
+    RUNTIME_DEPENDENCY_SET ${PROJECT_NAME}_runtime_deps
+)
+install(RUNTIME_DEPENDENCY_SET ${PROJECT_NAME}_runtime_deps
+    PRE_EXCLUDE_REGEXES
+        [[api-ms-]] [[ext-ms-]]            # Windows API set DLLs
+    POST_EXCLUDE_REGEXES
+        [[.*[\\/]system32[\\/].*\.dll]]    # Windows system DLLs
+        [[^/(lib|usr/lib|usr/lib64)/.*]]   # Linux system libs
+    DIRECTORIES $<TARGET_FILE_DIR:${PROJECT_NAME}>
+)
+
+# Project docs / metadata
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+    "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE.txt"
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/docs/"
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+)

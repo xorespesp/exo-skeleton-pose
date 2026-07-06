@@ -1,24 +1,22 @@
-include_guard(GLOBAL)
-include(FetchContent)
+﻿if (NOT TARGET Eigen3::Eigen)
+    message(STATUS "Fetching Eigen...")
 
-set(_EIGEN_VERSION 3.4.0)
+    FetchContent_Declare(
+        Eigen
+        GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+        GIT_TAG 3.4.0
+        GIT_SHALLOW TRUE # git clone --depth=1
+        GIT_PROGRESS TRUE
+    )
 
-set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
-set(EIGEN_TEST_NOQT ON CACHE BOOL "" FORCE)
+    # Optionally disable parts of Eigen build if not needed
+    set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+    set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
+    set(EIGEN_BUILD_BLAS OFF CACHE BOOL "" FORCE)
+    set(EIGEN_BUILD_LAPACK OFF CACHE BOOL "" FORCE)
+    set(EIGEN_USE_LAPACKE OFF CACHE BOOL "" FORCE)
+    set(EIGEN_BUILD_BTL OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 
-FetchContent_Declare(
-    Eigen3
-    URL https://gitlab.com/libeigen/eigen/-/archive/${_EIGEN_VERSION}/eigen-${_EIGEN_VERSION}.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP ON
-    # URL_HASH SHA256=<add hash for reproducible builds>
-)
-FetchContent_MakeAvailable(Eigen3)
-
-# Eigen 3.4.0's in-tree CMake creates an INTERFACE target named `eigen`.
-# Alias it as `Eigen3::Eigen` for parity with find_package(Eigen3).
-if(NOT TARGET Eigen3::Eigen AND TARGET eigen)
-    add_library(Eigen3::Eigen ALIAS eigen)
+    FetchContent_MakeAvailable(Eigen)
 endif()

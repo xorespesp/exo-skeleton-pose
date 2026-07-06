@@ -1,18 +1,24 @@
-include_guard(GLOBAL)
-include(FetchContent)
+﻿if (NOT TARGET spdlog::spdlog)
+    message(STATUS "Fetching spdlog...")
 
-set(_SPDLOG_VERSION 1.15.3)
+    FetchContent_Declare(spdlog
+        GIT_REPOSITORY https://github.com/gabime/spdlog.git
+        GIT_TAG        v1.15.2
+        GIT_SHALLOW TRUE # git clone --depth=1
+        GIT_PROGRESS TRUE
+        EXCLUDE_FROM_ALL # Added in CMake 3.28
+    )
 
-set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
-set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "" FORCE)
+    set(SPDLOG_BUILD_SHARED  OFF CACHE BOOL "" FORCE)
+    set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+    set(SPDLOG_WCHAR_SUPPORT ON CACHE BOOL "" FORCE)
 
-FetchContent_Declare(
-    spdlog
-    URL https://github.com/gabime/spdlog/archive/refs/tags/v${_SPDLOG_VERSION}.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP ON
-    # URL_HASH SHA256=<add hash for reproducible builds>
-)
-FetchContent_MakeAvailable(spdlog)
+    # See: https://github.com/gabime/spdlog/blob/b18a234ed6af38638678a3338c0d7ed90210ae6c/CMakeLists.txt#L91
+    #      https://github.com/gabime/spdlog/issues/355#issuecomment-273497846
+    #set(SPDLOG_FMT_EXTERNAL_HO  ON CACHE BOOL "" FORCE)
+    
+    # https://github.com/gabime/spdlog/issues/3261#issuecomment-2483715077
+    set(SPDLOG_USE_STD_FORMAT  ON CACHE BOOL "" FORCE)
+
+    FetchContent_MakeAvailable(spdlog)
+endif()

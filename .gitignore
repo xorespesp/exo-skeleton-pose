@@ -1,4 +1,10 @@
-﻿/.vs/
+﻿.*
+!.gitkeep
+!.gitattributes
+!.gitignore
+
+/.vs/
 /dependency/
+!/dependency/.gitkeep
 /out/
 /*.local.*

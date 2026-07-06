@@ -19,20 +19,57 @@ include(GNUInstallDirs)
 
 add_executable(${TARGET_NAME})
 target_sources(${TARGET_NAME} PRIVATE
-    "src/main.cc")
-        
+    "src/main.cc"
+
+    # camera sensor abstraction
+    "src/hw/calibration.hh"
+    "src/hw/sensor_frameset.hh"
+    "src/hw/sensor_frame.hh"
+    "src/hw/sensor_frame_source.hh"
+    "src/hw/sensor_frame_observer.hh"
+    "src/hw/sensor_frame_provider.hh"
+    "src/hw/sensor_frame_provider.cc"
+
+    # camera sensor backend implementation (Orbbec K4A Wrapper, temporary)
+    "src/hw/k4a_frameset.hh"
+    "src/hw/k4a_frameset.cc"
+    "src/hw/k4a_frame_source.hh"
+    "src/hw/k4a_frame_source.cc"
+
+    # tag detection / pose
+    "src/pose/tag_detector.hh"
+    "src/pose/tag_detector.cc"
+)
+
+target_include_directories(${TARGET_NAME} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+if (WIN32)
+    target_compile_definitions(${TARGET_NAME} PRIVATE 
+        NOMINMAX 
+        WIN32_LEAN_AND_MEAN)
+endif()
+
 include(FetchCLI11)
-include(FetchBoost)
+#include(FetchBoost)
 include(FetchEigen)
 include(FetchSpdlog)
+include(FetchAprilTag)
+include(FetchOrbbecK4A)
+
+find_package(OpenCV REQUIRED)
 
 target_link_libraries(${TARGET_NAME} PRIVATE
-    Boost::asio
-    Boost::pool
-    Boost::circular_buffer
     Eigen3::Eigen
     spdlog::spdlog_header_only
+    apriltag::apriltag
+    CLI11::CLI11
+    k4a::k4a
+    k4a::k4arecord
+    ${OpenCV_LIBS}
 )
+
+setup_orbbec_k4a_binaries(${TARGET_NAME} INSTALL_PATH ${CMAKE_INSTALL_BINDIR})
 
 ########################################################################################
 # Install

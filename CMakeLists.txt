@@ -20,6 +20,8 @@ include(GNUInstallDirs)
 add_executable(${TARGET_NAME})
 target_sources(${TARGET_NAME} PRIVATE
     "src/main.cc"
+    "src/cli_options.hh"
+    "src/cli_options.cc"
 
     # camera sensor abstraction
     "src/hw/calibration.hh"
@@ -39,6 +41,17 @@ target_sources(${TARGET_NAME} PRIVATE
     # tag detection / pose
     "src/pose/tag_detector.hh"
     "src/pose/tag_detector.cc"
+    "src/pose/pose_estimator.hh"
+    "src/pose/pose_estimator.cc"
+
+    # gui
+    "src/gui/app_base.hh"
+    "src/gui/app_renderer_sdl3.hh"
+    "src/gui/app_renderer_sdl3.cc"
+    "src/gui/frame_texture.hh"
+    "src/gui/frame_texture.cc"
+    "src/gui/debug_gui_app.hh"
+    "src/gui/debug_gui_app.cc"
 )
 
 target_include_directories(${TARGET_NAME} PRIVATE
@@ -56,6 +69,9 @@ include(FetchEigen)
 include(FetchSpdlog)
 include(FetchAprilTag)
 include(FetchOrbbecK4A)
+include(FetchSDL3)
+
+add_subdirectory(dependency)
 
 find_package(OpenCV REQUIRED)
 
@@ -67,6 +83,10 @@ target_link_libraries(${TARGET_NAME} PRIVATE
     k4a::k4a
     k4a::k4arecord
     ${OpenCV_LIBS}
+    imgui::imgui
+    implot::implot
+    implot3d::implot3d
+    imfilebrowser::imfilebrowser
 )
 
 setup_orbbec_k4a_binaries(${TARGET_NAME} INSTALL_PATH ${CMAKE_INSTALL_BINDIR})

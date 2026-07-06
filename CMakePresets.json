@@ -15,7 +15,7 @@
         "CMAKE_C_COMPILER": "cl.exe",
         "CMAKE_CXX_COMPILER": "cl.exe",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_INSTALLED_DIR": "${sourceDir}/dependency/vcpkg_installed",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/deps/vcpkg_installed",
         "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
       },
       "condition": {

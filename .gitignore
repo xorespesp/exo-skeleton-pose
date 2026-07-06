@@ -4,7 +4,7 @@
 !.gitignore
 
 /.vs/
-/dependency/vcpkg_installed/
-!/dependency/.gitkeep
+/deps/vcpkg_installed/
+!/deps/.gitkeep
 /out/
 /*.local.*

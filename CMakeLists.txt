@@ -71,7 +71,7 @@ include(FetchAprilTag)
 include(FetchOrbbecK4A)
 include(FetchSDL3)
 
-add_subdirectory(dependency)
+add_subdirectory(deps)
 
 find_package(OpenCV REQUIRED)
 

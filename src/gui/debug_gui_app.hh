@@ -97,7 +97,7 @@ namespace gui
         uint64_t _last_seq{ 0 };
 
         bool _camera_fullscreen{ false };
-        bool _absolute_rot{ false }; // false = local (vs parent), true = absolute (camera frame)
+        bool _relative_rot{ true }; // true = local (vs parent), false = absolute (camera frame)
         bool _subplot_autofit{ true }; // pack subplots to fill the panel
         float _subplot_size{ 150.0f }; // manual subplot cell size [px], DPI-scaled at use
 

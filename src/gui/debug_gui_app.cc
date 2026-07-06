@@ -234,7 +234,7 @@ namespace gui
 
     std::optional<Eigen::Quaterniond> debug_gui_app::_display_rot(const pose::joint_state_t& st) const
     {
-        if (!_absolute_rot) { return st.anim_rot; } // local: relative to parent (delta from rest)
+        if (_relative_rot) { return st.anim_rot; } // local: relative to parent (delta from rest)
         if (st.is_visible()) { return Eigen::Quaterniond{ st.view_pose.value().rotation() }.normalized(); }
         return std::nullopt; // absolute: tag orientation in the camera frame
     }
@@ -297,7 +297,7 @@ namespace gui
         if (ImGui::Button("Clear")) { _estimator.clear_rest_pose(); }
 
         ImGui::SeparatorText("Visualization");
-        ImGui::Checkbox("Absolute Rotation", &_absolute_rot);
+        ImGui::Checkbox("Relative Rotation", &_relative_rot);
         ImGui::Checkbox("Auto-fit Subplots", &_subplot_autofit);
         if (!_subplot_autofit) {
             ImGui::SliderFloat("Subplot Size", &_subplot_size, 80.0f, 400.0f, "%.0f px");
@@ -345,7 +345,7 @@ namespace gui
         for (const auto& info : pose::kJointsInfo)
         {
             const auto& st = _estimator.get_joint_state(info.id);
-            const char* ref = (_absolute_rot || pose::is_root_joint(info.id))
+            const char* ref = (!_relative_rot || pose::is_root_joint(info.id))
                 ? "camera" : pose::joint_info(info.parent).name.data();
             const auto rot = this->_display_rot(st);
 

@@ -9,7 +9,7 @@ namespace hw
     {
         float fx{ 0.0f }, fy{ 0.0f };  // focal length [px]
         float cx{ 0.0f }, cy{ 0.0f };  // principal point [px]
-        int   width{ 0 }, height{ 0 };
+        int width{ 0 }, height{ 0 };
     };
 
     // Brown-Conrady (rational) distortion coefficients.

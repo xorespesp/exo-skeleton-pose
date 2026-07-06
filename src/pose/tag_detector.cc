@@ -30,6 +30,7 @@ namespace pose
                 static_cast<float>(k.fy * p_cam.y() / p_cam.z() + k.cy)
             };
         }
+
     } // namespace
 
     tag_detector::tag_detector(const options_t& opt)
@@ -55,16 +56,17 @@ namespace pose
         else { gray = image; }
         if (!gray.isContinuous()) { gray = gray.clone(); }
 
-        image_u8_t im{ gray.cols, gray.rows, static_cast<int32_t>(gray.step[0]), gray.data };
+        ::image_u8_t im{ gray.cols, gray.rows, static_cast<int32_t>(gray.step[0]), gray.data };
 
-        const std::unique_ptr<::zarray_t, void (*)(zarray_t*)> raw{
-            ::apriltag_detector_detect(_detector.get(), &im), &::apriltag_detections_destroy
+        const std::unique_ptr<::zarray_t, void(*)(::zarray_t*)> raw{
+            ::apriltag_detector_detect(_detector.get(), &im), 
+            &::apriltag_detections_destroy
         };
 
         std::vector<tag_detection_t> detections;
         detections.reserve(::zarray_size(raw.get()));
         for (int i = 0; i < ::zarray_size(raw.get()); ++i) {
-            apriltag_detection_t* d = nullptr;
+            ::apriltag_detection_t* d = nullptr;
             ::zarray_get(raw.get(), i, &d);
 
             tag_detection_t& det = detections.emplace_back();
@@ -72,7 +74,7 @@ namespace pose
             det.hamming = d->hamming;
             det.decision_margin = d->decision_margin;
             det.center = { static_cast<float>(d->c[0]), static_cast<float>(d->c[1]) };
-            for (int k = 0; k < 4; ++k) {
+            for (size_t k = 0; k < det.corners.size(); ++k) {
                 det.corners[k] = { static_cast<float>(d->p[k][0]), static_cast<float>(d->p[k][1]) };
             }
 

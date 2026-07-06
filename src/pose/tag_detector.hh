@@ -50,11 +50,14 @@ namespace pose
 
     private:
         options_t _opt;
-        std::unique_ptr<::apriltag_detector, void (*)(::apriltag_detector*)> _detector;
-        std::unique_ptr<::apriltag_family,   void (*)(::apriltag_family*)>   _family;
+        std::unique_ptr<::apriltag_detector, void(*)(::apriltag_detector*)> _detector;
+        std::unique_ptr<::apriltag_family,   void(*)(::apriltag_family*)> _family;
     };
 
     // Draw tag outlines, ids, and 3D axes (when present).
-    void draw_tag_detections(cv::Mat& bgr, std::span<const tag_detection_t> detections);
+    void draw_tag_detections(
+        cv::Mat& bgr, 
+        std::span<const tag_detection_t> detections
+    );
 
 } // namespace pose

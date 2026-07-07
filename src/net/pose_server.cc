@@ -201,7 +201,7 @@ namespace net
         }
 
         const auto status = fb_proto::CreateServerStatus(
-            b, opened, name, w, h, _is_recording, _estimator.has_rest_pose()
+            b, opened, name, w, h, _estimator.has_rest_pose()
         );
 
         b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_ServerStatus, status.Union(), request_id));
@@ -214,8 +214,8 @@ namespace net
         // Recording EOF is graceful; a live device stopping on its own is a loss.
         const bool is_error = !_is_recording;
         const char* msg = _is_recording ? "recording reached end" : "device stream ended";
-        const auto ended = fb_proto::CreateSourceEnded(b, is_error, b.CreateString(msg));
-        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_SourceEnded, ended.Union(), kReservedServerNotifyReqId));
+        const auto ended = fb_proto::CreateSourceStreamEnded(b, is_error, b.CreateString(msg));
+        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_SourceStreamEnded, ended.Union(), kReservedServerNotifyReqId));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
@@ -279,9 +279,9 @@ namespace net
 
                     switch (m->payload_type())
                     {
-                        case fb_proto::Payload_OpenSource:
+                        case fb_proto::Payload_OpenSourceStream:
                         {
-                            const auto* o = m->payload_as_OpenSource();
+                            const auto* o = m->payload_as_OpenSourceStream();
                             const std::string src = o->source() ? o->source()->str() : std::string{};
                             std::optional<int32_t> exposure, gain;
                             if (const auto e = o->exposure_us()) { exposure = *e; }
@@ -291,7 +291,7 @@ namespace net
                             status_changed = true;
                             break;
                         }
-                        case fb_proto::Payload_CloseSource:
+                        case fb_proto::Payload_CloseSourceStream:
                             this->_apply_close();
                             ack = this->_serialize_ack(true, "source closed", req);
                             status_changed = true;

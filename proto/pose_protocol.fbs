@@ -22,14 +22,13 @@ enum JointId : ubyte {
 // Client -> Server commands
 // ---------------------------------------------------------------------------
 
-table OpenSource {
+table OpenSourceStream {
     source: string; // device index or recording path
-    tag_size_m:
-    double = 0.05;
+    tag_size_m: double = 0.05;
     exposure_us: int = null; // optional (null == auto)
     gain: int = null; // optional (null == auto)
 }
-table CloseSource {}
+table CloseSourceStream {}
 table CalibrateRestPose {} // latch the current pose as the rest (bind) reference
 table ClearRestPose {}     // drop the captured rest pose
 table GetServerStatus {}   // request the current ServerStatus (reply a ServerStatus, no Ack)
@@ -61,18 +60,17 @@ table PoseFrame {
 
 // Current server state, pushed on connect, on change, or on GetServerStatus request.
 table ServerStatus {
-    opened: bool;
+    is_stream_opened: bool;
     source_name: string;
     width: int;
     height: int;
-    is_recording: bool;
     has_rest_pose: bool;
 }
 
-// Sent when the source stream stops on its own: 
+// Sent when the source stream stops on its own:
 // live device was lost (is_error = true) or a recording reached its end (is_error = false).
 // The pose stream halts; the client decides whether to close/re-open.
-table SourceEnded {
+table SourceStreamEnded {
     is_error: bool;
     message: string;
 }
@@ -81,8 +79,8 @@ table SourceEnded {
 table Ack { ok: bool; message: string; }
 
 union Payload {
-    OpenSource, CloseSource, CalibrateRestPose, ClearRestPose, GetServerStatus,  // client -> server
-    PoseFrame, ServerStatus, SourceEnded, Ack                                    // server -> client
+    OpenSourceStream, CloseSourceStream, CalibrateRestPose, ClearRestPose, GetServerStatus,  // client -> server
+    PoseFrame, ServerStatus, SourceStreamEnded, Ack                                          // server -> client
 }
 
 // request_id lets a client match a reply to its command: send a non-zero id and

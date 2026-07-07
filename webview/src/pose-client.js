@@ -3,8 +3,8 @@
 import * as flatbuffers from 'flatbuffers';
 import {
     Message, Payload,
-    OpenSource, CloseSource, CalibrateRestPose, ClearRestPose, GetServerStatus,
-    PoseFrame, ServerStatus, SourceEnded, Ack,
+    OpenSourceStream, CloseSourceStream, CalibrateRestPose, ClearRestPose, GetServerStatus,
+    PoseFrame, ServerStatus, SourceStreamEnded, Ack,
 } from './generated/exo/proto.js';
 
 // request_id value reserved for messages the server sends on its own
@@ -43,18 +43,18 @@ export class PoseClient {
     sendOpen({ source, tagSizeM = 0.05, exposureUs = null, gain = null }) {
         const b = new flatbuffers.Builder(256);
         const srcOff = b.createString(source);
-        OpenSource.startOpenSource(b);
-        OpenSource.addSource(b, srcOff);
-        OpenSource.addTagSizeM(b, tagSizeM);
-        if (exposureUs !== null) { OpenSource.addExposureUs(b, exposureUs); }
-        if (gain !== null) { OpenSource.addGain(b, gain); }
-        this._send(b, Payload.OpenSource, OpenSource.endOpenSource(b));
+        OpenSourceStream.startOpenSourceStream(b);
+        OpenSourceStream.addSource(b, srcOff);
+        OpenSourceStream.addTagSizeM(b, tagSizeM);
+        if (exposureUs !== null) { OpenSourceStream.addExposureUs(b, exposureUs); }
+        if (gain !== null) { OpenSourceStream.addGain(b, gain); }
+        this._send(b, Payload.OpenSourceStream, OpenSourceStream.endOpenSourceStream(b));
     }
 
     sendClose() {
         const b = new flatbuffers.Builder(64);
-        CloseSource.startCloseSource(b);
-        this._send(b, Payload.CloseSource, CloseSource.endCloseSource(b));
+        CloseSourceStream.startCloseSourceStream(b);
+        this._send(b, Payload.CloseSourceStream, CloseSourceStream.endCloseSourceStream(b));
     }
 
     sendCalibrateRestPose() {
@@ -95,7 +95,7 @@ export class PoseClient {
         switch (msg.payloadType()) {
             case Payload.PoseFrame:    this.onPoseFrame?.(msg.payload(new PoseFrame())); break;
             case Payload.ServerStatus: this.onStatus?.(msg.payload(new ServerStatus())); break;
-            case Payload.SourceEnded:  this.onSourceEnded?.(msg.payload(new SourceEnded())); break;
+            case Payload.SourceStreamEnded: this.onSourceEnded?.(msg.payload(new SourceStreamEnded())); break;
             case Payload.Ack:          this.onAck?.(msg.payload(new Ack()), requestId); break;
             default: break;
         }

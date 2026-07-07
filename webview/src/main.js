@@ -64,7 +64,7 @@ client.onSourceEnded = (ev) => {
     console.log(`source ended: is_error=${ev.isError()} "${ev.message()}"`);
 };
 client.onStatus = (st) => {
-    opened = st.opened();
+    opened = st.isStreamOpened();
     ui.source_name = opened ? `${st.sourceName()} (${st.width()}x${st.height()})` : '(none)';
     ui.rest_pose = st.hasRestPose() ? 'calibrated' : 'none';
     refresh();

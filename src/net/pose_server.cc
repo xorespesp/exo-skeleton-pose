@@ -102,8 +102,11 @@ namespace net
         , _initial{ initial }
     { }
 
-    bool pose_server::_apply_open(const std::string& source, double tag_size_m,
-                                  std::optional<int32_t> exposure_us, std::optional<int32_t> gain)
+    bool pose_server::_do_open_source_stream(
+        const std::string& source, 
+        double tag_size_m,
+        std::optional<int32_t> exposure_us, 
+        std::optional<int32_t> gain)
     {
         auto provider = std::make_shared<hw::sensor_frame_provider>();
         auto observer = std::make_shared<pose_frame_observer>(*provider, tag_size_m);
@@ -132,7 +135,7 @@ namespace net
         return true;
     }
 
-    void pose_server::_apply_close()
+    void pose_server::_do_close_source_stream()
     {
         _provider.reset(); // stops/joins the worker thread
         _observer.reset();
@@ -140,12 +143,12 @@ namespace net
         _last_seq = 0;
     }
 
-    bool pose_server::_apply_calibrate()
+    bool pose_server::_do_calibrate_rest_pose()
     {
         return _estimator.calibrate_rest_pose();
     }
 
-    void pose_server::_apply_clear_rest()
+    void pose_server::_do_clear_rest_pose()
     {
         _estimator.clear_rest_pose();
     }
@@ -183,11 +186,11 @@ namespace net
         const uint32_t frame_id = _provider ? _provider->get_current_frame_id() : 0;
         const auto pose_frame = fb_proto::CreatePoseFrame(b, frame_id, _last_timestamp_us, _estimator.has_rest_pose(), joints_vec);
 
-        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_PoseFrame, pose_frame.Union(), kReservedServerNotifyReqId));
+        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_PoseFrame, pose_frame.Union(), kServerNotifyReqId));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
-    std::string pose_server::_serialize_server_status(req_id_t request_id) const
+    std::string pose_server::_serialize_server_status(req_id_t req_id) const
     {
         fb::FlatBufferBuilder b;
 
@@ -204,45 +207,56 @@ namespace net
             b, opened, name, w, h, _estimator.has_rest_pose()
         );
 
-        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_ServerStatus, status.Union(), request_id));
+        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_ServerStatus, status.Union(), req_id));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
-    std::string pose_server::_serialize_source_ended() const
+    std::string pose_server::_serialize_source_stream_ended() const
     {
         fb::FlatBufferBuilder b;
         // Recording EOF is graceful; a live device stopping on its own is a loss.
         const bool is_error = !_is_recording;
         const char* msg = _is_recording ? "recording reached end" : "device stream ended";
         const auto ended = fb_proto::CreateSourceStreamEnded(b, is_error, b.CreateString(msg));
-        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_SourceStreamEnded, ended.Union(), kReservedServerNotifyReqId));
+        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_SourceStreamEnded, ended.Union(), kServerNotifyReqId));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
-    std::string pose_server::_serialize_ack(bool ok, std::string_view message, req_id_t request_id) const
+    std::string pose_server::_serialize_ack(
+        bool ok, 
+        std::string_view msg, 
+        req_id_t req_id) const
     {
         fb::FlatBufferBuilder b;
-        const auto ack = fb_proto::CreateAck(b, ok, b.CreateString(message.data(), message.size()));
-        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_Ack, ack.Union(), request_id));
+        const auto ack = fb_proto::CreateAck(b, ok, b.CreateString(msg.data(), msg.size()));
+        b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_Ack, ack.Union(), req_id));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
     int pose_server::run()
     {
-        struct socket_data {}; // per-connection state (unused)
+        struct socket_data {
+            bool accepted{ false }; // false for a rejected (over-capacity) socket
+        };
 
         uWS::App app;
 
         app.ws<socket_data>("/*", {
             .compression = uWS::DISABLED,
             .open = [this](auto* ws) {
-                // Subscribe to the broadcast topics, then send the current status.
+                if (_client_count >= 1) {
+                    ws->end(1013, "another client is already connected"); // 1013 = Try Again Later
+                    return;
+                }
+                ws->getUserData()->accepted = true;
                 ++_client_count;
+                // Subscribe to the broadcast topics, then send the current status.
                 ws->subscribe("pose");
                 ws->subscribe("status");
                 ws->send(this->_serialize_server_status(), uWS::OpCode::BINARY);
             },
             .message = [this, &app](auto* ws, std::string_view msg, uWS::OpCode /*op*/) {
+                if (!ws->getUserData()->accepted) { return; } // ignore a rejected socket still closing
                 const auto* data = std::bit_cast<const uint8_t*>(msg.data());
                 fb::Verifier verifier{ data, msg.size() };
                 if (!fb_proto::VerifyMessageBuffer(verifier))
@@ -257,12 +271,11 @@ namespace net
                 // A malformed request must never take down the loop; reply with an error Ack.
                 try
                 {
-                    if (req == kReservedServerNotifyReqId)
-                    {
+                    if (req == kServerNotifyReqId) {
                         // 0 is reserved for server notify events,
-                        // so a client command carrying request_id 0 is a protocol violation.
+                        // so a client command carrying request id 0 is a protocol violation.
                         // reject it.
-                        ws->send(this->_serialize_ack(false, "request_id must be non-zero", kReservedServerNotifyReqId), uWS::OpCode::BINARY);
+                        ws->send(this->_serialize_ack(false, "request_id must be non-zero", kServerNotifyReqId), uWS::OpCode::BINARY);
                         return;
                     }
 
@@ -286,25 +299,25 @@ namespace net
                             std::optional<int32_t> exposure, gain;
                             if (const auto e = o->exposure_us()) { exposure = *e; }
                             if (const auto g = o->gain()) { gain = *g; }
-                            const bool ok = this->_apply_open(src, o->tag_size_m(), exposure, gain);
+                            const bool ok = this->_do_open_source_stream(src, o->tag_size_m(), exposure, gain);
                             ack = this->_serialize_ack(ok, ok ? "source opened" : "open failed", req);
                             status_changed = true;
                             break;
                         }
                         case fb_proto::Payload_CloseSourceStream:
-                            this->_apply_close();
+                            this->_do_close_source_stream();
                             ack = this->_serialize_ack(true, "source closed", req);
                             status_changed = true;
                             break;
                         case fb_proto::Payload_CalibrateRestPose:
                         {
-                            const bool ok = this->_apply_calibrate();
+                            const bool ok = this->_do_calibrate_rest_pose();
                             ack = this->_serialize_ack(ok, ok ? "rest pose calibrated" : "no computable joint rotation", req);
                             status_changed = true;
                             break;
                         }
                         case fb_proto::Payload_ClearRestPose:
-                            this->_apply_clear_rest();
+                            this->_do_clear_rest_pose();
                             ack = this->_serialize_ack(true, "rest pose cleared", req);
                             status_changed = true;
                             break;
@@ -322,12 +335,13 @@ namespace net
                     ws->send(this->_serialize_ack(false, "internal error", req), uWS::OpCode::BINARY);
                 }
             },
-            .close = [this](auto* /*ws*/, int /*code*/, std::string_view /*message*/) {
-                // Release the shared source once the last client disconnects.
-                if (_client_count > 0) { --_client_count; }
+            .close = [this](auto* ws, int /*code*/, std::string_view /*message*/) {
+                if (!ws->getUserData()->accepted) { return; } // rejected socket was never counted
+                // Release the shared source once the (only) client disconnects.
+                --_client_count;
                 if (_client_count == 0)
                 {
-                    this->_apply_close();
+                    this->_do_close_source_stream();
                     spdlog::info("last client disconnected; source released");
                 }
             }
@@ -349,14 +363,19 @@ namespace net
             }
             if (c->self->_poll_stream_ended())
             {
-                c->app->publish("status", c->self->_serialize_source_ended(), uWS::OpCode::BINARY);
+                c->app->publish("status", c->self->_serialize_source_stream_ended(), uWS::OpCode::BINARY);
             }
         }, 8, 8); // ~120 Hz
 
         // Optional: auto-open a recording passed on the command line.
         if (!_initial.input_path.empty())
         {
-            this->_apply_open(_initial.input_path, _initial.tag_size_m, _initial.exposure_us, _initial.gain);
+            this->_do_open_source_stream(
+                _initial.input_path, 
+                _initial.tag_size_m,
+                _initial.exposure_us, 
+                _initial.gain
+            );
         }
 
         app.listen(_port, [this](auto* token) {

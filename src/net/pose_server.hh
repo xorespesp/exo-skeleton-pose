@@ -16,12 +16,20 @@ namespace net
     // forward declaration of worker-thread observer
     class pose_frame_observer;
 
+    // Protocol correlation id (Message.request_id).
+    using req_id_t = uint32_t;
+
+    // request_id value reserved for messages the server sends on its own
+    // (status/pose/ended notifications); clients must use a non-zero id.
+    inline constexpr req_id_t kReservedServerNotifyReqId = 0;
+
     // uWS based pose server. (protocol: pose_protocol.fbs)
     //
     // NOTE: uWS runs one event loop on the calling thread.
     //       The provider's worker thread only latches detections;
-    //       everything else (command dispatch, estimator update, all sends) happens on the loop thread, 
+    //       everything else happens on the loop thread, 
     //       so no extra locking is needed here.
+    //       (command dispatch, estimator update, all sends ...)
     class pose_server final
     {
     public:
@@ -46,10 +54,16 @@ namespace net
         // true if a new frame arrived.
         bool _poll_new_detections();
 
+        // True once per stream-end signal latched by the observer (worker thread).
+        bool _poll_stream_ended();
+
         // Protocol serializers (loop thread) -> FlatBuffers `Message` bytes.
+        // Pass request_id to echo the triggering command's id back on a reply;
+        // NOTE: 0 is reserved for messages the server sends on its own.
         std::string _serialize_pose_frame() const;
-        std::string _serialize_server_status() const;
-        std::string _serialize_ack(bool ok, std::string_view message) const;
+        std::string _serialize_server_status(req_id_t request_id = kReservedServerNotifyReqId) const;
+        std::string _serialize_source_ended() const;
+        std::string _serialize_ack(bool ok, std::string_view message, req_id_t request_id = kReservedServerNotifyReqId) const;
 
     private:
         uint16_t _port;
@@ -61,6 +75,7 @@ namespace net
 
         std::vector<pose::tag_detection_t> _detections;
         uint64_t _last_seq{ 0 };
+        int64_t _last_timestamp_us{ 0 }; // device timestamp of the latched frame
         bool _is_recording{ false };
         size_t _client_count{ 0 }; // connected clients; source is released when it hits 0
     };

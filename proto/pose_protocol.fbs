@@ -8,46 +8,85 @@
 namespace exo.proto;
 
 // Lower-limb joints. Values match pose::joint_id_t on the server.
-enum JointId : ubyte { Pelvis = 0, RKnee, LKnee, RAnkle, LAnkle, RFoot, LFoot }
+enum JointId : ubyte {
+    Pelvis = 0, 
+    RKnee, 
+    LKnee, 
+    RAnkle, 
+    LAnkle, 
+    RFoot, 
+    LFoot
+}
 
 // ---------------------------------------------------------------------------
 // Client -> Server commands
 // ---------------------------------------------------------------------------
 
-// Open a frame source. `source` is parsed by the server: an unsigned integer
-// selects a live device index, anything else is treated as a recording path.
-// `exposure_us` / `gain` are optional (null == auto); device sources only.
-table OpenSource  { source:string; tag_size_m:double = 0.05; exposure_us:int = null; gain:int = null; }
+table OpenSource {
+    source: string; // device index or recording path
+    tag_size_m:
+    double = 0.05;
+    exposure_us: int = null; // optional (null == auto)
+    gain: int = null; // optional (null == auto)
+}
 table CloseSource {}
-table CalibrateRestPose {}   // latch the current pose as the rest (bind) reference
-table ClearRestPose {}       // drop the captured rest pose
-table GetServerStatus {}     // request the current ServerStatus (reply a ServerStatus, no Ack)
+table CalibrateRestPose {} // latch the current pose as the rest (bind) reference
+table ClearRestPose {}     // drop the captured rest pose
+table GetServerStatus {}   // request the current ServerStatus (reply a ServerStatus, no Ack)
 
 // ---------------------------------------------------------------------------
 // Server -> Client events
 // ---------------------------------------------------------------------------
 
-struct Quat { x:double; y:double; z:double; w:double; }
+struct Quat { x: double; y: double; z: double; w: double; }
 
-// One joint's rotation. `local_rot` is relative to the parent joint; 
-// `local_anim_rot` is that relative to the captured rest pose.
-// Both are identity when `visible` is false.
-table JointPose { id:JointId; visible:bool; local_rot:Quat; local_anim_rot:Quat; }
+// One joint's rotation. 
+// `local_rot` -> relative to the parent joint
+// `local_anim_rot` -> relative to the captured rest pose
+// NOTE: Both are identity when `visible` is false.
+table JointPose {
+    id: JointId;
+    visible: bool;
+    local_rot: Quat;
+    local_anim_rot: Quat;
+}
 
 // One estimation step, broadcast to subscribed clients per new frame.
-table PoseFrame { frame_id:uint; timestamp_us:long; has_rest_pose:bool; joints:[JointPose]; }
+table PoseFrame {
+    frame_id: uint;
+    timestamp_us: long; // source (device) timestamp of the frame
+    has_rest_pose: bool;
+    joints: [JointPose];
+}
 
 // Current server state, pushed on connect, on change, or on GetServerStatus request.
-table ServerStatus { opened:bool; source_name:string; width:int; height:int;
-                     is_recording:bool; has_rest_pose:bool; }
+table ServerStatus {
+    opened: bool;
+    source_name: string;
+    width: int;
+    height: int;
+    is_recording: bool;
+    has_rest_pose: bool;
+}
 
-// Result of a command (ok / error text).
-table Ack { ok:bool; message:string; }
+// Sent when the source stream stops on its own: 
+// live device was lost (is_error = true) or a recording reached its end (is_error = false).
+// The pose stream halts; the client decides whether to close/re-open.
+table SourceEnded {
+    is_error: bool;
+    message: string;
+}
+
+// Result of a command (ok / error msg)
+table Ack { ok: bool; message: string; }
 
 union Payload {
     OpenSource, CloseSource, CalibrateRestPose, ClearRestPose, GetServerStatus,  // client -> server
-    PoseFrame, ServerStatus, Ack                                                 // server -> client
+    PoseFrame, ServerStatus, SourceEnded, Ack                                    // server -> client
 }
 
-table Message { payload:Payload; }
+// request_id lets a client match a reply to its command: send a non-zero id and
+// the server echoes it on the Ack (or GetServerStatus reply). 
+// NOTE: 0 is reserved for the server's own notifications (pose/status/ended)
+table Message { payload: Payload; request_id: uint = 0; }
 root_type Message;

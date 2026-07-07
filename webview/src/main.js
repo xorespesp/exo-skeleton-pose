@@ -54,10 +54,14 @@ client.onClose = () => {
     stopStatusPoll();
     refresh();
 };
-client.onAck = (ack) => {
+client.onAck = (ack, requestId) => {
     pending = false;
-    console.log(`ack: ok=${ack.ok()} "${ack.message()}"`);
+    console.log(`ack[#${requestId}]: ok=${ack.ok()} "${ack.message()}"`);
     refresh();
+};
+client.onSourceEnded = (ev) => {
+    // Stream stopped on its own (recording EOF or device lost).
+    console.log(`source ended: is_error=${ev.isError()} "${ev.message()}"`);
 };
 client.onStatus = (st) => {
     opened = st.opened();
@@ -66,33 +70,33 @@ client.onStatus = (st) => {
     refresh();
 };
 client.onPoseFrame = (frame) => {
-  applyPoseFrame(bones, bindPose, frame);
-  ui.frame_id = frame.frameId();
-  for (let i = 0; i < frame.jointsLength(); i++) {
-    const jp = frame.joints(i);
-    const e = quatToEulerDeg(jp.localAnimRot(), ui.euler_order); // convert on the client
-    ui.joints[BONE_BY_JOINT_ID[jp.id()]] =
-      jp.visible() ? `${e.x.toFixed(0)}, ${e.y.toFixed(0)}, ${e.z.toFixed(0)}` : '-';
-  }
+    applyPoseFrame(bones, bindPose, frame);
+    ui.frame_id = frame.frameId();
+    for (let i = 0; i < frame.jointsLength(); i++) {
+        const jp = frame.joints(i);
+        const e = quatToEulerDeg(jp.localAnimRot(), ui.euler_order); // convert on the client
+        ui.joints[BONE_BY_JOINT_ID[jp.id()]] =
+            jp.visible() ? `${e.x.toFixed(0)}, ${e.y.toFixed(0)}, ${e.z.toFixed(0)}` : '-';
+    }
 };
 
 // --- actions ------------------------------------------------------------------
 function doConnect() {
-  if (connected || connecting) { return; }
-  connecting = true;
-  client.connect(ui.url);
-  refresh();
+    if (connected || connecting) { return; }
+    connecting = true;
+    client.connect(ui.url);
+    refresh();
 }
 function doDisconnect() { client.disconnect(); }
 function doOpen() {
-  pending = true;
-  client.sendOpen({
-    source: ui.source,
-    tagSizeM: ui.tag_size_m,
-    exposureUs: ui.manual_exposure ? ui.exposure_us : null,
-    gain: ui.manual_gain ? ui.gain : null,
-  });
-  refresh();
+    pending = true;
+    client.sendOpen({
+        source: ui.source,
+        tagSizeM: ui.tag_size_m,
+        exposureUs: ui.manual_exposure ? ui.exposure_us : null,
+        gain: ui.manual_gain ? ui.gain : null,
+    });
+    refresh();
 }
 function doClose() { pending = true; client.sendClose(); refresh(); }
 function doCalibrate() { pending = true; client.sendCalibrateRestPose(); refresh(); }
@@ -101,16 +105,22 @@ function doClearRest() { pending = true; client.sendClearRestPose(); refresh(); 
 // Low-frequency ServerStatus poll (for resync; status is also pushed on every change)
 let statusPollTimer = null;
 function startStatusPoll() {
-  stopStatusPoll();
-  statusPollTimer = setInterval(() => client.sendGetServerStatus(), 2000);
+    stopStatusPoll();
+    statusPollTimer = setInterval(() => client.sendGetServerStatus(), 2000);
 }
 function stopStatusPoll() {
-  if (statusPollTimer !== null) { clearInterval(statusPollTimer); statusPollTimer = null; }
+    if (statusPollTimer !== null) { clearInterval(statusPollTimer); statusPollTimer = null; }
 }
 
 // --- gui panel ----------------------------------------------------------------
-const acts = { connect: doConnect, disconnect: doDisconnect, open: doOpen, close: doClose,
-               calibrate: doCalibrate, clearRest: doClearRest };
+const acts = {
+    connect: doConnect, 
+    disconnect: doDisconnect, 
+    open: doOpen, 
+    close: doClose,
+    calibrate: doCalibrate, 
+    clearRest: doClearRest,
+};
 
 const gui = new GUI({ title: 'exo-skeleton-pose', width: 300 });
 gui.add(ui, 'url').name('server url');
@@ -138,7 +148,7 @@ const joints = gui.addFolder('Joints (euler deg)').close();
 joints.add(ui, 'frame_id').name('frame').listen().disable();
 joints.add(ui, 'euler_order', ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX']).name('euler order');
 for (const name of BONE_BY_JOINT_ID) {
-  joints.add(ui.joints, name).listen().disable();
+    joints.add(ui.joints, name).listen().disable();
 }
 
 // Enable/disable controls to match the current connection + source state.

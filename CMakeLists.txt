@@ -97,7 +97,7 @@ target_sources(${TARGET_NAME} PRIVATE ${FBS_GEN_HEADER})
 target_include_directories(${TARGET_NAME} PRIVATE ${FBS_GEN_DIR})
 
 # TS bindings -> webview build tree
-set(FBS_TS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webview/src/protocol")
+set(FBS_TS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webview/src/generated")
 set(FBS_TS_BARREL "${FBS_TS_DIR}/exo/proto.ts")
 add_custom_command(
     OUTPUT ${FBS_TS_BARREL}

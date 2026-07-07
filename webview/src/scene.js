@@ -54,9 +54,50 @@ export function createScene(container) {
   return { scene, camera, renderer, controls, startRenderLoop };
 }
 
-// Loads Xbot.glb, adds it to the scene, and returns { model, bones } 
-// where `bones` maps sanitized bone name -> THREE.Bone. 
-// NOTE: GLTFLoader strips the ':' from the raw "mixamorig:Hips" names, 
+// Lower-body bones (Hips + both leg chains). Mesh skinned above these is dropped.
+const LOWER_BODY_BONES = new Set([
+  'mixamorigHips',
+  'mixamorigLeftUpLeg', 'mixamorigRightUpLeg',
+  'mixamorigLeftLeg', 'mixamorigRightLeg',
+  'mixamorigLeftFoot', 'mixamorigRightFoot',
+  'mixamorigLeftToeBase', 'mixamorigRightToeBase',
+  'mixamorigLeftToe_End', 'mixamorigRightToe_End',
+]);
+
+// Xbot is a single whole-body skinned mesh, so we cannot just hide a child.
+// Instead drop every triangle whose vertices are skinned mainly to non-lower-body bones,
+// leaving a clean cut at the pelvis. Skinning is unaffected. (only the index shrinks)
+function hideUpperBody(model) {
+  model.traverse((obj) => {
+    if (!obj.isSkinnedMesh || !obj.geometry.index) { return; }
+    const geo = obj.geometry;
+    const si = geo.attributes.skinIndex;
+    const sw = geo.attributes.skinWeight;
+    const bones = obj.skeleton.bones;
+
+    const vertexIsLower = (v) => {
+      // The dominant (max-weight) bone decides which half the vertex belongs to.
+      const idx = [si.getX(v), si.getY(v), si.getZ(v), si.getW(v)];
+      const w = [sw.getX(v), sw.getY(v), sw.getZ(v), sw.getW(v)];
+      let best = 0;
+      for (let k = 1; k < 4; k++) { if (w[k] > w[best]) { best = k; } }
+      const bone = bones[idx[best]];
+      return bone && LOWER_BODY_BONES.has(bone.name);
+    };
+
+    const index = geo.index;
+    const kept = [];
+    for (let i = 0; i < index.count; i += 3) {
+      const a = index.getX(i), b = index.getX(i + 1), c = index.getX(i + 2);
+      if (vertexIsLower(a) && vertexIsLower(b) && vertexIsLower(c)) { kept.push(a, b, c); }
+    }
+    geo.setIndex(kept);
+  });
+}
+
+// Loads Xbot.glb, adds it to the scene, and returns { model, bones }
+// where `bones` maps sanitized bone name -> THREE.Bone.
+// NOTE: GLTFLoader strips the ':' from the raw "mixamorig:Hips" names,
 //       so keys look like "mixamorigHips".
 export async function loadCharacter(scene) {
   const gltf = await new GLTFLoader().loadAsync(xbotUrl);
@@ -68,6 +109,8 @@ export async function loadCharacter(scene) {
     if (obj.isBone) { bones[obj.name] = obj; }
     if (obj.isMesh) { obj.castShadow = true; }
   });
+
+  hideUpperBody(model); // lower-limb demo: drop the mesh above the pelvis
 
   // One-time check that the expected sanitized names are present.
   console.log('loaded bones:', Object.keys(bones));

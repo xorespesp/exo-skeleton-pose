@@ -50,6 +50,7 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/gui/app_renderer_sdl3.cc"
     "src/gui/frame_texture.hh"
     "src/gui/frame_texture.cc"
+    "src/gui/plot_buffer.hh"
     "src/gui/debug_gui_app.hh"
     "src/gui/debug_gui_app.cc"
 

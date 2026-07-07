@@ -1,12 +1,18 @@
 ﻿#include "debug_gui_app.hh"
 
+#include "hw/sensor_frame_observer.hh"
+
 #include <spdlog/spdlog.h>
 
 #include <imgui.h>
+#include <implot.h>
 #include <implot3d.h>
+#include <implot3d_internal.h> // GetCurrentPlot / ImPlot3DPlot for axis-frame sync
 
 #include <algorithm>
+#include <cmath>
 #include <format>
+#include <mutex>
 #include <numbers>
 
 namespace gui
@@ -20,15 +26,20 @@ namespace gui
             { "YZX", 1, 2, 0 }, { "ZXY", 2, 0, 1 }, { "ZYX", 2, 1, 0 },
         } };
 
-        // Euler angles [deg] of a rotation in the given order (readout only; euler
-        // angles wrap and hit gimbal singularities, so drive skeletons from the quaternion).
         Eigen::Vector3d to_euler_deg(const Eigen::Quaterniond& q, const euler_order_t& order)
         {
             return q.toRotationMatrix().eulerAngles(order.a0, order.a1, order.a2) * (180.0 / std::numbers::pi);
         }
 
+        std::optional<Eigen::Quaterniond> try_get_joint_rot(const pose::joint_state_t& st, bool relative)
+        {
+            if (relative) { return st.local_anim_rot; }
+            if (st.is_visible()) { return Eigen::Quaterniond{ st.view_pose.value().rotation() }.normalized(); }
+            return std::nullopt;
+        }
+
         // RGB axis triad (X=red, Y=green, Z=blue) for `q`, into the current ImPlot3D plot.
-        void draw_axes(std::string_view prefix, const Eigen::Quaterniond& q, float thickness)
+        void draw_axes(const Eigen::Quaterniond& q, float thickness)
         {
             const Eigen::Vector3d ex = q * Eigen::Vector3d::UnitX();
             const Eigen::Vector3d ey = q * Eigen::Vector3d::UnitY();
@@ -38,16 +49,101 @@ namespace gui
             const double yx[2]{ 0.0, ey.x() }, yy[2]{ 0.0, ey.y() }, yz[2]{ 0.0, ey.z() };
             const double zx[2]{ 0.0, ez.x() }, zy[2]{ 0.0, ez.y() }, zz[2]{ 0.0, ez.z() };
 
+            // NOTE: Use short legend names; the caller wraps each subplot in PushID/PopID so ids stay unique.
             ImPlot3DSpec spec;
             spec.LineWeight = thickness;
             spec.LineColor = ImVec4(1, 0, 0, 1);
-            ImPlot3D::PlotLine(std::format("{}-X", prefix).c_str(), xx, xy, xz, 2, spec);
+            ImPlot3D::PlotLine("X", xx, xy, xz, 2, spec);
             spec.LineColor = ImVec4(0, 1, 0, 1);
-            ImPlot3D::PlotLine(std::format("{}-Y", prefix).c_str(), yx, yy, yz, 2, spec);
+            ImPlot3D::PlotLine("Y", yx, yy, yz, 2, spec);
             spec.LineColor = ImVec4(0, 0, 1, 1);
-            ImPlot3D::PlotLine(std::format("{}-Z", prefix).c_str(), zx, zy, zz, 2, spec);
+            ImPlot3D::PlotLine("Z", zx, zy, zz, 2, spec);
         }
+
+        constexpr float kWindowSec = 10.0f; // scrolling line-plot window [s]
+        constexpr float kEulerYLo = -190.0f, kEulerYHi = 190.0f; // euler deg range (all subplots)
+        constexpr float kQuatYLo = -1.1f, kQuatYHi = 1.1f; // quaternion range (all subplots)
+
+        // Scrolling line plot of a buffer's channels over the newest `window` seconds.
+        // x is the device time (`v.xs`); channel k is `v.ys.data() + k`, both strided by `v.stride`.
+        // x always auto-scrolls; only y obeys `y_cond` (Always locks, Once leaves it mouse-free) and
+        // `sync` (links y to the shared `sy` so all subplots share one y range).
+        template <typename _Scalar>
+        void draw_lines(
+            const char* title,
+            const plot_buffer_view<_Scalar>& v,
+            float window,
+            float y_lo,
+            float y_hi,
+            ImPlotCond y_cond,
+            bool sync,
+            double* sy,
+            const ImVec4* colors,
+            const char* const* names,
+            const ImVec2& size)
+        {
+            // legend shown (short names); the caller wraps each subplot in PushID/PopID for unique ids.
+            if (!ImPlot::BeginPlot(title, size, ImPlotFlags_None)) { return; }
+
+            ImPlot::SetupAxes(nullptr, nullptr, 0, 0);
+            ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+            if (sync) { ImPlot::SetupAxisLinks(ImAxis_Y1, &sy[0], &sy[1]); } // sync y only
+            // x always tracks the newest `window` seconds; y follows lock/sync.
+            ImPlot::SetupAxisLimits(ImAxis_X1, v.t_hi - window, v.t_hi, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, y_lo, y_hi, y_cond);
+
+            for (std::size_t k = 0; k < v.ys.size(); ++k)
+            {
+                ImPlotSpec spec;
+                spec.LineColor = colors[k];
+                spec.LineWeight = 2.0f;
+                spec.Offset = v.offset;
+                spec.Stride = v.stride;
+                ImPlot::PlotLine(names[k], v.xs, v.ys.data() + k, v.count, spec);
+            }
+            ImPlot::EndPlot();
+        }
+
     } // namespace
+
+    // Worker-thread tag detection; latches the annotated image + detections for the UI.
+    class debug_gui_observer final : public hw::sensor_frame_observer
+    {
+    public:
+        debug_gui_observer(const hw::sensor_frame_provider& provider, double tag_size_m)
+            : _provider{ provider }, _tag_size_m{ tag_size_m }
+        { }
+
+        bool try_get(
+            cv::Mat& out_img, 
+            std::vector<pose::tag_detection_t>& out_dets,
+            double& out_ts, 
+            uint64_t& last_seq)
+        {
+            std::scoped_lock lk{ _mtx };
+            if (_seq == last_seq || _latest.empty()) { return false; }
+            out_img = _latest;
+            out_dets = _detections;
+            out_ts = _timestamp;
+            last_seq = _seq;
+            return true;
+        }
+
+    public:
+        void on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& frame) override;
+        void on_sensor_stream_reset() override {}
+        void on_sensor_stream_end() override {}
+
+    private:
+        const hw::sensor_frame_provider& _provider;
+        double _tag_size_m{};
+        std::optional<pose::tag_detector> _detector;
+        std::mutex _mtx;
+        cv::Mat _latest;
+        std::vector<pose::tag_detection_t> _detections;
+        double _timestamp{ 0.0 }; // device timestamp [s] of the latched frame
+        uint64_t _seq{ 0 };
+    };
 
     void debug_gui_observer::on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& frame)
     {
@@ -66,19 +162,20 @@ namespace gui
         std::scoped_lock lk{ _mtx };
         _latest = std::move(annotated);
         _detections = std::move(detections);
+        _timestamp = frame->timestamp_in_sec();
         ++_seq;
     }
 
     debug_gui_app::debug_gui_app(const app::source_options& opt)
         : _opt{ opt }
     {
-        _dlg_device = static_cast<int>(opt.device_index);
-        if (opt.exposure_us.has_value()) { _dlg_manual_exposure = true; _dlg_exposure = opt.exposure_us.value(); }
-        if (opt.gain.has_value()) { _dlg_manual_gain = true; _dlg_gain = opt.gain.value(); }
-        _dlg_recording = opt.input_path;
-        _open_kind = opt.is_recording() ? 1 : 0;
+        _ui.device = static_cast<int>(opt.device_index);
+        if (opt.exposure_us.has_value()) { _ui.manual_exposure = true; _ui.exposure = opt.exposure_us.value(); }
+        if (opt.gain.has_value()) { _ui.manual_gain = true; _ui.gain = opt.gain.value(); }
+        _ui.recording = opt.input_path;
+        _ui.open_kind = opt.is_recording() ? source_kind_t::recording : source_kind_t::device;
 
-        _file_dialog.SetTitle("Open recording (.mkv)");
+        _file_dialog.SetTitle("Open recording file");
         _file_dialog.SetTypeFilters({ ".mkv" });
     }
 
@@ -100,7 +197,7 @@ namespace gui
         if (!_texture.has_value()) { _texture.emplace(this->renderer().sdl_renderer()); }
         this->_poll_observer();
 
-        if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) { _camera_fullscreen = !_camera_fullscreen; }
+        if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) { _ui.camera_fullscreen = !_ui.camera_fullscreen; }
         this->_render_menu_bar();
 
         const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -121,7 +218,7 @@ namespace gui
             ImGui::SetCursorPos(ImVec2{ cur.x + (avail.x - sz.x) * 0.5f, cur.y + (avail.y - sz.y) * 0.5f });
             ImGui::TextDisabled("%s", msg);
         }
-        else if (_camera_fullscreen)
+        else if (_ui.camera_fullscreen)
         {
             // Fullscreen: sensor frame scaled to fit, centered.
             if (!_texture.value().valid()) { ImGui::TextUnformatted("Waiting for frames...  (F11 to exit)"); }
@@ -149,8 +246,6 @@ namespace gui
 
             ImGui::BeginChild("side", ImVec2(0, 0), ImGuiChildFlags_Borders);
             this->_render_control_panel();
-            ImGui::Separator();
-            this->_render_angle_table();
             ImGui::EndChild();
         }
         ImGui::End();
@@ -160,8 +255,8 @@ namespace gui
         _file_dialog.Display();
         if (_file_dialog.HasSelected())
         {
-            _dlg_recording = _file_dialog.GetSelected().string();
-            _open_kind = 1;
+            _ui.recording = _file_dialog.GetSelected().string();
+            _ui.open_kind = source_kind_t::recording;
             _file_dialog.ClearSelected();
         }
     }
@@ -181,6 +276,8 @@ namespace gui
         _observer = std::move(observer);
         _last_seq = 0;
         _estimator.clear_rest_pose();
+        _euler_bufs.clear();
+        _quat_bufs.clear();
         spdlog::info("source '{}' opened", _provider->get_source_name());
     }
 
@@ -199,25 +296,27 @@ namespace gui
         _observer = std::move(observer);
         _last_seq = 0;
         _estimator.clear_rest_pose();
+        _euler_bufs.clear();
+        _quat_bufs.clear();
         spdlog::info("source '{}' opened", _provider->get_source_name());
     }
 
     void debug_gui_app::_do_open_source()
     {
-        if (_open_kind == 1)
+        if (_ui.open_kind == source_kind_t::recording)
         {
-            if (_dlg_recording.empty()) { spdlog::warn("no recording file selected"); return; }
+            if (_ui.recording.empty()) { spdlog::warn("no recording file selected"); return; }
             _opt.exposure_us.reset();
             _opt.gain.reset();
-            this->_open_recording(_dlg_recording);
+            this->_open_recording(_ui.recording);
         }
         else
         {
-            _opt.exposure_us = _dlg_manual_exposure ? std::optional<int32_t>{ _dlg_exposure } : std::nullopt;
-            _opt.gain = _dlg_manual_gain ? std::optional<int32_t>{ _dlg_gain } : std::nullopt;
-            this->_open_device(static_cast<uint32_t>(_dlg_device));
+            _opt.exposure_us = _ui.manual_exposure ? std::optional<int32_t>{ _ui.exposure } : std::nullopt;
+            _opt.gain = _ui.manual_gain ? std::optional<int32_t>{ _ui.gain } : std::nullopt;
+            this->_open_device(static_cast<uint32_t>(_ui.device));
         }
-        _show_open = false;
+        _ui.show_open = false;
     }
 
     void debug_gui_app::_do_close_source()
@@ -226,22 +325,41 @@ namespace gui
         _observer.reset();
         _opt.input_path.clear();
         _last_seq = 0;
+        _euler_bufs.clear();
+        _quat_bufs.clear();
     }
 
     void debug_gui_app::_poll_observer()
     {
-        if (_observer && _observer->try_get(_frame, _detections, _last_seq))
-        {
-            _texture.value().update(_frame);
-            _estimator.update(_detections);
-        }
-    }
+        double ts = 0.0;
+        if (!_observer || !_observer->try_get(_frame, _detections, ts, _last_seq)) { return; }
 
-    std::optional<Eigen::Quaterniond> debug_gui_app::_display_rot(const pose::joint_state_t& st) const
-    {
-        if (_relative_rot) { return st.local_anim_rot; } // local: relative to parent (delta from rest)
-        if (st.is_visible()) { return Eigen::Quaterniond{ st.view_pose.value().rotation() }.normalized(); }
-        return std::nullopt; // absolute: tag orientation in the camera frame
+        _texture.value().update(_frame);
+        _estimator.update(_detections);
+
+        // Append the current per-joint euler/quat samples, stamped with the device frame time.
+        _euler_bufs.advance(ts);
+        _quat_bufs.advance(ts);
+        int ji = 0;
+        for (const auto& info : pose::kJointsInfo)
+        {
+            const auto& st = _estimator.get_joint_state(info.id);
+            const auto rot = try_get_joint_rot(st, _ui.relative_rot);
+            if (rot.has_value())
+            {
+                const Eigen::Vector3d e = to_euler_deg(rot.value(), kEulerOrders[_ui.euler_order]);
+                _euler_bufs.push(ji, e.cast<float>());
+                _quat_bufs.push(ji, rot.value().cast<float>());
+            }
+            else // gap while the joint is not visible; NaN breaks the line
+            {
+                Eigen::Quaternionf qn;
+                qn.coeffs().setConstant(std::nanf(""));
+                _euler_bufs.push(ji, Eigen::Vector3f::Constant(std::nanf("")));
+                _quat_bufs.push(ji, qn);
+            }
+            ++ji;
+        }
     }
 
     void debug_gui_app::_render_menu_bar()
@@ -249,7 +367,7 @@ namespace gui
         if (!ImGui::BeginMainMenuBar()) { return; }
         if (ImGui::BeginMenu("File"))
         {
-            if (ImGui::MenuItem("Open...")) { _show_open = true; }
+            if (ImGui::MenuItem("Open...")) { _ui.show_open = true; }
             if (ImGui::MenuItem("Close", nullptr, false, _provider != nullptr)) { this->_do_close_source(); }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit")) { SDL_Event e{}; e.type = SDL_EVENT_QUIT; ::SDL_PushEvent(&e); }
@@ -257,7 +375,7 @@ namespace gui
         }
         if (ImGui::BeginMenu("View"))
         {
-            ImGui::MenuItem("Fullscreen", "F11", &_camera_fullscreen);
+            ImGui::MenuItem("Fullscreen", "F11", &_ui.camera_fullscreen);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -265,8 +383,20 @@ namespace gui
 
     void debug_gui_app::_render_control_panel()
     {
+        ImGui::SeparatorText("Sensor Info");
         if (_provider)
         {
+            // annotated sensor frame (texture) at the top of the section
+            if (_texture.value().valid())
+            {
+                const float scale = ImGui::GetContentRegionAvail().x / _texture.value().width();
+                ImGui::Image(_texture.value().id(), ImVec2{ _texture.value().width() * scale, _texture.value().height() * scale });
+            }
+            else
+            {
+                ImGui::TextUnformatted("Waiting for sensor frames...");
+            }
+
             ImGui::TextUnformatted(std::format("Source : {}", _provider->get_source_name()).c_str());
             const auto res = _provider->get_color_camera_resolution();
             ImGui::TextUnformatted(std::format("Color  : {}x{}", res.x(), res.y()).c_str());
@@ -289,9 +419,53 @@ namespace gui
             ImGui::TextUnformatted("No source opened. (File > Open...)");
         }
 
-        ImGui::SeparatorText("Rest Pose");
+        ImGui::SeparatorText("Visualization");
+        ImGui::TextUnformatted("Plot Type");
+        const auto plot_radio = [this](const char* label, plot_type_t val) {
+            // Switching mode changes the natural range, so reset the limits.
+            if (ImGui::RadioButton(label, _ui.plot_type == val)) { _ui.plot_type = val; _reset_plots = true; }
+        };
+        plot_radio("Axis Frame", plot_type_t::axis_frame);
+        ImGui::SameLine();
+        plot_radio("Euler Angles", plot_type_t::euler_line);
+        ImGui::SameLine();
+        plot_radio("Quaternion", plot_type_t::quat_line);
 
-        ImGui::TextUnformatted(_estimator.has_rest_pose() ? "rest pose: calibrated" : "rest pose: N/A");
+        // Plot limit controls (both implot3d axis view and implot line plots).
+        ImGui::Checkbox("Lock Plots", &_ui.lock_plots);
+        ImGui::SameLine();
+        // Toggling sync (re)initializes the shared range, so reset on change.
+        if (ImGui::Checkbox("Sync Plots", &_ui.sync_plots)) { _reset_plots = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Plots")) { _reset_plots = true; }
+
+        // A rotation-basis change invalidates both histories; an euler-order change only the euler one.
+        if (ImGui::Checkbox("Relative Rotation", &_ui.relative_rot))
+        {
+            _euler_bufs.clear();
+            _quat_bufs.clear();
+        }
+        if (ImGui::BeginCombo("Euler Order", kEulerOrders[_ui.euler_order].name))
+        {
+            for (int i = 0; i < static_cast<int>(kEulerOrders.size()); ++i)
+            {
+                const bool selected = (i == _ui.euler_order);
+                if (ImGui::Selectable(kEulerOrders[i].name, selected) && i != _ui.euler_order)
+                {
+                    _ui.euler_order = i;
+                    _euler_bufs.clear(); // quats are order-independent; keep their history
+                }
+                if (selected) { ImGui::SetItemDefaultFocus(); }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::Checkbox("Auto-fit Subplots", &_ui.subplot_autofit);
+        if (!_ui.subplot_autofit) {
+            ImGui::SliderFloat("Subplot Size", &_ui.subplot_size, 80.0f, 400.0f, "%.0f px");
+        }
+
+        ImGui::SeparatorText("Control");
+        ImGui::TextUnformatted(_estimator.has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
         ImGui::SameLine();
         if (ImGui::Button("Calibrate")) {
             if (!_estimator.calibrate_rest_pose()) {
@@ -300,33 +474,43 @@ namespace gui
         }
         ImGui::SameLine();
         if (ImGui::Button("Clear")) { _estimator.clear_rest_pose(); }
+    }
 
-        ImGui::SeparatorText("Visualization");
-        ImGui::Checkbox("Relative Rotation", &_relative_rot);
-        if (ImGui::BeginCombo("Euler Order", kEulerOrders[_euler_order].name))
+    // Axis-frame sync/reset via the internal ImPlot3DPlot (implot3d has no public links).
+    // Called inside each BeginPlot/EndPlot, after SetupAxesLimits.
+    void debug_gui_app::_sync_axis_frame()
+    {
+        ImPlot3DPlot* plot = ImPlot3D::GetCurrentPlot();
+        if (!plot) { return; }
+
+        // One-shot reset: snap to the home rotation and default ranges.
+        if (_reset_plots)
         {
-            for (int i = 0; i < static_cast<int>(kEulerOrders.size()); ++i)
+            plot->Rotation = plot->InitialRotation;
+            for (int a = 0; a < 3; ++a) { plot->Axes[a].SetRange(-1.2, 1.2); }
+        }
+
+        if (!_ui.sync_plots) { return; } // subplots independent
+
+        // The hovered/held plot (unless locked) is the master; the first sync frame and any reset
+        // (re)seed the shared reference from it. Everyone else follows the shared reference.
+        const bool master = !_sync_init || _reset_plots
+            || (!_ui.lock_plots && (plot->Hovered || plot->Held));
+        if (master)
+        {
+            _sync_rot[0] = plot->Rotation.x; _sync_rot[1] = plot->Rotation.y;
+            _sync_rot[2] = plot->Rotation.z; _sync_rot[3] = plot->Rotation.w;
+            for (int a = 0; a < 3; ++a)
             {
-                const bool selected = (i == _euler_order);
-                if (ImGui::Selectable(kEulerOrders[i].name, selected)) { _euler_order = i; }
-                if (selected) { ImGui::SetItemDefaultFocus(); }
+                _sync_range[a][0] = plot->Axes[a].Range.Min;
+                _sync_range[a][1] = plot->Axes[a].Range.Max;
             }
-            ImGui::EndCombo();
-        }
-        ImGui::Checkbox("Auto-fit Subplots", &_subplot_autofit);
-        if (!_subplot_autofit) {
-            ImGui::SliderFloat("Subplot Size", &_subplot_size, 80.0f, 400.0f, "%.0f px");
-        }
-
-        ImGui::SeparatorText("Sensor Frame");
-        if (_texture.value().valid())
-        {
-            const float scale = ImGui::GetContentRegionAvail().x / _texture.value().width();
-            ImGui::Image(_texture.value().id(), ImVec2{ _texture.value().width() * scale, _texture.value().height() * scale });
+            _sync_init = true;
         }
         else
         {
-            ImGui::TextUnformatted("Waiting for sensor frames...");
+            plot->Rotation = ImPlot3DQuat{ _sync_rot[0], _sync_rot[1], _sync_rot[2], _sync_rot[3] };
+            for (int a = 0; a < 3; ++a) { plot->Axes[a].SetRange(_sync_range[a][0], _sync_range[a][1]); }
         }
     }
 
@@ -338,7 +522,7 @@ namespace gui
 
         int cols = 1;
         float cell_sz = 1.0f;
-        if (_subplot_autofit)
+        if (_ui.subplot_autofit)
         {
             // Pick the column count whose square cell best fills the panel area.
             for (int c = 1; c <= n; ++c)
@@ -351,110 +535,135 @@ namespace gui
         }
         else
         {
-            cell_sz = _subplot_size * this->renderer().dpi_scale(); // DPI-aware px
+            cell_sz = _ui.subplot_size * this->renderer().dpi_scale(); // DPI-aware px
             cols = std::max(1, static_cast<int>((avail.x + spacing) / (cell_sz + spacing)));
         }
-        const ImVec2 cell{ cell_sz, cell_sz };
+
+        const ImVec2 plot_sz{ cell_sz, cell_sz };
+        const char* order = kEulerOrders[_ui.euler_order].name;
+
+        // Lines: x always auto-scrolls; Lock (or a one-shot reset) forces the default y range,
+        // otherwise y is mouse-adjustable. Axis frame: rotation/range sync handled in _sync_axis_frame().
+        const ImPlotCond y_cond = (_ui.lock_plots || _reset_plots) ? ImPlotCond_Always : ImPlotCond_Once;
 
         int col = 0;
+        int ji = 0;
         for (const auto& info : pose::kJointsInfo)
         {
             const auto& st = _estimator.get_joint_state(info.id);
-            const char* ref = (!_relative_rot || pose::is_root_joint(info.id))
+            const char* ref = (!_ui.relative_rot || pose::is_root_joint(info.id))
                 ? "camera" : pose::joint_info(info.parent).name.data();
-            const auto rot = this->_display_rot(st);
+            const auto rot = try_get_joint_rot(st, _ui.relative_rot);
+            const std::optional<Eigen::Vector3d> e = rot.has_value()
+                ? std::optional{ to_euler_deg(rot.value(), kEulerOrders[_ui.euler_order]) }
+                : std::nullopt;
 
-            if (col != 0) { ImGui::SameLine(); }
-            ImGui::BeginGroup();
-            const std::string title = std::format("{} (ref: {})##giz", info.name, ref);
-            if (ImPlot3D::BeginPlot(title.c_str(), cell, ImPlot3DFlags_Equal | ImPlot3DFlags_NoClip))
+            // Second title line: euler for the euler-line plot, else the quaternion.
+            std::string readout;
+            if (_ui.plot_type == plot_type_t::euler_line)
             {
-                ImPlot3D::SetupAxesLimits(-1.2, 1.2, -1.2, 1.2, -1.2, 1.2, ImPlot3DCond_Always);
-                if (rot.has_value()) { draw_axes(info.name, rot.value(), 3.0f); }
-                ImPlot3D::EndPlot();
-            }
-            ImGui::EndGroup();
-
-            if (++col >= cols) { col = 0; }
-        }
-    }
-
-    void debug_gui_app::_render_angle_table()
-    {
-        constexpr ImGuiTableFlags flags =
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
-        if (!ImGui::BeginTable("angles", 5, flags)) { return; }
-
-        ImGui::TableSetupColumn("Joint ID");
-        ImGui::TableSetupColumn("Visible");
-        ImGui::TableSetupColumn("X deg");
-        ImGui::TableSetupColumn("Y deg");
-        ImGui::TableSetupColumn("Z deg");
-        ImGui::TableHeadersRow();
-
-        for (const auto& info : pose::kJointsInfo)
-        {
-            const auto& st = _estimator.get_joint_state(info.id);
-            const auto rot = this->_display_rot(st);
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(std::format("{} (#{})", info.name, info.tag_id).c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(st.is_visible() ? "o" : "-");
-            if (rot.has_value())
-            {
-                const Eigen::Vector3d e = to_euler_deg(rot.value(), kEulerOrders[_euler_order]);
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(std::format("{:6.1f}", e.x()).c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(std::format("{:6.1f}", e.y()).c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(std::format("{:6.1f}", e.z()).c_str());
+                readout = e.has_value()
+                    ? std::format("Euler{}: {:.1f}, {:.1f}, {:.1f}", order, e->x(), e->y(), e->z())
+                    : std::format("Euler{}: -", order);
             }
             else
             {
-                ImGui::TableNextColumn(); ImGui::TextUnformatted("-");
-                ImGui::TableNextColumn(); ImGui::TextUnformatted("-");
-                ImGui::TableNextColumn(); ImGui::TextUnformatted("-");
+                readout = rot.has_value()
+                    ? std::format("Q: {:.3f}, {:.3f}, {:.3f}, {:.3f}", rot->x(), rot->y(), rot->z(), rot->w())
+                    : "Q: -";
             }
+            // `###name` = stable id so the per-frame readout doesn't reset the plot's zoom/rotation.
+            const std::string title = std::format("{} (ref: {})\n{}###{}", info.name, ref, readout, info.name);
+
+            if (col != 0) { ImGui::SameLine(); }
+            // Scope every id in this subplot (plot, legend, context menus) so implot3d/implot
+            // items don't clash across subplots. Lets the plot items keep short, plain labels.
+            ImGui::PushID(ji);
+            ImGui::BeginGroup();
+
+            if (_ui.plot_type == plot_type_t::axis_frame)
+            {
+                // Axis-frame view: RGB triad. Limits fixed; Lock/Sync/Reset act on the view rotation.
+                ImPlot3DFlags f3d = ImPlot3DFlags_Equal | ImPlot3DFlags_NoClip;
+                if (_ui.lock_plots) { f3d |= ImPlot3DFlags_NoRotate | ImPlot3DFlags_NoPan | ImPlot3DFlags_NoZoom; }
+                if (ImPlot3D::BeginPlot(title.c_str(), plot_sz, f3d))
+                {
+                    ImPlot3D::SetupAxesLimits(-1.2, 1.2, -1.2, 1.2, -1.2, 1.2, ImPlot3DCond_Once);
+                    ImPlot3D::SetupLegend(ImPlot3DLocation_West);
+                    this->_sync_axis_frame(); // read-back rotation/range sync across subplots + reset
+                    if (rot.has_value()) { draw_axes(rot.value(), 3.0f); }
+                    ImPlot3D::EndPlot();
+                }
+            }
+            else if (_ui.plot_type == plot_type_t::euler_line)
+            {
+                // Rolling history of the three euler angles (matches the triad colors).
+                const ImVec4 col[3]{ { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 0, 0, 1, 1 } };
+                const char* const nm[3]{ "X", "Y", "Z" };
+                draw_lines(title.c_str(), _euler_bufs.view(ji), kWindowSec, kEulerYLo, kEulerYHi,
+                    y_cond, _ui.sync_plots, _sync_y, col, nm, plot_sz);
+            }
+            else
+            {
+                // Rolling history of the quaternion components.
+                const ImVec4 col[4]{ { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 0, 0, 1, 1 }, { 0.85f, 0.85f, 0.2f, 1 } };
+                const char* const nm[4]{ "X", "Y", "Z", "W" };
+                draw_lines(title.c_str(), _quat_bufs.view(ji), kWindowSec, kQuatYLo, kQuatYHi,
+                    y_cond, _ui.sync_plots, _sync_y, col, nm, plot_sz);
+            }
+
+            ImGui::EndGroup();
+            ImGui::PopID();
+
+            if (++col >= cols) { col = 0; }
+            ++ji;
         }
-        ImGui::EndTable();
+
+        _reset_plots = false; // one-shot: the ranges were forced this frame
     }
 
     void debug_gui_app::_render_open_dialog()
     {
-        if (!_show_open) { return; }
+        if (!_ui.show_open) { return; }
         ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
-        if (ImGui::Begin("Open Source", &_show_open, ImGuiWindowFlags_NoCollapse))
+        if (ImGui::Begin("Open Source", &_ui.show_open, ImGuiWindowFlags_NoCollapse))
         {
-            ImGui::RadioButton("Device", &_open_kind, 0);
+            const auto kind_radio = [this](const char* label, source_kind_t val) {
+                if (ImGui::RadioButton(label, _ui.open_kind == val)) { _ui.open_kind = val; }
+            };
+            kind_radio("Device", source_kind_t::device);
             ImGui::SameLine();
-            ImGui::RadioButton("Recording", &_open_kind, 1);
+            kind_radio("Recording", source_kind_t::recording);
             ImGui::Separator();
 
-            if (_open_kind == 0)
+            if (_ui.open_kind == source_kind_t::device)
             {
-                ImGui::InputInt("Device index", &_dlg_device);
-                if (_dlg_device < 0) { _dlg_device = 0; }
-                ImGui::Checkbox("Manual exposure [us]", &_dlg_manual_exposure);
-                if (_dlg_manual_exposure)
+                ImGui::InputInt("Device index", &_ui.device);
+                if (_ui.device < 0) { _ui.device = 0; }
+                ImGui::Checkbox("Manual exposure [us]", &_ui.manual_exposure);
+                if (_ui.manual_exposure)
                 {
                     ImGui::SameLine(); ImGui::SetNextItemWidth(120);
-                    ImGui::InputInt("##exposure", &_dlg_exposure);
+                    ImGui::InputInt("##exposure", &_ui.exposure);
                 }
-                ImGui::Checkbox("Manual gain", &_dlg_manual_gain);
-                if (_dlg_manual_gain)
+                ImGui::Checkbox("Manual gain", &_ui.manual_gain);
+                if (_ui.manual_gain)
                 {
                     ImGui::SameLine(); ImGui::SetNextItemWidth(120);
-                    ImGui::InputInt("##gain", &_dlg_gain);
+                    ImGui::InputInt("##gain", &_ui.gain);
                 }
             }
             else
             {
                 if (ImGui::Button("Browse...")) { _file_dialog.Open(); }
                 ImGui::SameLine();
-                ImGui::TextUnformatted(_dlg_recording.empty() ? "(no file selected)" : _dlg_recording.c_str());
+                ImGui::TextUnformatted(_ui.recording.empty() ? "(no file selected)" : _ui.recording.c_str());
             }
 
             ImGui::Separator();
             if (ImGui::Button("Open", ImVec2(90, 0))) { this->_do_open_source(); }
             ImGui::SameLine();
-            if (ImGui::Button("Cancel", ImVec2(90, 0))) { _show_open = false; }
+            if (ImGui::Button("Cancel", ImVec2(90, 0))) { _ui.show_open = false; }
         }
         ImGui::End();
     }

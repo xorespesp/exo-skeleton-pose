@@ -1,13 +1,9 @@
 ﻿#include "pose_estimator.hh"
 
-#include <numbers>
-
 namespace pose
 {
     namespace
     {
-        constexpr double kRadToDeg = 180.0 / std::numbers::pi;
-
         size_t index_of(joint_id_t j) { return static_cast<size_t>(j); }
 
         // Orthonormalized rotation part of a tag->camera pose as a quaternion.
@@ -20,14 +16,6 @@ namespace pose
         Eigen::Quaterniond q_relative(const Eigen::Quaterniond& parent, const Eigen::Quaterniond& child)
         {
             return (parent.conjugate() * child).normalized();
-        }
-
-        // Intrinsic XYZ euler decomposition [deg].
-        // NOTE: euler angles wrap and hit gimbal singularities; use anim_rot (the
-        // quaternion) for anything downstream, and treat these as a readout only.
-        Eigen::Vector3d to_euler_deg(const Eigen::Quaterniond& q)
-        {
-            return q.toRotationMatrix().eulerAngles(0, 1, 2) * kRadToDeg;
         }
     } // namespace
 
@@ -76,13 +64,12 @@ namespace pose
 
             if (!curr_j_state.local_rot.has_value()) { continue; }
 
-            curr_j_state.anim_rot = curr_j_state.local_rot.value(); // no rest captured -> identity rest
+            curr_j_state.local_anim_rot = curr_j_state.local_rot.value(); // no rest captured -> identity rest
             if (_rest_pose.has_value())
             {
                 const auto& rest = _rest_pose.value()[index_of(curr_j_info.id)];
-                if (rest.has_value()) { curr_j_state.anim_rot = q_relative(rest.value(), curr_j_state.local_rot.value()); }
+                if (rest.has_value()) { curr_j_state.local_anim_rot = q_relative(rest.value(), curr_j_state.local_rot.value()); }
             }
-            curr_j_state.euler_deg = to_euler_deg(curr_j_state.anim_rot.value());
         }
     }
 

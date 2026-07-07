@@ -86,27 +86,23 @@ namespace hw
             throw std::runtime_error{ "k4a_device_capturer: failed to start cameras" };
         }
 
-        // Manual color controls (non-fatal if unsupported).
-        if (controls.exposure_us.has_value()) {
-            if (K4A_FAILED(::k4a_device_set_color_control(device,
-                K4A_COLOR_CONTROL_EXPOSURE_TIME_ABSOLUTE, 
-                K4A_COLOR_CONTROL_MODE_MANUAL,
-                *controls.exposure_us))) {
-                spdlog::warn("k4a: failed to set manual exposure {}us", *controls.exposure_us);
+        // Color controls (non-fatal if unsupported). The device retains previous
+        // settings across opens while it stays connected, so nullopt must actively
+        // reset the control to AUTO rather than leave a stale manual value in place.
+        const auto apply_color_control = [device](k4a_color_control_command_t cmd,
+                                                  std::optional<int32_t> value, const char* name)
+        {
+            const auto mode = value.has_value() ? K4A_COLOR_CONTROL_MODE_MANUAL : K4A_COLOR_CONTROL_MODE_AUTO;
+            if (K4A_FAILED(::k4a_device_set_color_control(device, cmd, mode, value.value_or(0)))) {
+                spdlog::warn("k4a: failed to set {} {}", name, value.has_value() ? "manual" : "auto");
+            } else if (value.has_value()) {
+                spdlog::info("k4a: manual {} {}", name, *value);
             } else {
-                spdlog::info("k4a: manual exposure {}us", *controls.exposure_us);
+                spdlog::info("k4a: auto {}", name);
             }
-        }
-        if (controls.gain.has_value()) {
-            if (K4A_FAILED(::k4a_device_set_color_control(device,
-                K4A_COLOR_CONTROL_GAIN, 
-                K4A_COLOR_CONTROL_MODE_MANUAL, 
-                *controls.gain))) {
-                spdlog::warn("k4a: failed to set manual gain {}", *controls.gain);
-            } else {
-                spdlog::info("k4a: manual gain {}", *controls.gain);
-            }
-        }
+        };
+        apply_color_control(K4A_COLOR_CONTROL_EXPOSURE_TIME_ABSOLUTE, controls.exposure_us, "exposure");
+        apply_color_control(K4A_COLOR_CONTROL_GAIN, controls.gain, "gain");
 
         // serial number (for logging; non-fatal if it fails)
         std::string serialnum;

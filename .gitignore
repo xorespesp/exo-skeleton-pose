@@ -8,3 +8,8 @@
 !/deps/.gitkeep
 /out/
 /*.local.*
+
+# webview (vite)
+/webview/node_modules/
+/webview/dist/
+/webview/src/protocol/

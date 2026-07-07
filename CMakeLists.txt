@@ -52,6 +52,10 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/gui/frame_texture.cc"
     "src/gui/debug_gui_app.hh"
     "src/gui/debug_gui_app.cc"
+
+    # server (websocket + flatbuffers protocol)
+    "src/net/pose_server.hh"
+    "src/net/pose_server.cc"
 )
 
 target_include_directories(${TARGET_NAME} PRIVATE
@@ -64,16 +68,46 @@ if (WIN32)
 endif()
 
 include(FetchCLI11)
-#include(FetchBoost)
 include(FetchEigen)
 include(FetchSpdlog)
 include(FetchAprilTag)
 include(FetchOrbbecK4A)
 include(FetchSDL3)
+include(FetchFlatBuffers)
+include(FetchUWebSockets)
 
 add_subdirectory(deps)
 
 find_package(OpenCV REQUIRED)
+
+# Generate protocol bindings from the FlatBuffers schema.
+set(FBS_SCHEMA "${CMAKE_CURRENT_SOURCE_DIR}/proto/pose_protocol.fbs")
+
+# C++ header -> build tree, compiled into the server.
+set(FBS_GEN_DIR "${CMAKE_BINARY_DIR}/generated")
+set(FBS_GEN_HEADER "${FBS_GEN_DIR}/pose_protocol_generated.h")
+add_custom_command(
+    OUTPUT ${FBS_GEN_HEADER}
+    COMMAND flatc --cpp -o ${FBS_GEN_DIR} ${FBS_SCHEMA}
+    DEPENDS ${FBS_SCHEMA} flatc
+    COMMENT "Generating FlatBuffers C++ header from pose_protocol.fbs"
+    VERBATIM
+)
+target_sources(${TARGET_NAME} PRIVATE ${FBS_GEN_HEADER})
+target_include_directories(${TARGET_NAME} PRIVATE ${FBS_GEN_DIR})
+
+# TS bindings -> webview build tree
+set(FBS_TS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webview/src/protocol")
+set(FBS_TS_BARREL "${FBS_TS_DIR}/exo/proto.ts")
+add_custom_command(
+    OUTPUT ${FBS_TS_BARREL}
+    COMMAND flatc --ts -o ${FBS_TS_DIR} ${FBS_SCHEMA}
+    DEPENDS ${FBS_SCHEMA} flatc
+    COMMENT "Generating FlatBuffers TS bindings for the webview"
+    VERBATIM
+)
+add_custom_target(webview_protocol DEPENDS ${FBS_TS_BARREL})
+add_dependencies(${TARGET_NAME} webview_protocol)
 
 target_link_libraries(${TARGET_NAME} PRIVATE
     Eigen3::Eigen
@@ -87,6 +121,8 @@ target_link_libraries(${TARGET_NAME} PRIVATE
     implot::implot
     implot3d::implot3d
     imfilebrowser::imfilebrowser
+    uwebsockets::uwebsockets
+    flatbuffers::flatbuffers
 )
 
 setup_orbbec_k4a_binaries(${TARGET_NAME} INSTALL_PATH ${CMAKE_INSTALL_BINDIR})

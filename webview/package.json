@@ -1,0 +1,19 @@
+{
+  "name": "exo-skeleton-pose-webview",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "three.js demo that drives an Xbot rig from the exo-skeleton-pose WebSocket protocol",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "flatbuffers": "^25.9.23",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

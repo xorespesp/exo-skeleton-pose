@@ -13,10 +13,18 @@ namespace gui
 {
     namespace
     {
-        // Intrinsic XYZ euler angles [deg] of a rotation (readout only).
-        Eigen::Vector3d to_euler_deg(const Eigen::Quaterniond& q)
+        // Selectable euler decomposition order (Eigen axis indices: 0=X, 1=Y, 2=Z).
+        struct euler_order_t { const char* name; int a0, a1, a2; };
+        constexpr std::array<euler_order_t, 6> kEulerOrders{ {
+            { "XYZ", 0, 1, 2 }, { "XZY", 0, 2, 1 }, { "YXZ", 1, 0, 2 },
+            { "YZX", 1, 2, 0 }, { "ZXY", 2, 0, 1 }, { "ZYX", 2, 1, 0 },
+        } };
+
+        // Euler angles [deg] of a rotation in the given order (readout only; euler
+        // angles wrap and hit gimbal singularities, so drive skeletons from the quaternion).
+        Eigen::Vector3d to_euler_deg(const Eigen::Quaterniond& q, const euler_order_t& order)
         {
-            return q.toRotationMatrix().eulerAngles(0, 1, 2) * (180.0 / std::numbers::pi);
+            return q.toRotationMatrix().eulerAngles(order.a0, order.a1, order.a2) * (180.0 / std::numbers::pi);
         }
 
         // RGB axis triad (X=red, Y=green, Z=blue) for `q`, into the current ImPlot3D plot.
@@ -81,9 +89,6 @@ namespace gui
             spdlog::error("failed to create GUI window");
             return -1;
         }
-
-        if (_opt.is_recording()) { this->_open_recording(_opt.input_path); }
-        else { this->_open_device(_opt.device_index); }
 
         this->app_base::run();
         this->destroy();
@@ -234,7 +239,7 @@ namespace gui
 
     std::optional<Eigen::Quaterniond> debug_gui_app::_display_rot(const pose::joint_state_t& st) const
     {
-        if (_relative_rot) { return st.anim_rot; } // local: relative to parent (delta from rest)
+        if (_relative_rot) { return st.local_anim_rot; } // local: relative to parent (delta from rest)
         if (st.is_visible()) { return Eigen::Quaterniond{ st.view_pose.value().rotation() }.normalized(); }
         return std::nullopt; // absolute: tag orientation in the camera frame
     }
@@ -298,6 +303,16 @@ namespace gui
 
         ImGui::SeparatorText("Visualization");
         ImGui::Checkbox("Relative Rotation", &_relative_rot);
+        if (ImGui::BeginCombo("Euler Order", kEulerOrders[_euler_order].name))
+        {
+            for (int i = 0; i < static_cast<int>(kEulerOrders.size()); ++i)
+            {
+                const bool selected = (i == _euler_order);
+                if (ImGui::Selectable(kEulerOrders[i].name, selected)) { _euler_order = i; }
+                if (selected) { ImGui::SetItemDefaultFocus(); }
+            }
+            ImGui::EndCombo();
+        }
         ImGui::Checkbox("Auto-fit Subplots", &_subplot_autofit);
         if (!_subplot_autofit) {
             ImGui::SliderFloat("Subplot Size", &_subplot_size, 80.0f, 400.0f, "%.0f px");
@@ -386,7 +401,7 @@ namespace gui
             ImGui::TableNextColumn(); ImGui::TextUnformatted(st.is_visible() ? "o" : "-");
             if (rot.has_value())
             {
-                const Eigen::Vector3d e = to_euler_deg(rot.value());
+                const Eigen::Vector3d e = to_euler_deg(rot.value(), kEulerOrders[_euler_order]);
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(std::format("{:6.1f}", e.x()).c_str());
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(std::format("{:6.1f}", e.y()).c_str());
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(std::format("{:6.1f}", e.z()).c_str());

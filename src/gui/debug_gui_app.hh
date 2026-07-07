@@ -98,6 +98,7 @@ namespace gui
 
         bool _camera_fullscreen{ false };
         bool _relative_rot{ true }; // true = local (vs parent), false = absolute (camera frame)
+        int _euler_order{ 0 }; // index into kEulerOrders for the angle-table readout
         bool _subplot_autofit{ true }; // pack subplots to fill the panel
         float _subplot_size{ 150.0f }; // manual subplot cell size [px], DPI-scaled at use
 

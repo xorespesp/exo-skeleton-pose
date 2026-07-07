@@ -68,8 +68,7 @@ namespace pose
     {
         std::optional<Eigen::Isometry3d> view_pose; // tag -> camera; set iff the tag was detected this frame
         std::optional<Eigen::Quaterniond> local_rot; // rotation relative to the parent joint's tag
-        std::optional<Eigen::Quaterniond> anim_rot; // local_rot relative to the captured rest pose (drives the skeleton)
-        Eigen::Vector3d euler_deg{ Eigen::Vector3d::Zero() }; // anim_rot as intrinsic XYZ euler angles [deg]
+        std::optional<Eigen::Quaterniond> local_anim_rot; // local_rot relative to the captured rest pose (drives the skeleton)
 
         bool is_visible() const { return view_pose.has_value(); } // tag detected this frame
     };
@@ -80,8 +79,8 @@ namespace pose
     //
     // Poses are tag->camera; the camera is not a fixed world frame, so only
     // rotations relative to a parent tag (local_rot = R_parent^-1 * R_child;
-    // root: vs camera) or to a captured rest pose (anim_rot = R_rest^-1 * R_local)
-    // are meaningful. anim_rot drives the skeleton; the rest pose is captured by
+    // root: vs camera) or to a captured rest pose (local_anim_rot = R_rest^-1 * R_local)
+    // are meaningful. local_anim_rot drives the skeleton; the rest pose is captured by
     // calibrate_rest_pose() in any neutral stance (not necessarily a T-pose).
     class pose_estimator
     {

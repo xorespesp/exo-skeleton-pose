@@ -1,0 +1,53 @@
+﻿// exo-skeleton-pose network protocol.
+//
+// codegen:
+//   C++ : flatc --cpp    -o <out> pose_protocol.fbs
+//   C#  : flatc --csharp -o <out> pose_protocol.fbs
+//   JS  : flatc --ts     -o <out> pose_protocol.fbs
+
+namespace exo.proto;
+
+// Lower-limb joints. Values match pose::joint_id_t on the server.
+enum JointId : ubyte { Pelvis = 0, RKnee, LKnee, RAnkle, LAnkle, RFoot, LFoot }
+
+// ---------------------------------------------------------------------------
+// Client -> Server commands
+// ---------------------------------------------------------------------------
+
+// Open a frame source. `source` is parsed by the server: an unsigned integer
+// selects a live device index, anything else is treated as a recording path.
+// `exposure_us` / `gain` are optional (null == auto); device sources only.
+table OpenSource  { source:string; tag_size_m:double = 0.05; exposure_us:int = null; gain:int = null; }
+table CloseSource {}
+table CalibrateRestPose {}   // latch the current pose as the rest (bind) reference
+table ClearRestPose {}       // drop the captured rest pose
+table GetServerStatus {}     // request the current ServerStatus (reply a ServerStatus, no Ack)
+
+// ---------------------------------------------------------------------------
+// Server -> Client events
+// ---------------------------------------------------------------------------
+
+struct Quat { x:double; y:double; z:double; w:double; }
+
+// One joint's rotation. `local_rot` is relative to the parent joint; 
+// `local_anim_rot` is that relative to the captured rest pose.
+// Both are identity when `visible` is false.
+table JointPose { id:JointId; visible:bool; local_rot:Quat; local_anim_rot:Quat; }
+
+// One estimation step, broadcast to subscribed clients per new frame.
+table PoseFrame { frame_id:uint; timestamp_us:long; has_rest_pose:bool; joints:[JointPose]; }
+
+// Current server state, pushed on connect, on change, or on GetServerStatus request.
+table ServerStatus { opened:bool; source_name:string; width:int; height:int;
+                     is_recording:bool; has_rest_pose:bool; }
+
+// Result of a command (ok / error text).
+table Ack { ok:bool; message:string; }
+
+union Payload {
+    OpenSource, CloseSource, CalibrateRestPose, ClearRestPose, GetServerStatus,  // client -> server
+    PoseFrame, ServerStatus, Ack                                                 // server -> client
+}
+
+table Message { payload:Payload; }
+root_type Message;

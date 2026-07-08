@@ -84,7 +84,7 @@ namespace net
 
         std::vector<pose::tag_detection_t> _detections;
         uint64_t _last_seq{ 0 };
-        int64_t _last_timestamp_us{ 0 }; // device timestamp of the latched frame
+        std::chrono::microseconds _last_timestamp{ 0 }; // device timestamp of the latched frame
         bool _is_recording{ false };
         size_t _client_count{ 0 }; // connected clients; source is released when it hits 0
     };

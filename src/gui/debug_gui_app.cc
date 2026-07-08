@@ -34,7 +34,7 @@ namespace gui
         std::optional<Eigen::Quaterniond> try_get_joint_rot(const pose::joint_state_t& st, bool relative)
         {
             if (relative) { return st.local_anim_rot; }
-            if (st.is_visible()) { return Eigen::Quaterniond{ st.view_pose.value().rotation() }.normalized(); }
+            if (st.view_pose.has_value()) { return Eigen::Quaterniond{ st.view_pose.value().rotation() }.normalized(); }
             return std::nullopt;
         }
 
@@ -115,9 +115,9 @@ namespace gui
         { }
 
         bool try_get(
-            cv::Mat& out_img, 
+            cv::Mat& out_img,
             std::vector<pose::tag_detection_t>& out_dets,
-            double& out_ts, 
+            std::chrono::microseconds& out_ts,
             uint64_t& last_seq)
         {
             std::scoped_lock lk{ _mtx };
@@ -141,7 +141,7 @@ namespace gui
         std::mutex _mtx;
         cv::Mat _latest;
         std::vector<pose::tag_detection_t> _detections;
-        double _timestamp{ 0.0 }; // device timestamp [s] of the latched frame
+        std::chrono::microseconds _timestamp{ 0 }; // device timestamp of the latched frame
         uint64_t _seq{ 0 };
     };
 
@@ -162,7 +162,7 @@ namespace gui
         std::scoped_lock lk{ _mtx };
         _latest = std::move(annotated);
         _detections = std::move(detections);
-        _timestamp = frame->timestamp_in_sec();
+        _timestamp = frame->timestamp;
         ++_seq;
     }
 
@@ -331,15 +331,18 @@ namespace gui
 
     void debug_gui_app::_poll_observer()
     {
-        double ts = 0.0;
+        std::chrono::microseconds ts{ 0 };
         if (!_observer || !_observer->try_get(_frame, _detections, ts, _last_seq)) { return; }
 
         _texture.value().update(_frame);
-        _estimator.update(_detections);
+
+        _estimator.update(_detections, ts);
 
         // Append the current per-joint euler/quat samples, stamped with the device frame time.
-        _euler_bufs.advance(ts);
-        _quat_bufs.advance(ts);
+        const double ts_sec = std::chrono::duration<double>{ ts }.count();
+        _euler_bufs.advance(ts_sec);
+        _quat_bufs.advance(ts_sec);
+
         int ji = 0;
         for (const auto& info : pose::kJointsInfo)
         {
@@ -351,7 +354,7 @@ namespace gui
                 _euler_bufs.push(ji, e.cast<float>());
                 _quat_bufs.push(ji, rot.value().cast<float>());
             }
-            else // gap while the joint is not visible; NaN breaks the line
+            else // gap while the joint has no rotation this frame; NaN breaks the line
             {
                 Eigen::Quaternionf qn;
                 qn.coeffs().setConstant(std::nanf(""));
@@ -383,97 +386,146 @@ namespace gui
 
     void debug_gui_app::_render_control_panel()
     {
-        ImGui::SeparatorText("Sensor Info");
-        if (_provider)
+        // Sensor info section
+        if (ImGui::CollapsingHeader("Sensor Info", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            // annotated sensor frame (texture) at the top of the section
-            if (_texture.value().valid())
+            if (_provider)
             {
-                const float scale = ImGui::GetContentRegionAvail().x / _texture.value().width();
-                ImGui::Image(_texture.value().id(), ImVec2{ _texture.value().width() * scale, _texture.value().height() * scale });
+                // annotated sensor frame (texture) at the top of the section
+                if (_texture.value().valid())
+                {
+                    const float scale = ImGui::GetContentRegionAvail().x / _texture.value().width();
+                    ImGui::Image(_texture.value().id(), ImVec2{ _texture.value().width() * scale, _texture.value().height() * scale });
+                }
+                else
+                {
+                    ImGui::TextUnformatted("Waiting for sensor frames...");
+                }
+
+                ImGui::TextUnformatted(std::format("Source : {}", _provider->get_source_name()).c_str());
+                const auto res = _provider->get_color_camera_resolution();
+                ImGui::TextUnformatted(std::format("Color  : {}x{}", res.x(), res.y()).c_str());
+                ImGui::TextUnformatted(std::format("FPS    : {:.1f}", _provider->get_current_update_rate()).c_str());
+
+                if (_opt.is_recording())
+                {
+                    if (ImGui::Button(_provider->is_paused() ? "Play" : "Pause")) {
+                        _provider->is_paused() ? _provider->play() : _provider->pause();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("|< Begin")) { _provider->seek_recording_to_begin(); }
+                    ImGui::SameLine();
+                    if (ImGui::Button("End >|")) { _provider->seek_recording_to_end(); }
+                }
             }
             else
             {
-                ImGui::TextUnformatted("Waiting for sensor frames...");
+                ImGui::TextUnformatted("No source opened. (File > Open...)");
+            }
+        }
+
+        // Visualization section
+        if (ImGui::CollapsingHeader("Visualization", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            if (ImGui::Checkbox("Relative Rotation", &_ui.relative_rot)) {
+                // A rotation-basis change invalidates both histories
+                _euler_bufs.clear();
+                _quat_bufs.clear();
             }
 
-            ImGui::TextUnformatted(std::format("Source : {}", _provider->get_source_name()).c_str());
-            const auto res = _provider->get_color_camera_resolution();
-            ImGui::TextUnformatted(std::format("Color  : {}x{}", res.x(), res.y()).c_str());
-            ImGui::TextUnformatted(std::format("FPS    : {:.1f}", _provider->get_current_update_rate()).c_str());
+            if (ImGui::BeginCombo("Euler Order", kEulerOrders[_ui.euler_order].name)) {
+                for (int i = 0; i < static_cast<int>(kEulerOrders.size()); ++i) {
+                    const bool selected = (i == _ui.euler_order);
+                    if (ImGui::Selectable(kEulerOrders[i].name, selected) && i != _ui.euler_order) {
+                        _ui.euler_order = i;
+                        _euler_bufs.clear(); // quats are order-independent; keep their history
+                    }
+                    if (selected) { ImGui::SetItemDefaultFocus(); }
+                }
+                ImGui::EndCombo();
+            }
 
-            if (_opt.is_recording())
+            constexpr std::array<const char*, 3> plot_types{ "Axis Frame", "Euler Angles", "Quaternion" };
+            if (ImGui::BeginCombo("Plot Type", plot_types[static_cast<int>(_ui.plot_type)])) {
+                for (size_t i = 0; i < plot_types.size(); ++i) {
+                    const plot_type_t curr_plot_type = static_cast<plot_type_t>(i);
+                    const bool selected = (curr_plot_type == _ui.plot_type);
+                    if (ImGui::Selectable(plot_types[i], selected) && !selected) {
+                        _ui.plot_type = curr_plot_type;
+                        _reset_plots = true;
+                    }
+                    if (selected) { ImGui::SetItemDefaultFocus(); }
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::Checkbox("Lock Plots", &_ui.lock_plots);
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Sync Plots", &_ui.sync_plots)) { _reset_plots = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset Plots")) { _reset_plots = true; }
+
+            ImGui::Checkbox("Auto-size Plots", &_ui.autosize_plots);
+            if (!_ui.autosize_plots) {
+                ImGui::SliderFloat("Plots Size", &_ui.plot_size_px, 80.0f, 400.0f, "%.0f px");
+            }
+        }
+
+        // Control section
+        if (ImGui::CollapsingHeader("Control", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            // ----- Rest Pose calibration options -----
+            ImGui::SeparatorText("Rest Pose");
             {
-                if (ImGui::Button(_provider->is_paused() ? "Play" : "Pause"))
-                {
-                    _provider->is_paused() ? _provider->play() : _provider->pause();
+                ImGui::TextUnformatted(_estimator.has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
+                ImGui::SameLine();
+                if (ImGui::Button("Calibrate")) {
+                    if (!_estimator.calibrate_rest_pose()) {
+                        spdlog::warn("calibrate: no joint had a computable local rotation");
+                    }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("|< Begin")) { _provider->seek_recording_to_begin(); }
-                ImGui::SameLine();
-                if (ImGui::Button("End >|")) { _provider->seek_recording_to_end(); }
+                if (ImGui::Button("Clear")) { _estimator.clear_rest_pose(); }
             }
-        }
-        else
-        {
-            ImGui::TextUnformatted("No source opened. (File > Open...)");
-        }
 
-        ImGui::SeparatorText("Visualization");
-        ImGui::TextUnformatted("Plot Type");
-        const auto plot_radio = [this](const char* label, plot_type_t val) {
-            // Switching mode changes the natural range, so reset the limits.
-            if (ImGui::RadioButton(label, _ui.plot_type == val)) { _ui.plot_type = val; _reset_plots = true; }
-        };
-        plot_radio("Axis Frame", plot_type_t::axis_frame);
-        ImGui::SameLine();
-        plot_radio("Euler Angles", plot_type_t::euler_line);
-        ImGui::SameLine();
-        plot_radio("Quaternion", plot_type_t::quat_line);
-
-        // Plot limit controls (both implot3d axis view and implot line plots).
-        ImGui::Checkbox("Lock Plots", &_ui.lock_plots);
-        ImGui::SameLine();
-        // Toggling sync (re)initializes the shared range, so reset on change.
-        if (ImGui::Checkbox("Sync Plots", &_ui.sync_plots)) { _reset_plots = true; }
-        ImGui::SameLine();
-        if (ImGui::Button("Reset Plots")) { _reset_plots = true; }
-
-        // A rotation-basis change invalidates both histories; an euler-order change only the euler one.
-        if (ImGui::Checkbox("Relative Rotation", &_ui.relative_rot))
-        {
-            _euler_bufs.clear();
-            _quat_bufs.clear();
-        }
-        if (ImGui::BeginCombo("Euler Order", kEulerOrders[_ui.euler_order].name))
-        {
-            for (int i = 0; i < static_cast<int>(kEulerOrders.size()); ++i)
+            // ----- Rotation filter options -----
+            ImGui::SeparatorText("Rotation Filter");
             {
-                const bool selected = (i == _ui.euler_order);
-                if (ImGui::Selectable(kEulerOrders[i].name, selected) && i != _ui.euler_order)
-                {
-                    _ui.euler_order = i;
-                    _euler_bufs.clear(); // quats are order-independent; keep their history
-                }
-                if (selected) { ImGui::SetItemDefaultFocus(); }
-            }
-            ImGui::EndCombo();
-        }
-        ImGui::Checkbox("Auto-fit Subplots", &_ui.subplot_autofit);
-        if (!_ui.subplot_autofit) {
-            ImGui::SliderFloat("Subplot Size", &_ui.subplot_size, 80.0f, 400.0f, "%.0f px");
-        }
+                using ms_d = pose::pose_estimator::ms_d;
+                constexpr auto kFlags = ImGuiSliderFlags_AlwaysClamp;
+                // Small double-DragScalar helper (params are double; avoids float temporaries).
+                const auto drag = [](const char* label, double& v, double lo, double hi, double step, const char* fmt) {
+                    return ImGui::DragScalar(label, ImGuiDataType_Double, &v, static_cast<float>(step), &lo, &hi, fmt, kFlags);
+                };
 
-        ImGui::SeparatorText("Control");
-        ImGui::TextUnformatted(_estimator.has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
-        ImGui::SameLine();
-        if (ImGui::Button("Calibrate")) {
-            if (!_estimator.calibrate_rest_pose()) {
-                spdlog::warn("calibrate: no joint had a computable local rotation");
+                auto& opt = _estimator.options();
+
+                ImGui::Checkbox("Enable smoothing", &opt.enable_smoothing);
+
+                // Kernel selector
+                const char* const kernel_kinds[] = { "One Euro" };
+                int curr_kind = static_cast<int>(opt.filter.kind);
+                if (ImGui::Combo("Kernel", &curr_kind, kernel_kinds, IM_ARRAYSIZE(kernel_kinds))) {
+                    opt.filter.kind = static_cast<pose::rotation_filter_kind>(curr_kind);
+                }
+
+                if (opt.filter.kind == pose::rotation_filter_kind::one_euro)
+                {
+                    ImGui::BeginDisabled(!opt.enable_smoothing);
+                    auto& oe = opt.filter.one_euro;
+                    drag("Min cutoff [Hz]", oe.min_cutoff_hz, 0.01, 10.0, 0.01, "%.2f");
+                    drag("Beta", oe.beta, 0.0, 1.0, 0.001, "%.3f");
+                    drag("Deriv cutoff [Hz]", oe.dcutoff_hz, 0.01, 10.0, 0.01, "%.2f");
+                    ImGui::EndDisabled();
+                }
+
+                // Occlusion hold (independent of the smoothing on/off switch).
+                double hold_ms = opt.max_hold.count();
+                if (drag("Max hold [ms]", hold_ms, 0.0, 1000.0, 1.0, "%.0f")) { opt.max_hold = ms_d{ hold_ms }; }
+                double reset_ms = opt.reset_gap.count();
+                if (drag("Reset gap [ms]", reset_ms, 0.0, 2000.0, 1.0, "%.0f")) { opt.reset_gap = ms_d{ reset_ms }; }
             }
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear")) { _estimator.clear_rest_pose(); }
     }
 
     // Axis-frame sync/reset via the internal ImPlot3DPlot (implot3d has no public links).
@@ -522,7 +574,7 @@ namespace gui
 
         int cols = 1;
         float cell_sz = 1.0f;
-        if (_ui.subplot_autofit)
+        if (_ui.autosize_plots)
         {
             // Pick the column count whose square cell best fills the panel area.
             for (int c = 1; c <= n; ++c)
@@ -535,7 +587,7 @@ namespace gui
         }
         else
         {
-            cell_sz = _ui.subplot_size * this->renderer().dpi_scale(); // DPI-aware px
+            cell_sz = _ui.plot_size_px * this->renderer().dpi_scale(); // DPI-aware px
             cols = std::max(1, static_cast<int>((avail.x + spacing) / (cell_sz + spacing)));
         }
 

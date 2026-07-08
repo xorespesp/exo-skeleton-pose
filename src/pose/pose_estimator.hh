@@ -1,13 +1,17 @@
 ﻿#pragma once
-#include "tag_detector.hh" // pose::tag_detection_t
+#include "tag_detector.hh"
+#include "rotation_filter.hh"
 
 #include <Eigen/Geometry>
 
 #include <array>
+#include <chrono>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
 #include <cstddef>
+#include <cstdint>
 
 namespace pose
 {
@@ -61,16 +65,24 @@ namespace pose
         return joint_info(j).parent == j;
     }
 
+    // NOTE: The estimator computes local rotations in a single forward pass over
+    // kJointsInfo, so every parent must precede its child. (parent index <= own)
+    static_assert([] {
+        for (const auto& j : kJointsInfo) {
+            if (static_cast<size_t>(j.parent) > static_cast<size_t>(j.id)) { return false; }
+        }
+        return true;
+    }(), "kJointsInfo must be parent-before-child ordered");
+
     // ---------------------------------------------------------------------------
     // Per-joint result of one estimation step
     // ---------------------------------------------------------------------------
     struct joint_state_t
     {
         std::optional<Eigen::Isometry3d> view_pose; // tag -> camera; set iff the tag was detected this frame
+        std::optional<Eigen::Quaterniond> global_rot; // smoothed+held global (camera-frame) rotation available (fresh or held; consumed by the relative pass)
         std::optional<Eigen::Quaterniond> local_rot; // rotation relative to the parent joint's tag
         std::optional<Eigen::Quaterniond> local_anim_rot; // local_rot relative to the captured rest pose (drives the skeleton)
-
-        bool is_visible() const { return view_pose.has_value(); } // tag detected this frame
     };
 
     // ---------------------------------------------------------------------------
@@ -85,15 +97,33 @@ namespace pose
     class pose_estimator
     {
     public:
+        using ms_d = std::chrono::duration<double, std::milli>;
+        using sec_d = std::chrono::duration<double>;
+
         struct options_t
         {
-            // reserved (e.g. euler decomposition order); currently intrinsic XYZ.
+            bool enable_smoothing = true; // master switch for the smoothing kernel (hold still applies)
+
+            // Joint occlusion policy (filter-agnostic, owned by the estimator).
+            ms_d max_hold{ 200.0 };  // hold a lost joint's last rotation up to this long (~6 frames @30fps)
+            ms_d reset_gap{ 400.0 };  // beyond this gap, reseed the kernel to the raw sample
+            sec_d dt_min{ 0.001 };    // dt clamp floor [s]
+            sec_d dt_max{ 0.100 };    // dt clamp ceiling [s] (avoids a jump after a long pause)
+
+            // Rotation-smoothing kernel selection + params (only one_euro for now).
+            rotation_filter_config filter{};
         };
 
         explicit pose_estimator(const options_t& opt = {});
 
+        options_t& options() noexcept { return _opt; }
+        const options_t& options() const noexcept { return _opt; }
+
         // Ingest one frame's detections and recompute every joint state.
-        void update(std::span<const tag_detection_t> detections);
+        void update(
+            std::span<const tag_detection_t> detections, 
+            std::chrono::microseconds timestamp // sensor timestamp of the frame
+        );
 
         // Latch the current per-joint local_rot as the rest (bind) reference.
         // Returns false if no joint had a computable local_rot this frame.
@@ -105,10 +135,22 @@ namespace pose
         std::span<const joint_state_t> get_joint_states() const { return _joint_states; }
 
     private:
-        options_t _opt;
-        std::array<joint_state_t, kNumJoints> _joint_states{};
+        // Per-joint state that persists across frames (filter + occlusion timers).
+        struct joint_filter_state_t
+        {
+            std::unique_ptr<rotation_filter_base> smoother; // swappable smoothing kernel
+            std::optional<Eigen::Quaterniond> last_out; // last smoothed global rotation (hold output)
+            std::chrono::microseconds last_seen{ 0 };   // time of the last fresh detection (hold timer origin)
+            std::chrono::microseconds t_prev{ 0 };      // time of the last fresh filter step (dt source)
+        };
 
-        // Captured rest pose: outer optional == "calibrated"; 
+        options_t _opt;
+        std::array<joint_state_t, kNumJoints> _joint_states{};      // per-frame output; reset every update()
+        std::array<joint_filter_state_t, kNumJoints> _filter_states{}; // persists across frames
+        std::array<bool, kNumJoints> _last_fresh{};                 // this frame's fresh-detection flags (rest gating)
+        rotation_filter_kind _built_kind{};                         // kernel kind currently instantiated in _filter_states
+
+        // Captured rest pose: outer optional == "calibrated";
         // inner per-joint optional == "that joint had a computable local_rot at capture time".
         std::optional<std::array<std::optional<Eigen::Quaterniond>, kNumJoints>> _rest_pose;
     };

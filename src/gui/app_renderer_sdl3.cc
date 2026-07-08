@@ -1,6 +1,4 @@
-// adapted from imgui/examples/example_sdl3_sdlrenderer3
-
-#include "app_renderer_sdl3.hh"
+﻿#include "app_renderer_sdl3.hh"
 
 #include <spdlog/spdlog.h>
 
@@ -189,9 +187,9 @@ namespace gui
         c[ImGuiCol_Button] = ImVec4(0.48f, 0.72f, 0.89f, 0.49f);
         c[ImGuiCol_ButtonHovered] = ImVec4(0.50f, 0.69f, 0.99f, 0.68f);
         c[ImGuiCol_ButtonActive] = ImVec4(0.80f, 0.50f, 0.50f, 1.00f);
-        c[ImGuiCol_Header] = ImVec4(0.30f, 0.69f, 1.00f, 0.53f);
-        c[ImGuiCol_HeaderHovered] = ImVec4(0.44f, 0.61f, 0.86f, 1.00f);
-        c[ImGuiCol_HeaderActive] = ImVec4(0.38f, 0.62f, 0.83f, 1.00f);
+        c[ImGuiCol_Header] = ImVec4(0.18f, 0.22f, 0.34f, 1.00f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.26f, 0.33f, 0.50f, 1.00f);
+        c[ImGuiCol_HeaderActive] = ImVec4(0.32f, 0.42f, 0.62f, 1.00f);
         c[ImGuiCol_Separator] = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
         c[ImGuiCol_SeparatorHovered] = ImVec4(0.70f, 0.60f, 0.60f, 1.00f);
         c[ImGuiCol_SeparatorActive] = ImVec4(0.90f, 0.70f, 0.70f, 1.00f);

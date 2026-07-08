@@ -38,9 +38,13 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/hw/k4a_frame_source.hh"
     "src/hw/k4a_frame_source.cc"
 
+    # dsp
+    "src/dsp/one_euro_filter.hh"
+
     # tag detection / pose
     "src/pose/tag_detector.hh"
     "src/pose/tag_detector.cc"
+    "src/pose/rotation_filter.hh"
     "src/pose/pose_estimator.hh"
     "src/pose/pose_estimator.cc"
 

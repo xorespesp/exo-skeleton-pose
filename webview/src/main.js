@@ -74,9 +74,13 @@ client.onPoseFrame = (frame) => {
     ui.frame_id = frame.frameId();
     for (let i = 0; i < frame.jointsLength(); i++) {
         const jp = frame.joints(i);
-        const e = quatToEulerDeg(jp.localAnimRot(), ui.euler_order); // convert on the client
-        ui.joints[BONE_BY_JOINT_ID[jp.id()]] =
-            jp.visible() ? `${e.x.toFixed(0)}, ${e.y.toFixed(0)}, ${e.z.toFixed(0)}` : '-';
+        const q = jp.localAnimRot(); // null when the joint is lost this frame
+        if (q) {
+            const e = quatToEulerDeg(q, ui.euler_order); // convert on the client
+            ui.joints[BONE_BY_JOINT_ID[jp.id()]] = `${e.x.toFixed(0)}, ${e.y.toFixed(0)}, ${e.z.toFixed(0)}`;
+        } else {
+            ui.joints[BONE_BY_JOINT_ID[jp.id()]] = '-';
+        }
     }
 };
 

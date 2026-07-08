@@ -44,14 +44,14 @@ namespace net
 
         // Returns false if nothing new since `last_seq`, else copies out + advances it.
         bool try_get(
-            std::vector<pose::tag_detection_t>& out_dets, 
-            int64_t& out_timestamp_us, 
+            std::vector<pose::tag_detection_t>& out_dets,
+            std::chrono::microseconds& out_timestamp,
             uint64_t& last_seq)
         {
             std::scoped_lock lk{ _mtx };
             if (_seq == last_seq) { return false; }
             out_dets = _detections;
-            out_timestamp_us = _timestamp_us;
+            out_timestamp = _timestamp;
             last_seq = _seq;
             return true;
         }
@@ -76,7 +76,7 @@ namespace net
 
             std::scoped_lock lk{ _mtx };
             _detections = std::move(detections);
-            _timestamp_us = frame->timestamp.count();
+            _timestamp = frame->timestamp;
             ++_seq;
         }
 
@@ -89,7 +89,7 @@ namespace net
         std::optional<pose::tag_detector> _detector; // built once intrinsics are known (after open)
         std::mutex _mtx;
         std::vector<pose::tag_detection_t> _detections;
-        int64_t _timestamp_us{ 0 }; // device timestamp of the latched frame
+        std::chrono::microseconds _timestamp{ 0 }; // device timestamp of the latched frame
         uint64_t _seq{ 0 };
         std::atomic<bool> _stream_ended{ false }; // set by the worker thread on stream end
     };
@@ -155,8 +155,8 @@ namespace net
 
     bool pose_server::_poll_new_detections()
     {
-        if (!_observer || !_observer->try_get(_detections, _last_timestamp_us, _last_seq)) { return false; }
-        _estimator.update(_detections);
+        if (!_observer || !_observer->try_get(_detections, _last_timestamp, _last_seq)) { return false; }
+        _estimator.update(_detections, _last_timestamp);
         return true;
     }
 
@@ -174,17 +174,27 @@ namespace net
         for (const auto& info : pose::kJointsInfo)
         {
             const auto& st = _estimator.get_joint_state(info.id);
-            const Eigen::Quaterniond ql = st.local_rot.value_or(Eigen::Quaterniond::Identity());
-            const Eigen::Quaterniond qa = st.local_anim_rot.value_or(Eigen::Quaterniond::Identity());
-            const fb_proto::Quat local_rot{ ql.x(), ql.y(), ql.z(), ql.w() };
-            const fb_proto::Quat local_anim_rot{ qa.x(), qa.y(), qa.z(), qa.w() };
+
+            const auto to_fb_quat = [](const Eigen::Quaterniond& q) {
+                return fb_proto::Quat{ q.x(), q.y(), q.z(), q.w() };
+            };
+
+            // NOTE: fb_local_rot, fb_local_anim_rot must outlive CreateJointPose, which copies them immediately.
+            fb_proto::Quat fb_local_rot, fb_local_anim_rot;
+            if (st.local_rot.has_value()) { fb_local_rot = to_fb_quat(st.local_rot.value()); }
+            if (st.local_anim_rot.has_value()) { fb_local_anim_rot = to_fb_quat(st.local_anim_rot.value()); }
+
+            // Optional rotations: write a Quat only when present, else nullptr. (absent on the wire)
             joints.push_back(fb_proto::CreateJointPose(
-                b, static_cast<fb_proto::JointId>(info.id), st.is_visible(), &local_rot, &local_anim_rot));
+                b, static_cast<fb_proto::JointId>(info.id),
+                st.local_rot.has_value() ? &fb_local_rot : nullptr,
+                st.local_anim_rot.has_value() ? &fb_local_anim_rot : nullptr
+            ));
         }
 
         const auto joints_vec = b.CreateVector(joints);
         const uint32_t frame_id = _provider ? _provider->get_current_frame_id() : 0;
-        const auto pose_frame = fb_proto::CreatePoseFrame(b, frame_id, _last_timestamp_us, _estimator.has_rest_pose(), joints_vec);
+        const auto pose_frame = fb_proto::CreatePoseFrame(b, frame_id, _last_timestamp.count(), _estimator.has_rest_pose(), joints_vec);
 
         b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_PoseFrame, pose_frame.Union(), kServerNotifyReqId));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());

@@ -37,9 +37,11 @@ export function applyPoseFrame(bones, bindPose, frame) {
         const jp = frame.joints(i);
         const name = BONE_BY_JOINT_ID[jp.id()];
         const bone = bones[name];
-        if (!bone || !jp.visible()) { continue; } // undetected joints keep their rest pose
+        if (!bone) { continue; }
 
         const q = jp.localAnimRot();
+        if (!q) { continue; } // lost joint (null rotation) keeps its rest pose
+
         _delta.set(q.x(), q.y(), q.z(), q.w());
         bone.quaternion.copy(bindPose[name]).multiply(_delta);
     }

@@ -60,11 +60,11 @@ namespace gui
         {
             // view / visualization
             bool  camera_fullscreen{ false };
-            bool  relative_rot{ true }; // true = local (vs parent), false = absolute (camera frame)
+            bool  relative_rot{ true }; // true = local (vs parent), false = global (camera frame)
             int   euler_order{ 0 };     // index into kEulerOrders for the euler readout
             plot_type_t plot_type{ plot_type_t::axis_frame };
-            bool  subplot_autofit{ true }; // pack subplots to fill the panel
-            float subplot_size{ 150.0f };  // manual subplot cell size [px], DPI-scaled at use
+            bool  autosize_plots{ true }; // pack subplots to fill the panel
+            float plot_size_px{ 150.0f }; // manual subplot cell size [px], DPI-scaled at use
             bool  lock_plots{ false }; // true = force default ranges (live); false = mouse-adjustable
             bool  sync_plots{ true };  // share one range across all subplots
 

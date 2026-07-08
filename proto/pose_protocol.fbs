@@ -39,15 +39,12 @@ table GetServerStatus {}   // request the current ServerStatus (reply a ServerSt
 
 struct Quat { x: double; y: double; z: double; w: double; }
 
-// One joint's rotation. 
-// `local_rot` -> relative to the parent joint
-// `local_anim_rot` -> relative to the captured rest pose
-// NOTE: Both are identity when `visible` is false.
+// One joint's rotation. Both rotations share presence: present when the joint has a
+// usable rotation (tag detected, or held through a brief occlusion), null when lost.
 table JointPose {
     id: JointId;
-    visible: bool;
-    local_rot: Quat;
-    local_anim_rot: Quat;
+    local_rot: Quat;      // relative to the parent joint; optional (null == lost)
+    local_anim_rot: Quat; // relative to the captured rest pose (drives skeleton); optional (null == lost)
 }
 
 // One estimation step, broadcast to subscribed clients per new frame.

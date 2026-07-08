@@ -1,7 +1,7 @@
 ﻿# Pose protocol
 
 Network protocol between the `exo-skeleton-pose` server (`serve` subcommand) and its clients. 
-`pose_protocol.fbs` is the single source of truth; all bindings are generated from it with [FlatBuffers](https://flatbuffers.dev/) `flatc`.
+`exo_pose_proto.fbs` is the single source of truth; all bindings are generated from it with [FlatBuffers](https://flatbuffers.dev/) `flatc`.
 
 ## Transport
 
@@ -25,6 +25,6 @@ The C++ header is generated automatically during the CMake build. To generate
 bindings for other languages from the same schema:
 
 ```
-flatc --ts     -o <out> pose_protocol.fbs   # JavaScript / TypeScript (webview)
-flatc --csharp -o <out> pose_protocol.fbs   # C#
+flatc --ts     -o <out> exo_pose_proto.fbs   # JavaScript / TypeScript (webview)
+flatc --csharp -o <out> exo_pose_proto.fbs   # C#
 ```

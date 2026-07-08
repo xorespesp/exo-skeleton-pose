@@ -1,4 +1,4 @@
-﻿#include "pose_estimator.hh"
+﻿#include "exo_pose_estimator.hh"
 
 #include <algorithm>
 
@@ -21,7 +21,7 @@ namespace pose
         }
     } // namespace
 
-    pose_estimator::pose_estimator(const options_t& opt)
+    exo_pose_estimator::exo_pose_estimator(const options_t& opt)
         : _opt{ opt }
     {
         for (auto& fs : _filter_states) {
@@ -30,12 +30,12 @@ namespace pose
         _built_kind = _opt.filter.kind;
     }
 
-    const joint_state_t& pose_estimator::get_joint_state(joint_id_t j) const
+    const joint_state_t& exo_pose_estimator::get_joint_state(joint_id_t j) const
     {
         return _joint_states[index_of(j)];
     }
 
-    void pose_estimator::update(
+    void exo_pose_estimator::update(
         std::span<const tag_detection_t> detections, 
         std::chrono::microseconds timestamp)
     {
@@ -91,7 +91,7 @@ namespace pose
                     curr_j_fstate.smoother->reset(q);
                     curr_j_fstate.last_out = q;
                 } else {
-                    const sec_d dt = std::clamp(sec_d{ t - curr_j_fstate.t_prev }, _opt.dt_min, _opt.dt_max);
+                    const seconds_f64 dt = std::clamp(seconds_f64{ t - curr_j_fstate.t_prev }, _opt.dt_min, _opt.dt_max);
                     curr_j_fstate.last_out = curr_j_fstate.smoother->filter(q, dt.count()); // hemisphere align + smoothing inside
                 }
                 curr_j_fstate.t_prev = t;
@@ -136,7 +136,7 @@ namespace pose
         }
     }
 
-    bool pose_estimator::calibrate_rest_pose()
+    bool exo_pose_estimator::calibrate_rest_pose()
     {
         std::array<std::optional<Eigen::Quaterniond>, kNumJoints> new_rest_pose{};
 
@@ -154,7 +154,7 @@ namespace pose
         return any;
     }
 
-    void pose_estimator::clear_rest_pose()
+    void exo_pose_estimator::clear_rest_pose()
     {
         _rest_pose.reset();
     }

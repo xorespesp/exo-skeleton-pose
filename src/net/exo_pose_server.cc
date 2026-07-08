@@ -1,9 +1,9 @@
-﻿#include "pose_server.hh"
+﻿#include "exo_pose_server.hh"
 
 #include "hw/sensor_frame_observer.hh"
 #include "pose/tag_detector.hh"
 
-#include "pose_protocol_generated.h"
+#include "exo_pose_proto_generated.h"
 
 #include <App.h>         // uWS
 #include <libusockets.h> // us_create_timer / us_timer_set / us_timer_ext
@@ -94,15 +94,15 @@ namespace net
         std::atomic<bool> _stream_ended{ false }; // set by the worker thread on stream end
     };
 
-    // --- pose_server -------------------------------------------------------------
-    pose_server::pose_server(
+    // --- exo_pose_server -------------------------------------------------------------
+    exo_pose_server::exo_pose_server(
         uint16_t port, 
         const app::source_options& initial)
         : _port{ port }
         , _initial{ initial }
     { }
 
-    bool pose_server::_do_open_source_stream(
+    bool exo_pose_server::_do_open_source_stream(
         const std::string& source, 
         double tag_size_m,
         std::optional<int32_t> exposure_us, 
@@ -135,7 +135,7 @@ namespace net
         return true;
     }
 
-    void pose_server::_do_close_source_stream()
+    void exo_pose_server::_do_close_source_stream()
     {
         _provider.reset(); // stops/joins the worker thread
         _observer.reset();
@@ -143,29 +143,29 @@ namespace net
         _last_seq = 0;
     }
 
-    bool pose_server::_do_calibrate_rest_pose()
+    bool exo_pose_server::_do_calibrate_rest_pose()
     {
         return _estimator.calibrate_rest_pose();
     }
 
-    void pose_server::_do_clear_rest_pose()
+    void exo_pose_server::_do_clear_rest_pose()
     {
         _estimator.clear_rest_pose();
     }
 
-    bool pose_server::_poll_new_detections()
+    bool exo_pose_server::_poll_new_detections()
     {
         if (!_observer || !_observer->try_get(_detections, _last_timestamp, _last_seq)) { return false; }
         _estimator.update(_detections, _last_timestamp);
         return true;
     }
 
-    bool pose_server::_poll_stream_ended()
+    bool exo_pose_server::_poll_stream_ended()
     {
         return _observer && _observer->consume_stream_ended_signal();
     }
 
-    std::string pose_server::_serialize_pose_frame() const
+    std::string exo_pose_server::_serialize_pose_frame() const
     {
         fb::FlatBufferBuilder b;
 
@@ -200,7 +200,7 @@ namespace net
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
-    std::string pose_server::_serialize_server_status(req_id_t req_id) const
+    std::string exo_pose_server::_serialize_server_status(req_id_t req_id) const
     {
         fb::FlatBufferBuilder b;
 
@@ -221,7 +221,7 @@ namespace net
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
-    std::string pose_server::_serialize_source_stream_ended() const
+    std::string exo_pose_server::_serialize_source_stream_ended() const
     {
         fb::FlatBufferBuilder b;
         // Recording EOF is graceful; a live device stopping on its own is a loss.
@@ -232,7 +232,7 @@ namespace net
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
-    std::string pose_server::_serialize_ack(
+    std::string exo_pose_server::_serialize_ack(
         bool ok, 
         std::string_view msg, 
         req_id_t req_id) const
@@ -243,7 +243,7 @@ namespace net
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
     }
 
-    int pose_server::run()
+    int exo_pose_server::run()
     {
         struct socket_data {
             bool accepted{ false }; // false for a rejected (over-capacity) socket
@@ -360,7 +360,7 @@ namespace net
         // Periodic pump on the loop thread: pull the latest detections, update the
         // estimator, and broadcast a PoseFrame. The provider's worker thread only
         // latches, so this is the single place pose data is serialized and sent.
-        struct timer_ctx { pose_server* self; uWS::App* app; };
+        struct timer_ctx { exo_pose_server* self; uWS::App* app; };
         auto* timer = ::us_create_timer(std::bit_cast<us_loop_t*>(uWS::Loop::get()), 0, sizeof(timer_ctx));
         auto* ctx = std::bit_cast<timer_ctx*>(::us_timer_ext(timer));
         ctx->self = this;

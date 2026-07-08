@@ -1,6 +1,6 @@
 #include "cli_options.hh"
 #include "gui/debug_gui_app.hh"
-#include "net/pose_server.hh"
+#include "net/exo_pose_server.hh"
 
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
@@ -31,7 +31,7 @@ int main(int argc, char** argv)
 
     try
     {
-        if (serve->parsed()) { return net::pose_server{ serve_port, serve_opt }.run(); }
+        if (serve->parsed()) { return net::exo_pose_server{ serve_port, serve_opt }.run(); }
         return gui::debug_gui_app{ gui_opt }.run();
     }
     catch (const std::exception& e)

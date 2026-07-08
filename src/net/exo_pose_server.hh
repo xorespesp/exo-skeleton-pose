@@ -2,7 +2,7 @@
 #include "cli_options.hh"
 
 #include "hw/sensor_frame_provider.hh"
-#include "pose/pose_estimator.hh"
+#include "pose/exo_pose_estimator.hh"
 
 #include <cstdint>
 #include <memory>
@@ -23,22 +23,22 @@ namespace net
     // (status/pose/ended notifications); clients must use a non-zero id.
     inline constexpr req_id_t kServerNotifyReqId{ 0 };
 
-    // uWS based pose server. (protocol: pose_protocol.fbs)
+    // uWS based pose server. (protocol: exo_pose_proto.fbs)
     //
     // NOTE: uWS runs one event loop on the calling thread.
     //       The provider's worker thread only latches detections;
     //       everything else happens on the loop thread, 
     //       so no extra locking is needed here.
     //       (command dispatch, estimator update, all sends ...)
-    class pose_server final
+    class exo_pose_server final
     {
     public:
-        pose_server(uint16_t port, const app::source_options& initial);
+        exo_pose_server(uint16_t port, const app::source_options& initial);
 
-        pose_server(const pose_server&) = delete;
-        pose_server& operator=(const pose_server&) = delete;
-        pose_server(pose_server&&) = delete;
-        pose_server& operator=(pose_server&&) = delete;
+        exo_pose_server(const exo_pose_server&) = delete;
+        exo_pose_server& operator=(const exo_pose_server&) = delete;
+        exo_pose_server(exo_pose_server&&) = delete;
+        exo_pose_server& operator=(exo_pose_server&&) = delete;
 
         // blocks: listen + run the event loop
         int run();
@@ -80,7 +80,7 @@ namespace net
 
         std::shared_ptr<hw::sensor_frame_provider> _provider;
         std::shared_ptr<pose_frame_observer> _observer;
-        pose::pose_estimator _estimator;
+        pose::exo_pose_estimator _estimator;
 
         std::vector<pose::tag_detection_t> _detections;
         uint64_t _last_seq{ 0 };

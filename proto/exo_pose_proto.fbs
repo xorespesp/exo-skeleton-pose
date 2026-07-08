@@ -1,9 +1,9 @@
 ﻿// exo-skeleton-pose network protocol.
 //
 // codegen:
-//   C++ : flatc --cpp    -o <out> pose_protocol.fbs
-//   C#  : flatc --csharp -o <out> pose_protocol.fbs
-//   JS  : flatc --ts     -o <out> pose_protocol.fbs
+//   C++ : flatc --cpp    -o <out> exo_pose_proto.fbs
+//   C#  : flatc --csharp -o <out> exo_pose_proto.fbs
+//   JS  : flatc --ts     -o <out> exo_pose_proto.fbs
 
 namespace exo.proto;
 

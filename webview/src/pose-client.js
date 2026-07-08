@@ -1,4 +1,4 @@
-﻿// WebSocket client for the exo-skeleton-pose protocol. (pose_protocol.fbs)
+﻿// WebSocket client for the exo-skeleton-pose protocol. (exo_pose_proto.fbs)
 
 import * as flatbuffers from 'flatbuffers';
 import {

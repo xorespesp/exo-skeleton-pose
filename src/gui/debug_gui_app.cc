@@ -491,7 +491,6 @@ namespace gui
             // ----- Rotation filter options -----
             ImGui::SeparatorText("Rotation Filter");
             {
-                using ms_d = pose::pose_estimator::ms_d;
                 constexpr auto kFlags = ImGuiSliderFlags_AlwaysClamp;
                 // Small double-DragScalar helper (params are double; avoids float temporaries).
                 const auto drag = [](const char* label, double& v, double lo, double hi, double step, const char* fmt) {
@@ -521,9 +520,9 @@ namespace gui
 
                 // Occlusion hold (independent of the smoothing on/off switch).
                 double hold_ms = opt.max_hold.count();
-                if (drag("Max hold [ms]", hold_ms, 0.0, 1000.0, 1.0, "%.0f")) { opt.max_hold = ms_d{ hold_ms }; }
+                if (drag("Max hold [ms]", hold_ms, 0.0, 1000.0, 1.0, "%.0f")) { opt.max_hold = pose::millis_f64{ hold_ms }; }
                 double reset_ms = opt.reset_gap.count();
-                if (drag("Reset gap [ms]", reset_ms, 0.0, 2000.0, 1.0, "%.0f")) { opt.reset_gap = ms_d{ reset_ms }; }
+                if (drag("Reset gap [ms]", reset_ms, 0.0, 2000.0, 1.0, "%.0f")) { opt.reset_gap = pose::millis_f64{ reset_ms }; }
             }
         }
     }

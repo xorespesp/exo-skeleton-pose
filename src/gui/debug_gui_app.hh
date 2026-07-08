@@ -6,7 +6,7 @@
 
 #include "hw/sensor_frame_provider.hh"
 #include "pose/tag_detector.hh"
-#include "pose/pose_estimator.hh"
+#include "pose/exo_pose_estimator.hh"
 #include "plot_buffer.hh"
 
 #include <imfilebrowser.h>
@@ -83,7 +83,7 @@ namespace gui
 
         std::shared_ptr<hw::sensor_frame_provider> _provider;
         std::shared_ptr<debug_gui_observer> _observer;
-        pose::pose_estimator _estimator;
+        pose::exo_pose_estimator _estimator;
 
         std::optional<frame_texture> _texture;
         ImGui::FileBrowser _file_dialog;

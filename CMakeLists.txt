@@ -45,8 +45,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/pose/tag_detector.hh"
     "src/pose/tag_detector.cc"
     "src/pose/rotation_filter.hh"
-    "src/pose/pose_estimator.hh"
-    "src/pose/pose_estimator.cc"
+    "src/pose/exo_pose_estimator.hh"
+    "src/pose/exo_pose_estimator.cc"
 
     # gui
     "src/gui/app_base.hh"
@@ -59,8 +59,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/gui/debug_gui_app.cc"
 
     # server (websocket + flatbuffers protocol)
-    "src/net/pose_server.hh"
-    "src/net/pose_server.cc"
+    "src/net/exo_pose_server.hh"
+    "src/net/exo_pose_server.cc"
 )
 
 target_include_directories(${TARGET_NAME} PRIVATE
@@ -86,16 +86,16 @@ add_subdirectory(deps)
 find_package(OpenCV REQUIRED)
 
 # Generate protocol bindings from the FlatBuffers schema.
-set(FBS_SCHEMA "${CMAKE_CURRENT_SOURCE_DIR}/proto/pose_protocol.fbs")
+set(FBS_SCHEMA "${CMAKE_CURRENT_SOURCE_DIR}/proto/exo_pose_proto.fbs")
 
 # C++ header -> build tree, compiled into the server.
 set(FBS_GEN_DIR "${CMAKE_BINARY_DIR}/generated")
-set(FBS_GEN_HEADER "${FBS_GEN_DIR}/pose_protocol_generated.h")
+set(FBS_GEN_HEADER "${FBS_GEN_DIR}/exo_pose_proto_generated.h")
 add_custom_command(
     OUTPUT ${FBS_GEN_HEADER}
     COMMAND flatc --cpp -o ${FBS_GEN_DIR} ${FBS_SCHEMA}
     DEPENDS ${FBS_SCHEMA} flatc
-    COMMENT "Generating FlatBuffers C++ header from pose_protocol.fbs"
+    COMMENT "Generating FlatBuffers C++ header from exo_pose_proto.fbs"
     VERBATIM
 )
 target_sources(${TARGET_NAME} PRIVATE ${FBS_GEN_HEADER})

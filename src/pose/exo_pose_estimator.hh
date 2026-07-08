@@ -15,6 +15,9 @@
 
 namespace pose
 {
+    using millis_f64 = std::chrono::duration<double, std::milli>;
+    using seconds_f64 = std::chrono::duration<double>;
+
     // ---------------------------------------------------------------------------
     // Skeleton definition
     // ---------------------------------------------------------------------------
@@ -94,27 +97,24 @@ namespace pose
     // root: vs camera) or to a captured rest pose (local_anim_rot = R_rest^-1 * R_local)
     // are meaningful. local_anim_rot drives the skeleton; the rest pose is captured by
     // calibrate_rest_pose() in any neutral stance (not necessarily a T-pose).
-    class pose_estimator
+    class exo_pose_estimator
     {
     public:
-        using ms_d = std::chrono::duration<double, std::milli>;
-        using sec_d = std::chrono::duration<double>;
-
         struct options_t
         {
             bool enable_smoothing = true; // master switch for the smoothing kernel (hold still applies)
 
             // Joint occlusion policy (filter-agnostic, owned by the estimator).
-            ms_d max_hold{ 200.0 };  // hold a lost joint's last rotation up to this long (~6 frames @30fps)
-            ms_d reset_gap{ 400.0 };  // beyond this gap, reseed the kernel to the raw sample
-            sec_d dt_min{ 0.001 };    // dt clamp floor [s]
-            sec_d dt_max{ 0.100 };    // dt clamp ceiling [s] (avoids a jump after a long pause)
+            millis_f64 max_hold{ 200.0 };  // hold a lost joint's last rotation up to this long (~6 frames @30fps)
+            millis_f64 reset_gap{ 400.0 }; // beyond this gap, reseed the kernel to the raw sample
+            seconds_f64 dt_min{ 0.001 };   // dt clamp floor [s]
+            seconds_f64 dt_max{ 0.100 };   // dt clamp ceiling [s] (avoids a jump after a long pause)
 
             // Rotation-smoothing kernel selection + params (only one_euro for now).
             rotation_filter_config filter{};
         };
 
-        explicit pose_estimator(const options_t& opt = {});
+        explicit exo_pose_estimator(const options_t& opt = {});
 
         options_t& options() noexcept { return _opt; }
         const options_t& options() const noexcept { return _opt; }

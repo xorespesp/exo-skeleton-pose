@@ -1,7 +1,7 @@
 ﻿# webview
 
 three.js demo that drives an Xbot rig from the `exo-skeleton-pose` WebSocket protocol.   
-(A test client for the protocol in `../proto/pose_protocol.fbs`)
+(A test client for the protocol in `../proto/exo_pose_proto.fbs`)
 
 ## Setup
 

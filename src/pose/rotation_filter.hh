@@ -46,15 +46,15 @@ namespace pose
         // (Re)seed the kernel with a known-good rotation. (cold start / after a gap)
         virtual void reset(const Eigen::Quaterniond& q) = 0;
 
-        // Smooth one sample. `dt_sec` is the elapsed time since the previous fresh sample (> 0). 
+        // Smooth one sample. `dt_sec` is the elapsed time since the previous fresh sample (> 0).
         // Returns the smoothed absolute rotation.
+        // NOTE: The caller supplies a hemisphere-continuous stream.
+        //       (no double-cover sign flips between samples)
         [[nodiscard]] virtual Eigen::Quaterniond filter(const Eigen::Quaterniond& q, double dt_sec) = 0;
     };
 
     // One Euro on SO(3): the value low-pass is a SLERP toward the new sample with
     // an adaptive factor; the speed derivative uses a scalar dsp::LowPassFilter.
-    // Hemisphere alignment against the previous output handles the quaternion
-    // sign flip (double-cover) before smoothing.
     class one_euro_rotation_filter final : public rotation_filter_base
     {
     public:
@@ -81,8 +81,7 @@ namespace pose
                 return _prev;
             }
 
-            Eigen::Quaterniond q = q_in.normalized();
-            if (_prev.dot(q) < 0.0) { q.coeffs() *= -1.0; } // hemisphere align (sign flip)
+            const Eigen::Quaterniond q = q_in.normalized(); // NOTE: caller guarantees hemisphere continuity
 
             const double speed = _prev.angularDistance(q) / dt_sec; // rad/s
             const double sp = _dspeed.filter(speed, dsp::alpha(_cfg.dcutoff_hz, dt_sec));

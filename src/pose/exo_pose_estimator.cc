@@ -83,7 +83,16 @@ namespace pose
 
             if (curr_j_state.view_pose.has_value()) // fresh detection
             {
-                const Eigen::Quaterniond q = rot_of(curr_j_state.view_pose.value());
+                Eigen::Quaterniond q = rot_of(curr_j_state.view_pose.value());
+
+                // A quaternion and its negation encode the same rotation (double-cover), so a
+                // tag pose can report q on one frame and -q on the next while the joint barely
+                // moved. That sign flip would surface as a large jump in the smoother, the
+                // time-series plots, and the broadcast stream. Flip the sample into the same
+                // hemisphere as the last emitted rotation to keep the stream sign-continuous.
+                if (curr_j_fstate.last_out.has_value() && curr_j_fstate.last_out->dot(q) < 0.0) {
+                    q.coeffs() *= -1.0;
+                }
 
                 // Reseed on cold start, after a long gap, or when smoothing is disabled
                 // (disabled -> raw passthrough while keeping the kernel synced for re-enable).
@@ -92,7 +101,7 @@ namespace pose
                     curr_j_fstate.last_out = q;
                 } else {
                     const seconds_f64 dt = std::clamp(seconds_f64{ t - curr_j_fstate.t_prev }, _opt.dt_min, _opt.dt_max);
-                    curr_j_fstate.last_out = curr_j_fstate.smoother->filter(q, dt.count()); // hemisphere align + smoothing inside
+                    curr_j_fstate.last_out = curr_j_fstate.smoother->filter(q, dt.count());
                 }
                 curr_j_fstate.t_prev = t;
                 curr_j_fstate.last_seen = t;

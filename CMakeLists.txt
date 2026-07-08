@@ -56,6 +56,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/gui/frame_texture.hh"
     "src/gui/frame_texture.cc"
     "src/gui/plot_buffer.hh"
+    "src/gui/log_console.hh"
+    "src/gui/log_console.cc"
     "src/gui/debug_gui_app.hh"
     "src/gui/debug_gui_app.cc"
 

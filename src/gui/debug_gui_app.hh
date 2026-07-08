@@ -2,6 +2,7 @@
 #include "app_base.hh"
 #include "app_renderer_sdl3.hh"
 #include "frame_texture.hh"
+#include "log_console.hh"
 #include "cli_options.hh"
 
 #include "hw/sensor_frame_provider.hh"
@@ -52,6 +53,8 @@ namespace gui
         void _render_control_panel();
         void _render_plot_panel();
         void _render_open_dialog();
+        void _render_log_panel();  // bottom dock: resize grip + log console child
+        float _log_split_height(); // clamps `_ui.log_h`; returns the main content height above the panel
         void _sync_axis_frame(); // read-back rotation/range sync + reset for the current implot3d plot
 
     private:
@@ -67,6 +70,9 @@ namespace gui
             float plot_size_px{ 150.0f }; // manual subplot cell size [px], DPI-scaled at use
             bool  lock_plots{ false }; // true = force default ranges (live); false = mouse-adjustable
             bool  sync_plots{ true };  // share one range across all subplots
+            float side_w{ 460.0f };    // right control panel width [px], splitter-adjustable
+            bool  show_log{ false };   // spdlog output console: bottom dock panel
+            float log_h{ 200.0f };     // bottom log panel height [px], splitter-adjustable
 
             // open-source dialog
             bool  show_open{ false };
@@ -87,6 +93,7 @@ namespace gui
 
         std::optional<frame_texture> _texture;
         ImGui::FileBrowser _file_dialog;
+        log_console _log_console;
 
         cv::Mat _frame;
         std::vector<pose::tag_detection_t> _detections;

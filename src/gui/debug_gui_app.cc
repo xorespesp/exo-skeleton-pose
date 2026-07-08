@@ -60,6 +60,14 @@ namespace gui
             ImPlot3D::PlotLine("Z", zx, zy, zz, 2, spec);
         }
 
+        // Splitter grip thickness [px]. It doubles as the inter-panel gap: surrounding
+        // ItemSpacing is zeroed so the visible border-to-border gap equals this on both
+        // axes, and the whole gap is the drag hit-target (same width for v/h splitters).
+        constexpr float kSplitHit = 6.0f;
+        constexpr float kLogMinH = 60.0f;  // min height for both the content and log panes [px]
+        constexpr float kPlotMinW = 200.0f; // min width for the plots pane [px]
+        constexpr float kSideMinW = 200.0f; // min width for the control pane [px]
+
         constexpr float kWindowSec = 10.0f; // scrolling line-plot window [s]
         constexpr float kEulerYLo = -190.0f, kEulerYHi = 190.0f; // euler deg range (all subplots)
         constexpr float kQuatYLo = -1.1f, kQuatYHi = 1.1f; // quaternion range (all subplots)
@@ -177,6 +185,10 @@ namespace gui
 
         _file_dialog.SetTitle("Open recording file");
         _file_dialog.SetTypeFilters({ ".mkv" });
+
+        // Mirror spdlog output into the in-GUI log console. Registered here (main thread,
+        // before any capture worker exists) so appending to the sink list is race-free.
+        spdlog::default_logger()->sinks().push_back(_log_console.sink());
     }
 
     int debug_gui_app::run()
@@ -207,20 +219,34 @@ namespace gui
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
 
+        // Drop the host's rounded corners and outer border.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         ImGui::Begin("##host", nullptr, host_flags);
+        ImGui::PopStyleVar(2);
+
+        // plots, control, and log are all direct host siblings (no wrapper child), so
+        // every inter-panel gap is the same kSplitHit-wide grip drawn over the same host
+        // background: the log/plots gap matches the control/plots gap exactly.
+        // `row_h` is the height of the main content row above the (optional) log panel.
+        const bool show_log = _ui.show_log && !_ui.camera_fullscreen;
+        const float row_h = show_log ? this->_log_split_height() : ImGui::GetContentRegionAvail().y;
+
         if (!_provider)
         {
-            // No source: centered call-to-action only.
+            // No source: centered call-to-action, bounded to the content row.
+            ImGui::BeginChild("content", ImVec2(0, row_h), ImGuiChildFlags_None);
             const char* msg = "Open a source to start.   (File > Open...)";
             const ImVec2 avail = ImGui::GetContentRegionAvail();
             const ImVec2 sz = ImGui::CalcTextSize(msg);
             const ImVec2 cur = ImGui::GetCursorPos();
             ImGui::SetCursorPos(ImVec2{ cur.x + (avail.x - sz.x) * 0.5f, cur.y + (avail.y - sz.y) * 0.5f });
             ImGui::TextDisabled("%s", msg);
+            ImGui::EndChild();
         }
         else if (_ui.camera_fullscreen)
         {
-            // Fullscreen: sensor frame scaled to fit, centered.
+            // Fullscreen: sensor frame scaled to fit, centered (log panel is hidden here).
             if (!_texture.value().valid()) { ImGui::TextUnformatted("Waiting for frames...  (F11 to exit)"); }
             else
             {
@@ -236,18 +262,32 @@ namespace gui
         }
         else
         {
-            // Normal: plot panel (left) + control panel and angle table (right).
-            const float left_w = ImGui::GetContentRegionAvail().x * 0.62f;
-            ImGui::BeginChild("plots", ImVec2(left_w, 0), ImGuiChildFlags_Borders);
+            // Normal: plot panel (left) + control panel (right), split by a grip whose
+            // width equals the log splitter's so every gap looks identical.
+            const float avail_x = ImGui::GetContentRegionAvail().x;
+            const float max_side = std::max(kSideMinW, avail_x - kSplitHit - kPlotMinW);
+            _ui.side_w = std::clamp(_ui.side_w, kSideMinW, max_side);
+            const float plots_w = avail_x - _ui.side_w - kSplitHit;
+
+            ImGui::BeginChild("plots", ImVec2(plots_w, row_h), ImGuiChildFlags_Borders);
             this->_render_plot_panel();
             ImGui::EndChild();
 
-            ImGui::SameLine();
+            // Vertical resize grip (no visible line): flush to both panes (zero spacing),
+            // so the whole inter-panel gap is grabbable. Drag left to grow the control pane.
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::InvisibleButton("##side_split", ImVec2(kSplitHit, row_h));
+            if (ImGui::IsItemActive()) { _ui.side_w -= ImGui::GetIO().MouseDelta.x; }
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive()) { ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW); }
+            ImGui::SameLine(0.0f, 0.0f);
 
-            ImGui::BeginChild("side", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            ImGui::BeginChild("side", ImVec2(0, row_h), ImGuiChildFlags_Borders);
             this->_render_control_panel();
             ImGui::EndChild();
         }
+
+        if (show_log) { this->_render_log_panel(); }
+
         ImGui::End();
 
         this->_render_open_dialog();
@@ -379,6 +419,7 @@ namespace gui
         if (ImGui::BeginMenu("View"))
         {
             ImGui::MenuItem("Fullscreen", "F11", &_ui.camera_fullscreen);
+            ImGui::MenuItem("Log Panel", nullptr, &_ui.show_log);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -680,6 +721,35 @@ namespace gui
         }
 
         _reset_plots = false; // one-shot: the ranges were forced this frame
+    }
+
+    float debug_gui_app::_log_split_height()
+    {
+        const float avail_y = ImGui::GetContentRegionAvail().y;
+        const float max_log = std::max(kLogMinH, avail_y - kSplitHit - kLogMinH);
+        _ui.log_h = std::clamp(_ui.log_h, kLogMinH, max_log);
+        return avail_y - _ui.log_h - kSplitHit;
+    }
+
+    void debug_gui_app::_render_log_panel()
+    {
+        // Starting a new line after the content row already advanced the cursor by one
+        // ItemSpacing.y; undo it so the grip sits flush against the row. Without this the
+        // vertical gap would be ItemSpacing.y wider than the (SameLine-flush) side splitter.
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - ImGui::GetStyle().ItemSpacing.y);
+
+        // Horizontal resize grip (no visible line): zero spacing keeps it flush to both
+        // panes, so the inter-panel gap matches the vertical splitter's width and the
+        // whole gap is grabbable. Drag up to grow the panel, down to shrink it.
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+        ImGui::InvisibleButton("##log_split", ImVec2(-1.0f, kSplitHit));
+        if (ImGui::IsItemActive()) { _ui.log_h -= ImGui::GetIO().MouseDelta.y; }
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) { ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS); }
+
+        ImGui::BeginChild("logpanel", ImVec2(0.0f, _ui.log_h), ImGuiChildFlags_Borders);
+        ImGui::PopStyleVar(); // restore spacing for the console's own contents
+        _log_console.draw();
+        ImGui::EndChild();
     }
 
     void debug_gui_app::_render_open_dialog()

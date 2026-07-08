@@ -62,14 +62,15 @@ namespace pose
         _joint_states = {};
         _last_fresh = {};
 
-        // Pass 1: bind detections (with a pose) to joints via the static tag table.
+        // Pass 1: bind each detection's selected pose to its joint via the static tag table.
         for (const auto& curr_det : detections)
         {
-            if (!curr_det.pose.has_value()) { continue; }
+            if (!curr_det.pose.has_value()) { continue; } // no pose (no intrinsics / undetected)
+
             const auto joint = tag_to_joint(curr_det.id);
             if (!joint.has_value()) { continue; } // tag id not part of the rig
 
-            _joint_states[index_of(joint.value())].view_pose = curr_det.pose.value();
+            _joint_states[index_of(joint.value())].view_pose = curr_det.pose->transform;
         }
 
         // Pass 2: smooth+hold each joint's GLOBAL (camera-frame) rotation. (joint order irrelevant)

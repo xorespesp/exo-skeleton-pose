@@ -6,6 +6,7 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include <array>
 #include <format>
 #include <string>
 
@@ -33,17 +34,28 @@ namespace pose
 
     } // namespace
 
+    struct tag_detector::context_t
+    {
+        std::unique_ptr<::apriltag_detector, void(*)(::apriltag_detector*)> detector{
+            ::apriltag_detector_create(), 
+            &::apriltag_detector_destroy 
+        };
+        std::unique_ptr<::apriltag_family, void(*)(::apriltag_family*)> family{
+            ::tagStandard41h12_create(), 
+            &::tagStandard41h12_destroy 
+        };
+    };
+
     tag_detector::tag_detector(const options_t& opt)
         : _opt{ opt }
-        , _detector{ ::apriltag_detector_create(), &::apriltag_detector_destroy }
-        , _family{ ::tagStandard41h12_create(), &::tagStandard41h12_destroy }
+        , _ctx{ std::make_unique<context_t>() }
     {
-        ::apriltag_detector_add_family(_detector.get(), _family.get());
+        ::apriltag_detector_add_family(_ctx->detector.get(), _ctx->family.get());
 
-        _detector->quad_decimate = _opt.quad_decimate;
-        _detector->quad_sigma = _opt.quad_sigma;
-        _detector->nthreads = _opt.nthreads;
-        _detector->refine_edges = _opt.refine_edges;
+        _ctx->detector->quad_decimate = _opt.quad_decimate;
+        _ctx->detector->quad_sigma = _opt.quad_sigma;
+        _ctx->detector->nthreads = static_cast<int>(_opt.num_threads);
+        _ctx->detector->refine_edges = _opt.refine_edges;
     }
 
     tag_detector::~tag_detector() = default;
@@ -59,7 +71,7 @@ namespace pose
         ::image_u8_t im{ gray.cols, gray.rows, static_cast<int32_t>(gray.step[0]), gray.data };
 
         const std::unique_ptr<::zarray_t, void(*)(::zarray_t*)> raw{
-            ::apriltag_detector_detect(_detector.get(), &im), 
+            ::apriltag_detector_detect(_ctx->detector.get(), &im),
             &::apriltag_detections_destroy
         };
 
@@ -82,20 +94,61 @@ namespace pose
 
             const hw::intrinsic_t& intr = _opt.intrinsics.value();
             ::apriltag_detection_info_t info{ d, _opt.tag_size_m, intr.fx, intr.fy, intr.cx, intr.cy };
-            ::apriltag_pose_t pose{};
-            ::estimate_tag_pose(&info, &pose);
-            const Eigen::Isometry3d transform = to_isometry(pose);
-            ::matd_destroy(pose.R);
-            ::matd_destroy(pose.t);
+
+            // Run orthogonal iteration directly (estimate_tag_pose is just this + a min-error pick),
+            // keeping both planar-ambiguity solutions and their errors for the selector.
+            double err1{ 0.0 }, err2{ 0.0 };
+            ::apriltag_pose_t p1{}, p2{};
+            ::estimate_tag_pose_orthogonal_iteration(
+                &info, 
+                &err1, &p1, 
+                &err2, &p2, 
+                static_cast<int>(_opt.num_iters)
+            );
 
             const double len = _opt.tag_size_m * 0.5;
-            det.pose = transform;
-            det.axes = std::array<cv::Point2f, 4>{
-                project(intr, transform, { 0.0, 0.0, 0.0 }),
-                project(intr, transform, { len, 0.0, 0.0 }),
-                project(intr, transform, { 0.0, len, 0.0 }),
-                project(intr, transform, { 0.0, 0.0, len }),
+            const auto make_tag_pose = [&intr, len](const ::apriltag_pose_t& p, double err) {
+                const Eigen::Isometry3d tf = to_isometry(p);
+                return tag_pose_t{
+                    tf,
+                    err,
+                    std::array<cv::Point2f, 4>{
+                        project(intr, tf, { 0.0, 0.0, 0.0 }),
+                        project(intr, tf, { len, 0.0, 0.0 }),
+                        project(intr, tf, { 0.0, len, 0.0 }),
+                        project(intr, tf, { 0.0, 0.0, len }),
+                    }
+                };
             };
+
+            // NOTE: Orthogonal iteration always returns solution 1; the second exists only when a
+            // distinct minimum was found (p2.R != null), else err2 == HUGE_VAL and p2.t is unset.
+            std::array<tag_pose_t, 2> pose_cands_buff;
+            size_t num_pose_cands{};
+            
+            pose_cands_buff[0] = make_tag_pose(p1, err1);
+            num_pose_cands = 1;
+            ::matd_destroy(p1.R);
+            ::matd_destroy(p1.t);
+
+            if (p2.R != nullptr) { 
+                pose_cands_buff[1] = make_tag_pose(p2, err2);
+                num_pose_cands = 2;
+                ::matd_destroy(p2.R);
+                ::matd_destroy(p2.t);
+            }
+
+            // Select the best pose candidate (or leave empty if none were selected)
+            const std::span<const tag_pose_t> pose_cands_span{ pose_cands_buff.data(), num_pose_cands };
+            const tag_pose_t* const selected_pose = _opt.selector
+                ? _opt.selector(det.id, pose_cands_span)
+                : selectors::min_error(det.id, pose_cands_span);
+
+            if (selected_pose != nullptr) {
+                det.pose = *selected_pose;
+            } else {
+                // No pose was selected. leave empty.
+            }
         }
 
         return detections;
@@ -111,15 +164,17 @@ namespace pose
             cv::putText(bgr, std::format("{}", d.id), d.center,
                 cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar{ 0, 255, 255 }, 2);
 
-            if (d.axes.has_value()) {
-                const auto& a = d.axes.value();
+            if (d.pose.has_value()) {
+                const auto& a = d.pose->axes;
                 cv::line(bgr, a[0], a[1], cv::Scalar{ 0, 0, 255 }, 2); // X red
                 cv::line(bgr, a[0], a[2], cv::Scalar{ 0, 255, 0 }, 2); // Y green
                 cv::line(bgr, a[0], a[3], cv::Scalar{ 255, 0, 0 }, 2); // Z blue
-            }
-            if (d.pose.has_value()) {
-                cv::putText(bgr, std::format("{:.2f}m", d.pose->translation().norm()), d.corners[2],
-                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar{ 255, 255, 255 }, 2);
+                cv::putText(
+                    bgr,
+                    std::format("{:.2f}m", d.pose->transform.translation().norm()),
+                    d.corners[2],
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar{ 255, 255, 255 }, 2
+                );
             }
         }
     }

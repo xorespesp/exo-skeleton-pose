@@ -45,6 +45,7 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/pose/tag_detector.hh"
     "src/pose/tag_detector.cc"
     "src/pose/rotation_filter.hh"
+    "src/pose/rotation_constraint.hh"
     "src/pose/exo_pose_estimator.hh"
     "src/pose/exo_pose_estimator.cc"
 

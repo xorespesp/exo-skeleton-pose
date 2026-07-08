@@ -9,6 +9,7 @@
 #include <array>
 #include <format>
 #include <string>
+#include <utility>
 
 namespace pose
 {
@@ -125,20 +126,29 @@ namespace pose
             // distinct minimum was found (p2.R != null), else err2 == HUGE_VAL and p2.t is unset.
             std::array<tag_pose_t, 2> pose_cands_buff;
             size_t num_pose_cands{};
-            
+
             pose_cands_buff[0] = make_tag_pose(p1, err1);
             num_pose_cands = 1;
             ::matd_destroy(p1.R);
             ::matd_destroy(p1.t);
 
-            if (p2.R != nullptr) { 
+            if (p2.R != nullptr) {
                 pose_cands_buff[1] = make_tag_pose(p2, err2);
                 num_pose_cands = 2;
                 ::matd_destroy(p2.R);
                 ::matd_destroy(p2.t);
             }
 
-            // Select the best pose candidate (or leave empty if none were selected)
+            // Order by object-space error (ascending) so candidate [0] is the best geometric fit.
+            if (num_pose_cands == 2 && pose_cands_buff[1].obj_err < pose_cands_buff[0].obj_err) {
+                std::swap(pose_cands_buff[0], pose_cands_buff[1]);
+            }
+
+            // Expose the raw candidates so downstream consumers can re-select;
+            // the detector still picks one via its own selector.
+            det.pose_candidates = pose_cands_buff;
+            det.num_pose_candidates = static_cast<int>(num_pose_cands);
+
             const std::span<const tag_pose_t> pose_cands_span{ pose_cands_buff.data(), num_pose_cands };
             const tag_pose_t* const selected_pose = _opt.pose_selector
                 ? _opt.pose_selector(det.id, pose_cands_span)

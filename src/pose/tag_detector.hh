@@ -29,6 +29,8 @@ namespace pose
         float decision_margin{ 0.0f };        // decode confidence (higher = better)
         cv::Point2f center{};                 // tag center in pixels
         std::array<cv::Point2f, 4> corners{}; // corner pixels, counter-clockwise
+        std::array<tag_pose_t, 2> pose_candidates{}; // raw orthogonal-iteration solutions, obj_err ascending
+        int num_pose_candidates{ 0 };         // valid entries in pose_candidates (0 without intrinsics, else 1 or 2)
         std::optional<tag_pose_t> pose;       // pose the selector chose (tag->camera); empty without intrinsics
     };
 
@@ -62,7 +64,7 @@ namespace pose
             float quad_decimate{ 1.0f }; // 1.0 = full resolution (best corner accuracy)
             float quad_sigma{ 0.0f };    // Gaussian blur sigma for quad detection (0 = none)
             size_t num_threads{ 4 };     // detection worker threads
-            bool refine_edges{ true };   // snap quad edges to gradients (better accuracy)
+            bool refine_edges{ true };   // align quad edges to image gradients (better accuracy)
             size_t num_iters{ 50 };      // orthogonal-iteration count (default = 50)
             tag_pose_candidate_selector_fn pose_selector{ selectors::min_error }; // pose-candidate selection policy
         };

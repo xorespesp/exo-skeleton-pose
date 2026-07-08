@@ -524,6 +524,15 @@ namespace gui
                 double reset_ms = opt.reset_gap.count();
                 if (drag("Reset gap [ms]", reset_ms, 0.0, 2000.0, 1.0, "%.0f")) { opt.reset_gap = pose::millis_f64{ reset_ms }; }
             }
+
+            // ----- Leg-hinge constraint options -----
+            ImGui::SeparatorText("Hinge Constraint");
+            {
+                auto& opt = _estimator.options();
+                ImGui::Checkbox("Enable hinge constraint", &opt.enable_hinge_constraint);
+                ImGui::SetItemTooltip("Reject the planar-ambiguity flip and constrain each joint to its\n"
+                                      "1-DOF hinge axis. Needs a captured rest pose.");
+            }
         }
     }
 
@@ -534,7 +543,7 @@ namespace gui
         ImPlot3DPlot* plot = ImPlot3D::GetCurrentPlot();
         if (!plot) { return; }
 
-        // One-shot reset: snap to the home rotation and default ranges.
+        // One-shot reset: return to the home rotation and default ranges.
         if (_reset_plots)
         {
             plot->Rotation = plot->InitialRotation;

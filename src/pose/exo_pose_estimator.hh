@@ -78,6 +78,15 @@ namespace pose
     }(), "kJointsInfo must be parent-before-child ordered");
 
     // ---------------------------------------------------------------------------
+    // Leg-hinge constraint (1-DOF joint)
+    // ---------------------------------------------------------------------------
+    //
+    // IMPORTANT: Each leg joint rotates about a single leg-hinge axis.
+    // By mounting convention every tag's local X axis is aligned with its joint's flexion axis (see docs/README.md),
+    // so in the rest-relative frame the valid motion is a pure rotation about X for every joint.
+    inline const Eigen::Vector3d kExoHingeLocalAxis = Eigen::Vector3d::UnitX();
+
+    // ---------------------------------------------------------------------------
     // Per-joint result of one estimation step
     // ---------------------------------------------------------------------------
     struct joint_state_t
@@ -89,14 +98,14 @@ namespace pose
     };
 
     // ---------------------------------------------------------------------------
-    // Estimator: tag detections -> per-joint local / animation rotations
+    // exo skeleton pose estimator: tag detections -> per-joint local / animation rotations
     // ---------------------------------------------------------------------------
     //
     // Poses are tag->camera; the camera is not a fixed world frame, so only
-    // rotations relative to a parent tag (local_rot = R_parent^-1 * R_child;
-    // root: vs camera) or to a captured rest pose (local_anim_rot = R_rest^-1 * R_local)
-    // are meaningful. local_anim_rot drives the skeleton; the rest pose is captured by
-    // calibrate_rest_pose() in any neutral stance (not necessarily a T-pose).
+    // rotations relative to a parent tag (local_rot = R_parent^-1 * R_child; root: vs camera)
+    // or to a captured rest pose (local_anim_rot = R_rest^-1 * R_local) are meaningful.
+    // local_anim_rot drives the skeleton; the rest pose is captured by
+    // calibrate_rest_pose() in any neutral stance. (not necessarily a T-pose)
     class exo_pose_estimator
     {
     public:
@@ -112,47 +121,41 @@ namespace pose
 
             // Rotation-smoothing kernel selection + params (only one_euro for now).
             rotation_filter_config filter{};
+
+            // Hinge constraint: reject the planar-ambiguity flip and constrain each joint to its 1-DOF leg-hinge axis. 
+            // Active only once a rest pose is captured.
+            bool enable_hinge_constraint = true;
         };
 
         explicit exo_pose_estimator(const options_t& opt = {});
+        ~exo_pose_estimator();
+
+        exo_pose_estimator(const exo_pose_estimator&) = delete;
+        exo_pose_estimator& operator=(const exo_pose_estimator&) = delete;
 
         options_t& options() noexcept { return _opt; }
         const options_t& options() const noexcept { return _opt; }
 
         // Ingest one frame's detections and recompute every joint state.
         void update(
-            std::span<const tag_detection_t> detections, 
-            std::chrono::microseconds timestamp // sensor timestamp of the frame
+            std::span<const tag_detection_t> tag_detections, 
+            std::chrono::microseconds sensor_timestamp // sensor timestamp of the frame
         );
 
         // Latch the current per-joint local_rot as the rest (bind) reference.
         // Returns false if no joint had a computable local_rot this frame.
         bool calibrate_rest_pose();
         void clear_rest_pose();
-        bool has_rest_pose() const { return _rest_pose.has_value(); }
+        bool has_rest_pose() const;
 
         const joint_state_t& get_joint_state(joint_id_t j) const;
-        std::span<const joint_state_t> get_joint_states() const { return _joint_states; }
+        std::span<const joint_state_t> get_joint_states() const;
 
     private:
-        // Per-joint state that persists across frames (filter + occlusion timers).
-        struct joint_filter_state_t
-        {
-            std::unique_ptr<rotation_filter_base> smoother; // swappable smoothing kernel
-            std::optional<Eigen::Quaterniond> last_out; // last smoothed global rotation (hold output)
-            std::chrono::microseconds last_seen{ 0 };   // time of the last fresh detection (hold timer origin)
-            std::chrono::microseconds t_prev{ 0 };      // time of the last fresh filter step (dt source)
-        };
+        struct context_t;
 
         options_t _opt;
-        std::array<joint_state_t, kNumJoints> _joint_states{};      // per-frame output; reset every update()
-        std::array<joint_filter_state_t, kNumJoints> _filter_states{}; // persists across frames
-        std::array<bool, kNumJoints> _last_fresh{};                 // this frame's fresh-detection flags (rest gating)
-        rotation_filter_kind _built_kind{};                         // kernel kind currently instantiated in _filter_states
-
-        // Captured rest pose: outer optional == "calibrated";
-        // inner per-joint optional == "that joint had a computable local_rot at capture time".
-        std::optional<std::array<std::optional<Eigen::Quaterniond>, kNumJoints>> _rest_pose;
+        std::unique_ptr<context_t> _ctx;
     };
 
 } // namespace pose

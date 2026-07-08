@@ -64,7 +64,7 @@ namespace pose
             size_t num_threads{ 4 };     // detection worker threads
             bool refine_edges{ true };   // snap quad edges to gradients (better accuracy)
             size_t num_iters{ 50 };      // orthogonal-iteration count (default = 50)
-            tag_pose_candidate_selector_fn selector{ selectors::min_error }; // pose-candidate selection policy
+            tag_pose_candidate_selector_fn pose_selector{ selectors::min_error }; // pose-candidate selection policy
         };
 
         explicit tag_detector(const options_t& opt = {});

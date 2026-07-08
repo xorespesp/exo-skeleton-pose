@@ -140,8 +140,8 @@ namespace pose
 
             // Select the best pose candidate (or leave empty if none were selected)
             const std::span<const tag_pose_t> pose_cands_span{ pose_cands_buff.data(), num_pose_cands };
-            const tag_pose_t* const selected_pose = _opt.selector
-                ? _opt.selector(det.id, pose_cands_span)
+            const tag_pose_t* const selected_pose = _opt.pose_selector
+                ? _opt.pose_selector(det.id, pose_cands_span)
                 : selectors::min_error(det.id, pose_cands_span);
 
             if (selected_pose != nullptr) {

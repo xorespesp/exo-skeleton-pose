@@ -5,7 +5,6 @@
 #include "log_console.hh"
 #include "cli_options.hh"
 
-#include "hw/sensor_frame_provider.hh"
 #include "pose/tag_detector.hh"
 #include "pose/exo_pose_estimator.hh"
 #include "plot_buffer.hh"
@@ -26,39 +25,31 @@ namespace net { class exo_pose_server; }
 
 namespace gui
 {
-    // forward-declaration of worker thread tag detection observer
-    class debug_gui_observer;
-
     enum class plot_type_t { axis_frame, euler_line, quat_line };
 
     enum class source_kind_t { device, recording };
 
-    // Debugger GUI app
+    // Debug GUI for the pose server: starts/stops the WebSocket listener and drives the pose
+    // pipeline (source open/close, rest-pose calibration) while visualizing the annotated frame
+    // and per-joint rotations. Owns the server; the listener starts stopped.
     class debug_gui_app final : public app_base<app_renderer_sdl3>
     {
     public:
-        // `server` null: own the source. non-null: monitor/control the server's source.
-        explicit debug_gui_app(
-            const app::source_options& opt, 
-            net::exo_pose_server* server = nullptr
-        );
+        debug_gui_app(const app::source_options& opt, uint16_t port);
+        ~debug_gui_app();
 
-        int run(); // create window, open the initial source, loop, destroy
+        int run(); // create window, loop, destroy
 
     public:
         void render_ui() override;
 
     private:
-        // Active pipeline: the server's when monitoring, else this GUI's own.
-        pose::exo_pose_estimator& _est();
-        bool _is_source_recording() const;
-
         void _open_device(uint32_t index);
         void _open_recording(const std::string& path);
 
         void _do_open_source();
         void _do_close_source();
-        void _poll_observer();
+        void _update_pose_frame();
 
         void _render_menu_bar();
         void _render_control_panel();
@@ -97,11 +88,7 @@ namespace gui
         };
 
         app::source_options _opt;
-        net::exo_pose_server* _server{ nullptr }; // non-null -> monitor mode
-
-        std::shared_ptr<hw::sensor_frame_provider> _provider;
-        std::shared_ptr<debug_gui_observer> _observer;
-        pose::exo_pose_estimator _estimator;
+        std::unique_ptr<net::exo_pose_server> _server;
 
         std::optional<frame_texture> _texture;
         ImGui::FileBrowser _file_dialog;

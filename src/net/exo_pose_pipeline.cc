@@ -220,9 +220,35 @@ namespace net
         return _provider ? _provider->get_color_camera_resolution() : Eigen::Vector2i::Zero();
     }
 
+    float exo_pose_pipeline::source_fps() const
+    {
+        return _provider ? _provider->get_current_update_rate() : 0.0f;
+    }
+
     uint32_t exo_pose_pipeline::current_frame_id() const
     {
         return _provider ? _provider->get_current_frame_id() : 0;
+    }
+
+    bool exo_pose_pipeline::is_source_paused() const
+    {
+        return _provider && _provider->is_paused();
+    }
+
+    void exo_pose_pipeline::set_source_paused(bool paused)
+    {
+        if (!_provider) { return; }
+        paused ? _provider->pause() : _provider->play();
+    }
+
+    void exo_pose_pipeline::seek_to_begin()
+    {
+        if (_provider) { _provider->seek_recording_to_begin(); }
+    }
+
+    void exo_pose_pipeline::seek_to_end()
+    {
+        if (_provider) { _provider->seek_recording_to_end(); }
     }
 
 } // namespace net

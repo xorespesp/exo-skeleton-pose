@@ -356,46 +356,6 @@ namespace net
         return 0;
     }
 
-    // --- GUI Debugger accessors (delegate to the pipeline) ---------------------------
-    pose::exo_pose_estimator& exo_pose_server::estimator() { return _imp->pipeline.estimator(); }
-    const pose::exo_pose_estimator& exo_pose_server::estimator() const { return _imp->pipeline.estimator(); }
-    std::shared_ptr<hw::sensor_frame_provider> exo_pose_server::provider_shared() const { return _imp->pipeline.provider_shared(); }
-    bool exo_pose_server::is_source_recording() const { return _imp->pipeline.is_source_recording(); }
-
-    bool exo_pose_server::try_get_annotated_frame(
-        cv::Mat& out_img,
-        std::vector<pose::tag_detection_t>& out_dets,
-        std::chrono::microseconds& out_ts,
-        uint64_t& last_seq)
-    {
-        return _imp->pipeline.try_get_annotated_frame(out_img, out_dets, out_ts, last_seq);
-    }
-
-    bool exo_pose_server::open_device(uint32_t index, std::optional<int32_t> exposure_us, std::optional<int32_t> gain)
-    {
-        return _imp->pipeline.open_device(index, exposure_us, gain);
-    }
-
-    bool exo_pose_server::open_recording(const std::string& path)
-    {
-        return _imp->pipeline.open_recording(path);
-    }
-
-    void exo_pose_server::close_source()
-    {
-        _imp->pipeline.close_source();
-    }
-
-    bool exo_pose_server::calibrate_rest_pose()
-    {
-        return _imp->pipeline.calibrate_rest_pose();
-    }
-
-    void exo_pose_server::clear_rest_pose()
-    {
-        _imp->pipeline.clear_rest_pose();
-    }
-
     void exo_pose_server::_pump_pipeline()
     {
         // poll() consumes the pipeline's per-step signals; broadcast each while the listener is up.

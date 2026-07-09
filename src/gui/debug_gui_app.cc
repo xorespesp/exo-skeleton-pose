@@ -1,7 +1,7 @@
 ﻿#include "debug_gui_app.hh"
 
 #include "net/exo_pose_server.hh"
-#include "hw/sensor_frame_observer.hh"
+#include "net/exo_pose_pipeline.hh"
 
 #include <spdlog/spdlog.h>
 
@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
-#include <mutex>
 #include <numbers>
 
 namespace gui
@@ -115,71 +114,9 @@ namespace gui
 
     } // namespace
 
-    // Worker-thread tag detection; latches the annotated image + detections for the UI.
-    class debug_gui_observer final : public hw::sensor_frame_observer
-    {
-    public:
-        debug_gui_observer(const hw::sensor_frame_provider& provider, double tag_size_m)
-            : _provider{ provider }, _tag_size_m{ tag_size_m }
-        { }
-
-        bool try_get(
-            cv::Mat& out_img,
-            std::vector<pose::tag_detection_t>& out_dets,
-            std::chrono::microseconds& out_ts,
-            uint64_t& last_seq)
-        {
-            std::scoped_lock lk{ _mtx };
-            if (_seq == last_seq || _latest.empty()) { return false; }
-            out_img = _latest;
-            out_dets = _detections;
-            out_ts = _timestamp;
-            last_seq = _seq;
-            return true;
-        }
-
-    public:
-        void on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& frame) override;
-        void on_sensor_stream_reset() override {}
-        void on_sensor_stream_end() override {}
-
-    private:
-        const hw::sensor_frame_provider& _provider;
-        double _tag_size_m{};
-        std::optional<pose::tag_detector> _detector;
-        std::mutex _mtx;
-        cv::Mat _latest;
-        std::vector<pose::tag_detection_t> _detections;
-        std::chrono::microseconds _timestamp{ 0 }; // device timestamp of the latched frame
-        uint64_t _seq{ 0 };
-    };
-
-    void debug_gui_observer::on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& frame)
-    {
-        if (!_detector.has_value()) // built once intrinsics are known (after open)
-        {
-            pose::tag_detector::options_t opt;
-            opt.intrinsics = _provider.get_calibration().color_intr;
-            opt.tag_size_m = _tag_size_m;
-            _detector.emplace(opt);
-        }
-
-        cv::Mat annotated = frame->color_image.clone();
-        auto detections = _detector.value().detect(annotated);
-        pose::draw_tag_detections(annotated, detections);
-
-        std::scoped_lock lk{ _mtx };
-        _latest = std::move(annotated);
-        _detections = std::move(detections);
-        _timestamp = frame->timestamp;
-        ++_seq;
-    }
-
-    debug_gui_app::debug_gui_app(
-        const app::source_options& opt, 
-        net::exo_pose_server* server)
+    debug_gui_app::debug_gui_app(const app::source_options& opt, uint16_t port)
         : _opt{ opt }
-        , _server{ server }
+        , _server{ std::make_unique<net::exo_pose_server>(port, opt, /*annotate_frames*/ true) }
     {
         _ui.device = static_cast<int>(opt.device_index);
         if (opt.exposure_us.has_value()) { _ui.manual_exposure = true; _ui.exposure = opt.exposure_us.value(); }
@@ -196,15 +133,7 @@ namespace gui
         spdlog::default_logger()->sinks().push_back(_log_console.sink());
     }
 
-    pose::exo_pose_estimator& debug_gui_app::_est()
-    {
-        return _server ? _server->estimator() : _estimator;
-    }
-
-    bool debug_gui_app::_is_source_recording() const
-    {
-        return _server ? _server->is_source_recording() : _opt.is_recording();
-    }
+    debug_gui_app::~debug_gui_app() = default;
 
     int debug_gui_app::run()
     {
@@ -225,8 +154,8 @@ namespace gui
 
         // Advance the server one tick: services the listener when up, and always pumps the
         // pipeline so device/algorithm testing works whether or not it's running.
-        if (_server) { _server->poll(); }
-        this->_poll_observer();
+        _server->poll();
+        this->_update_pose_frame();
 
         if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) { _ui.camera_fullscreen = !_ui.camera_fullscreen; }
         this->_render_menu_bar();
@@ -251,7 +180,7 @@ namespace gui
         const bool show_log = _ui.show_log && !_ui.camera_fullscreen;
         const float row_h = show_log ? this->_log_split_height() : ImGui::GetContentRegionAvail().y;
 
-        if (!_provider)
+        if (!_server->pipeline().is_source_open())
         {
             // No source: centered call-to-action, bounded to the content row.
             ImGui::BeginChild("content", ImVec2(0, row_h), ImGuiChildFlags_None);
@@ -322,60 +251,18 @@ namespace gui
 
     void debug_gui_app::_open_device(uint32_t index)
     {
-        if (_server) // monitor mode: the server owns the source
-        {
-            _server->open_device(index, _opt.exposure_us, _opt.gain);
-            _last_seq = 0;
-            _euler_bufs.clear();
-            _quat_bufs.clear();
-            return;
-        }
-
-        auto provider = std::make_shared<hw::sensor_frame_provider>();
-        auto observer = std::make_shared<debug_gui_observer>(*provider, _opt.tag_size_m);
-        provider->add_observer(observer);
-        if (!provider->open_device(index, _opt.exposure_us, _opt.gain))
-        {
-            spdlog::error("failed to open device #{}", index);
-            return;
-        }
-        _opt.input_path.clear();
-        _provider = std::move(provider); // old provider closes/joins here
-        _observer = std::move(observer);
+        _server->pipeline().open_device(index, _opt.exposure_us, _opt.gain);
         _last_seq = 0;
-        _estimator.clear_rest_pose();
         _euler_bufs.clear();
         _quat_bufs.clear();
-        spdlog::info("source '{}' opened", _provider->get_source_name());
     }
 
     void debug_gui_app::_open_recording(const std::string& path)
     {
-        if (_server) // monitor mode: the server owns the source
-        {
-            _server->open_recording(path);
-            _last_seq = 0;
-            _euler_bufs.clear();
-            _quat_bufs.clear();
-            return;
-        }
-
-        auto provider = std::make_shared<hw::sensor_frame_provider>();
-        auto observer = std::make_shared<debug_gui_observer>(*provider, _opt.tag_size_m);
-        provider->add_observer(observer);
-        if (!provider->open_recording(path))
-        {
-            spdlog::error("failed to open recording '{}'", path);
-            return;
-        }
-        _opt.input_path = path; // marks the source as a recording (enables playback controls)
-        _provider = std::move(provider); // old provider closes/joins here
-        _observer = std::move(observer);
+        _server->pipeline().open_recording(path);
         _last_seq = 0;
-        _estimator.clear_rest_pose();
         _euler_bufs.clear();
         _quat_bufs.clear();
-        spdlog::info("source '{}' opened", _provider->get_source_name());
     }
 
     void debug_gui_app::_do_open_source()
@@ -398,33 +285,18 @@ namespace gui
 
     void debug_gui_app::_do_close_source()
     {
-        if (_server) { _server->close_source(); } // the server owns the source
-        else
-        {
-            _provider.reset(); // stops/joins the worker thread
-            _observer.reset();
-            _opt.input_path.clear();
-        }
+        _server->pipeline().close_source();
         _last_seq = 0;
         _euler_bufs.clear();
         _quat_bufs.clear();
     }
 
-    void debug_gui_app::_poll_observer()
+    void debug_gui_app::_update_pose_frame()
     {
+        // Pull the server's latest annotated frame + detections. The server owns and updates the
+        // estimator; nothing to do until a new frame arrives.
         std::chrono::microseconds ts{ 0 };
-        if (_server)
-        {
-            // Monitor mode: mirror the server's provider (for sensor info + playback) and
-            // pull its annotated frame. The server owns and updates the estimator.
-            _provider = _server->provider_shared();
-            if (!_server->try_get_annotated_frame(_frame, _detections, ts, _last_seq)) { return; }
-        }
-        else
-        {
-            if (!_observer || !_observer->try_get(_frame, _detections, ts, _last_seq)) { return; }
-            _estimator.update(_detections, ts);
-        }
+        if (!_server->pipeline().try_get_annotated_frame(_frame, _detections, ts, _last_seq)) { return; }
 
         _texture.value().update(_frame);
 
@@ -433,10 +305,11 @@ namespace gui
         _euler_bufs.advance(ts_sec);
         _quat_bufs.advance(ts_sec);
 
+        const pose::exo_pose_estimator& est = _server->pipeline().estimator();
         int ji = 0;
         for (const auto& info : pose::kJointsInfo)
         {
-            const auto& st = _est().get_joint_state(info.id);
+            const auto& st = est.get_joint_state(info.id);
             const auto rot = try_get_joint_rot(st, _ui.relative_rot);
             if (rot.has_value())
             {
@@ -461,7 +334,7 @@ namespace gui
         if (ImGui::BeginMenu("File"))
         {
             if (ImGui::MenuItem("Open...")) { _ui.show_open = true; }
-            if (ImGui::MenuItem("Close", nullptr, false, _provider != nullptr)) { this->_do_close_source(); }
+            if (ImGui::MenuItem("Close", nullptr, false, _server->pipeline().is_source_open())) { this->_do_close_source(); }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit")) { SDL_Event e{}; e.type = SDL_EVENT_QUIT; ::SDL_PushEvent(&e); }
             ImGui::EndMenu();
@@ -472,7 +345,7 @@ namespace gui
             ImGui::MenuItem("Log Panel", nullptr, &_ui.show_log);
             ImGui::EndMenu();
         }
-        if (_server && ImGui::BeginMenu("Server"))
+        if (ImGui::BeginMenu("Server"))
         {
             const bool running = _server->is_listening();
             if (ImGui::MenuItem("Start Server", nullptr, false, !running)) { _server->start(); }
@@ -484,10 +357,12 @@ namespace gui
 
     void debug_gui_app::_render_control_panel()
     {
+        net::exo_pose_pipeline& pipe = _server->pipeline();
+
         // Sensor info section
         if (ImGui::CollapsingHeader("Sensor Info", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            if (_provider)
+            if (pipe.is_source_open())
             {
                 // annotated sensor frame (texture) at the top of the section
                 if (_texture.value().valid())
@@ -500,20 +375,20 @@ namespace gui
                     ImGui::TextUnformatted("Waiting for sensor frames...");
                 }
 
-                ImGui::TextUnformatted(std::format("Source : {}", _provider->get_source_name()).c_str());
-                const auto res = _provider->get_color_camera_resolution();
+                ImGui::TextUnformatted(std::format("Source : {}", pipe.source_name()).c_str());
+                const auto res = pipe.source_resolution();
                 ImGui::TextUnformatted(std::format("Color  : {}x{}", res.x(), res.y()).c_str());
-                ImGui::TextUnformatted(std::format("FPS    : {:.1f}", _provider->get_current_update_rate()).c_str());
+                ImGui::TextUnformatted(std::format("FPS    : {:.1f}", pipe.source_fps()).c_str());
 
-                if (this->_is_source_recording())
+                if (pipe.is_source_recording())
                 {
-                    if (ImGui::Button(_provider->is_paused() ? "Play" : "Pause")) {
-                        _provider->is_paused() ? _provider->play() : _provider->pause();
+                    if (ImGui::Button(pipe.is_source_paused() ? "Play" : "Pause")) {
+                        pipe.set_source_paused(!pipe.is_source_paused());
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button("|< Begin")) { _provider->seek_recording_to_begin(); }
+                    if (ImGui::Button("|< Begin")) { pipe.seek_to_begin(); }
                     ImGui::SameLine();
-                    if (ImGui::Button("End >|")) { _provider->seek_recording_to_end(); }
+                    if (ImGui::Button("End >|")) { pipe.seek_to_end(); }
                 }
             }
             else
@@ -575,16 +450,13 @@ namespace gui
             // ----- Rest Pose calibration options -----
             ImGui::SeparatorText("Rest Pose");
             {
-                ImGui::TextUnformatted(_est().has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
+                ImGui::TextUnformatted(pipe.estimator().has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
                 ImGui::SameLine();
                 if (ImGui::Button("Calibrate")) {
-                    const bool ok = _server ? _server->calibrate_rest_pose() : _estimator.calibrate_rest_pose();
-                    if (!ok) { spdlog::warn("calibrate: no joint had a computable local rotation"); }
+                    if (!pipe.calibrate_rest_pose()) { spdlog::warn("calibrate: no joint had a computable local rotation"); }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Clear")) {
-                    if (_server) { _server->clear_rest_pose(); } else { _estimator.clear_rest_pose(); }
-                }
+                if (ImGui::Button("Clear")) { pipe.clear_rest_pose(); }
             }
 
             // ----- Rotation filter options -----
@@ -596,7 +468,7 @@ namespace gui
                     return ImGui::DragScalar(label, ImGuiDataType_Double, &v, static_cast<float>(step), &lo, &hi, fmt, kFlags);
                 };
 
-                auto& opt = _est().options();
+                auto& opt = pipe.estimator().options();
 
                 ImGui::Checkbox("Enable smoothing", &opt.enable_smoothing);
 
@@ -627,7 +499,7 @@ namespace gui
             // ----- Leg-hinge constraint options -----
             ImGui::SeparatorText("Hinge Constraint");
             {
-                auto& opt = _est().options();
+                auto& opt = pipe.estimator().options();
                 ImGui::Checkbox("Enable hinge constraint", &opt.enable_hinge_constraint);
                 ImGui::SetItemTooltip("Reject the planar-ambiguity flip and constrain each joint to its\n"
                                       "1-DOF hinge axis. Needs a captured rest pose.");
@@ -705,11 +577,12 @@ namespace gui
         // otherwise y is mouse-adjustable. Axis frame: rotation/range sync handled in _sync_axis_frame().
         const ImPlotCond y_cond = (_ui.lock_plots || _reset_plots) ? ImPlotCond_Always : ImPlotCond_Once;
 
+        const pose::exo_pose_estimator& est = _server->pipeline().estimator();
         int col = 0;
         int ji = 0;
         for (const auto& info : pose::kJointsInfo)
         {
-            const auto& st = _est().get_joint_state(info.id);
+            const auto& st = est.get_joint_state(info.id);
             const char* ref = (!_ui.relative_rot || pose::is_root_joint(info.id))
                 ? "camera" : pose::joint_info(info.parent).name.data();
             const auto rot = try_get_joint_rot(st, _ui.relative_rot);

@@ -1,18 +1,10 @@
 ﻿#pragma once
 #include "cli_options.hh"
 
-#include "hw/sensor_frame_provider.hh"
-#include "pose/exo_pose_estimator.hh"
-
-#include <opencv2/core.hpp>
-
-#include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace net
 {
@@ -50,35 +42,11 @@ namespace net
         // Convenience blocking mode: start(), run the loop until it ends, then stop().
         int run();
 
-        // The pose pipeline this server drives. 
-        // A GUI debugger reads/controls the source and estimator through this.
+        // The pose pipeline this server drives.
+        // A GUI debugger reads and controls the source and estimator through this;
         // single-threaded with poll().
         exo_pose_pipeline& pipeline();
         const exo_pose_pipeline& pipeline() const;
-
-        // --- GUI Debugger accessors --------------------------------
-        // Single-threaded with poll(), so the debugger touches these directly. Broadcasts a
-        // status update to connected clients where the underlying pipeline state changes.
-        pose::exo_pose_estimator& estimator();
-        const pose::exo_pose_estimator& estimator() const;
-        std::shared_ptr<hw::sensor_frame_provider> provider_shared() const;
-        bool is_source_recording() const;
-
-        // Pull the latest annotated frame for display.
-        // false if nothing new since last_seq.
-        bool try_get_annotated_frame(
-            cv::Mat& out_img,
-            std::vector<pose::tag_detection_t>& out_dets,
-            std::chrono::microseconds& out_ts,
-            uint64_t& last_seq
-        );
-
-        // GUI-driven source control (also broadcasts status to connected clients).
-        bool open_device(uint32_t index, std::optional<int32_t> exposure_us, std::optional<int32_t> gain);
-        bool open_recording(const std::string& path);
-        void close_source();
-        bool calibrate_rest_pose();
-        void clear_rest_pose();
 
     private:
         // Advance the pipeline one step: pull detections and recompute, then, while the listener

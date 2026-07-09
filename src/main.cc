@@ -34,12 +34,12 @@ int main(int argc, char** argv)
 
     try
     {
-        if (serve->parsed()) { return net::exo_pose_server{ serve_port, serve_opt }.run(); }
+        if (serve->parsed()) {
+            return net::exo_pose_server{ serve_port, serve_opt }.run();
+        }
 
-        // Debug GUI + embedded server (listener starts stopped; the GUI drives the pipeline
-        // pump each frame, so device/algorithm testing works whether or not it's running).
-        net::exo_pose_server server{ gui_port, gui_opt, /*annotate_frames*/ true };
-        return gui::debug_gui_app{ gui_opt, &server }.run();
+        // Debugger GUI
+        return gui::debug_gui_app{ gui_opt, gui_port }.run();
     }
     catch (const std::exception& e)
     {

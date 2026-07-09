@@ -75,11 +75,15 @@ namespace net
         // --- source metadata ----------------------------------------------------------
         std::string source_name() const;
         Eigen::Vector2i source_resolution() const;
+        float source_fps() const;
         uint32_t current_frame_id() const;
         std::chrono::microseconds last_timestamp() const { return _last_timestamp; }
 
-        // Borrowed handle to the current provider (null if no source open).
-        std::shared_ptr<hw::sensor_frame_provider> provider_shared() const { return _provider; }
+        // --- recording playback (no-op without an open recording source) ---------------
+        bool is_source_paused() const;
+        void set_source_paused(bool paused);
+        void seek_to_begin();
+        void seek_to_end();
 
     private:
         double _default_tag_size_m;

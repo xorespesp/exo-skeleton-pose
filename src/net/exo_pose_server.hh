@@ -81,11 +81,9 @@ namespace net
         void clear_rest_pose();
 
     private:
-        // Advance the pipeline one step and broadcast pose/status while the listener is up.
+        // Advance the pipeline one step: pull detections and recompute, then, while the listener
+        // is up, broadcast a pose frame, a stream-ended notice, and a refreshed status as needed.
         void _pump_pipeline();
-
-        // Broadcast the current ServerStatus to all subscribers. (no-op while stopped)
-        void _publish_server_status();
 
         // Protocol serializers (loop thread) -> FlatBuffers `Message` bytes.
         // Pass req_id to echo the triggering command's id back on a reply;

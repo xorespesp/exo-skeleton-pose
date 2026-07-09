@@ -236,7 +236,8 @@ namespace net
                             return;
                         }
 
-                        bool status_changed = false;
+                        // A source/rest command marks the pipeline's status changed; poll()
+                        // rebroadcasts the ServerStatus to all clients on the next tick.
                         std::string ack;
 
                         switch (m->payload_type())
@@ -250,25 +251,21 @@ namespace net
                                 if (const auto g = o->gain()) { gain = *g; }
                                 const bool ok = _imp->pipeline.open_source(src, o->tag_size_m(), exposure, gain);
                                 ack = this->_serialize_ack(ok, ok ? "source opened" : "open failed", req);
-                                status_changed = true;
                                 break;
                             }
                             case fb_proto::Payload_CloseSourceStream:
                                 _imp->pipeline.close_source();
                                 ack = this->_serialize_ack(true, "source closed", req);
-                                status_changed = true;
                                 break;
                             case fb_proto::Payload_CalibrateRestPose:
                             {
                                 const bool ok = _imp->pipeline.calibrate_rest_pose();
                                 ack = this->_serialize_ack(ok, ok ? "rest pose calibrated" : "no computable joint rotation", req);
-                                status_changed = true;
                                 break;
                             }
                             case fb_proto::Payload_ClearRestPose:
                                 _imp->pipeline.clear_rest_pose();
                                 ack = this->_serialize_ack(true, "rest pose cleared", req);
-                                status_changed = true;
                                 break;
                             default:
                                 ack = this->_serialize_ack(false, "unsupported message", req);
@@ -276,7 +273,6 @@ namespace net
                         }
 
                         ws->send(ack, uWS::OpCode::BINARY);
-                        if (status_changed) { this->_publish_server_status(); }
                     }
                     catch (const std::exception& e)
                     {
@@ -293,7 +289,6 @@ namespace net
                     if (_imp->client_count == 0)
                     {
                         _imp->pipeline.close_source();
-                        this->_publish_server_status();
                         spdlog::info("last client disconnected; source released");
                     }
                 }
@@ -378,51 +373,40 @@ namespace net
 
     bool exo_pose_server::open_device(uint32_t index, std::optional<int32_t> exposure_us, std::optional<int32_t> gain)
     {
-        const bool ok = _imp->pipeline.open_device(index, exposure_us, gain);
-        this->_publish_server_status();
-        return ok;
+        return _imp->pipeline.open_device(index, exposure_us, gain);
     }
 
     bool exo_pose_server::open_recording(const std::string& path)
     {
-        const bool ok = _imp->pipeline.open_recording(path);
-        this->_publish_server_status();
-        return ok;
+        return _imp->pipeline.open_recording(path);
     }
 
     void exo_pose_server::close_source()
     {
         _imp->pipeline.close_source();
-        this->_publish_server_status();
     }
 
     bool exo_pose_server::calibrate_rest_pose()
     {
-        const bool ok = _imp->pipeline.calibrate_rest_pose();
-        this->_publish_server_status();
-        return ok;
+        return _imp->pipeline.calibrate_rest_pose();
     }
 
     void exo_pose_server::clear_rest_pose()
     {
         _imp->pipeline.clear_rest_pose();
-        this->_publish_server_status();
     }
 
     void exo_pose_server::_pump_pipeline()
     {
+        // poll() consumes the pipeline's per-step signals; broadcast each while the listener is up.
+        // A status change (from a client command or a GUI action) is dropped while stopped, since
+        // there are no subscribers; a connecting client receives the current status on open.
         const exo_pose_pipeline::poll_result r = _imp->pipeline.poll();
         if (_imp->uws_loop.is_listening())
         {
             if (r.new_pose) { _imp->uws_loop.publish("pose", this->_serialize_pose_frame()); }
             if (r.stream_ended) { _imp->uws_loop.publish("status", this->_serialize_source_stream_ended()); }
-        }
-    }
-
-    void exo_pose_server::_publish_server_status()
-    {
-        if (_imp->uws_loop.is_listening()) {
-            _imp->uws_loop.publish("status", this->_serialize_server_status());
+            if (r.status_changed) { _imp->uws_loop.publish("status", this->_serialize_server_status()); }
         }
     }
 

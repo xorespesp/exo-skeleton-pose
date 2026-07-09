@@ -8,6 +8,7 @@
 #include <atomic>
 #include <charconv>
 #include <mutex>
+#include <utility>
 
 namespace net
 {
@@ -115,6 +116,8 @@ namespace net
         std::optional<int32_t> exposure_us,
         std::optional<int32_t> gain)
     {
+        _status_changed = true; // opening a source changes the reported status (even on failure)
+
         auto new_provider = std::make_shared<hw::sensor_frame_provider>();
         auto new_observer = std::make_shared<pose_frame_observer>(*new_provider, tag_size_m, _annotate_frames);
         new_provider->add_observer(new_observer);
@@ -154,6 +157,7 @@ namespace net
 
     void exo_pose_pipeline::close_source()
     {
+        _status_changed = true;
         _provider.reset(); // stops/joins the worker thread
         _observer.reset();
         _is_recording = false;
@@ -163,8 +167,17 @@ namespace net
     bool exo_pose_pipeline::is_source_open() const { return static_cast<bool>(_provider); }
     bool exo_pose_pipeline::is_source_recording() const { return _is_recording; }
 
-    bool exo_pose_pipeline::calibrate_rest_pose() { return _estimator.calibrate_rest_pose(); }
-    void exo_pose_pipeline::clear_rest_pose() { _estimator.clear_rest_pose(); }
+    bool exo_pose_pipeline::calibrate_rest_pose()
+    {
+        _status_changed = true;
+        return _estimator.calibrate_rest_pose();
+    }
+
+    void exo_pose_pipeline::clear_rest_pose()
+    {
+        _status_changed = true;
+        _estimator.clear_rest_pose();
+    }
 
     pose::exo_pose_estimator& exo_pose_pipeline::estimator() { return _estimator; }
     const pose::exo_pose_estimator& exo_pose_pipeline::estimator() const { return _estimator; }
@@ -182,6 +195,9 @@ namespace net
 
         // Stream end: consume the one-shot signal the worker thread raises at end of stream.
         r.stream_ended = _observer && _observer->consume_stream_ended_signal();
+
+        // Status: consume the flag set by the last source/rest command.
+        r.status_changed = std::exchange(_status_changed, false);
         return r;
     }
 

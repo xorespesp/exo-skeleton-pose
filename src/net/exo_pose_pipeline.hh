@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "hw/sensor_frame_provider.hh"
 #include "pose/exo_pose_estimator.hh"
 #include "pose/tag_detector.hh"
@@ -56,7 +56,12 @@ namespace net
 
         // --- stepping -----------------------------------------------------------------
         // Advance one step: pull the newest latched detections and recompute joint states.
-        struct poll_result { bool new_pose{ false }; bool stream_ended{ false }; };
+        // Each flag reports something that happened this step and is cleared once returned.
+        struct poll_result { 
+            bool new_pose{ false }; 
+            bool stream_ended{ false }; 
+            bool status_changed{ false };
+        };
         poll_result poll();
 
         // Latest annotated frame for display; false if nothing new since `last_seq`.
@@ -87,6 +92,7 @@ namespace net
         uint64_t _last_seq{ 0 };
         std::chrono::microseconds _last_timestamp{ 0 }; // device time of the latched frame
         bool _is_recording{ false };
+        bool _status_changed{ false }; // a source/rest command changed the reported status; consumed by poll()
     };
 
 } // namespace net

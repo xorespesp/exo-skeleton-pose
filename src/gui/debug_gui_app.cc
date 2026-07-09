@@ -1,5 +1,6 @@
 ﻿#include "debug_gui_app.hh"
 
+#include "net/exo_pose_server.hh"
 #include "hw/sensor_frame_observer.hh"
 
 #include <spdlog/spdlog.h>
@@ -174,14 +175,18 @@ namespace gui
         ++_seq;
     }
 
-    debug_gui_app::debug_gui_app(const app::source_options& opt)
+    debug_gui_app::debug_gui_app(
+        const app::source_options& opt, 
+        net::exo_pose_server* server)
         : _opt{ opt }
+        , _server{ server }
     {
         _ui.device = static_cast<int>(opt.device_index);
         if (opt.exposure_us.has_value()) { _ui.manual_exposure = true; _ui.exposure = opt.exposure_us.value(); }
         if (opt.gain.has_value()) { _ui.manual_gain = true; _ui.gain = opt.gain.value(); }
         _ui.recording = opt.input_path;
         _ui.open_kind = opt.is_recording() ? source_kind_t::recording : source_kind_t::device;
+        _ui.show_log = true; // surface the log console by default
 
         _file_dialog.SetTitle("Open recording file");
         _file_dialog.SetTypeFilters({ ".mkv" });
@@ -189,6 +194,16 @@ namespace gui
         // Mirror spdlog output into the in-GUI log console. Registered here (main thread,
         // before any capture worker exists) so appending to the sink list is race-free.
         spdlog::default_logger()->sinks().push_back(_log_console.sink());
+    }
+
+    pose::exo_pose_estimator& debug_gui_app::_est()
+    {
+        return _server ? _server->estimator() : _estimator;
+    }
+
+    bool debug_gui_app::_is_source_recording() const
+    {
+        return _server ? _server->is_source_recording() : _opt.is_recording();
     }
 
     int debug_gui_app::run()
@@ -207,6 +222,10 @@ namespace gui
     void debug_gui_app::render_ui()
     {
         if (!_texture.has_value()) { _texture.emplace(this->renderer().sdl_renderer()); }
+
+        // Advance the server one tick: services the listener when up, and always pumps the
+        // pipeline so device/algorithm testing works whether or not it's running.
+        if (_server) { _server->poll(); }
         this->_poll_observer();
 
         if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) { _ui.camera_fullscreen = !_ui.camera_fullscreen; }
@@ -303,6 +322,15 @@ namespace gui
 
     void debug_gui_app::_open_device(uint32_t index)
     {
+        if (_server) // monitor mode: the server owns the source
+        {
+            _server->open_device(index, _opt.exposure_us, _opt.gain);
+            _last_seq = 0;
+            _euler_bufs.clear();
+            _quat_bufs.clear();
+            return;
+        }
+
         auto provider = std::make_shared<hw::sensor_frame_provider>();
         auto observer = std::make_shared<debug_gui_observer>(*provider, _opt.tag_size_m);
         provider->add_observer(observer);
@@ -323,6 +351,15 @@ namespace gui
 
     void debug_gui_app::_open_recording(const std::string& path)
     {
+        if (_server) // monitor mode: the server owns the source
+        {
+            _server->open_recording(path);
+            _last_seq = 0;
+            _euler_bufs.clear();
+            _quat_bufs.clear();
+            return;
+        }
+
         auto provider = std::make_shared<hw::sensor_frame_provider>();
         auto observer = std::make_shared<debug_gui_observer>(*provider, _opt.tag_size_m);
         provider->add_observer(observer);
@@ -361,9 +398,13 @@ namespace gui
 
     void debug_gui_app::_do_close_source()
     {
-        _provider.reset(); // stops/joins the worker thread
-        _observer.reset();
-        _opt.input_path.clear();
+        if (_server) { _server->close_source(); } // the server owns the source
+        else
+        {
+            _provider.reset(); // stops/joins the worker thread
+            _observer.reset();
+            _opt.input_path.clear();
+        }
         _last_seq = 0;
         _euler_bufs.clear();
         _quat_bufs.clear();
@@ -372,11 +413,20 @@ namespace gui
     void debug_gui_app::_poll_observer()
     {
         std::chrono::microseconds ts{ 0 };
-        if (!_observer || !_observer->try_get(_frame, _detections, ts, _last_seq)) { return; }
+        if (_server)
+        {
+            // Monitor mode: mirror the server's provider (for sensor info + playback) and
+            // pull its annotated frame. The server owns and updates the estimator.
+            _provider = _server->provider_shared();
+            if (!_server->try_get_annotated_frame(_frame, _detections, ts, _last_seq)) { return; }
+        }
+        else
+        {
+            if (!_observer || !_observer->try_get(_frame, _detections, ts, _last_seq)) { return; }
+            _estimator.update(_detections, ts);
+        }
 
         _texture.value().update(_frame);
-
-        _estimator.update(_detections, ts);
 
         // Append the current per-joint euler/quat samples, stamped with the device frame time.
         const double ts_sec = std::chrono::duration<double>{ ts }.count();
@@ -386,7 +436,7 @@ namespace gui
         int ji = 0;
         for (const auto& info : pose::kJointsInfo)
         {
-            const auto& st = _estimator.get_joint_state(info.id);
+            const auto& st = _est().get_joint_state(info.id);
             const auto rot = try_get_joint_rot(st, _ui.relative_rot);
             if (rot.has_value())
             {
@@ -422,6 +472,13 @@ namespace gui
             ImGui::MenuItem("Log Panel", nullptr, &_ui.show_log);
             ImGui::EndMenu();
         }
+        if (_server && ImGui::BeginMenu("Server"))
+        {
+            const bool running = _server->is_listening();
+            if (ImGui::MenuItem("Start Server", nullptr, false, !running)) { _server->start(); }
+            if (ImGui::MenuItem("Stop Server", nullptr, false, running)) { _server->stop(); }
+            ImGui::EndMenu();
+        }
         ImGui::EndMainMenuBar();
     }
 
@@ -448,7 +505,7 @@ namespace gui
                 ImGui::TextUnformatted(std::format("Color  : {}x{}", res.x(), res.y()).c_str());
                 ImGui::TextUnformatted(std::format("FPS    : {:.1f}", _provider->get_current_update_rate()).c_str());
 
-                if (_opt.is_recording())
+                if (this->_is_source_recording())
                 {
                     if (ImGui::Button(_provider->is_paused() ? "Play" : "Pause")) {
                         _provider->is_paused() ? _provider->play() : _provider->pause();
@@ -518,15 +575,16 @@ namespace gui
             // ----- Rest Pose calibration options -----
             ImGui::SeparatorText("Rest Pose");
             {
-                ImGui::TextUnformatted(_estimator.has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
+                ImGui::TextUnformatted(_est().has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
                 ImGui::SameLine();
                 if (ImGui::Button("Calibrate")) {
-                    if (!_estimator.calibrate_rest_pose()) {
-                        spdlog::warn("calibrate: no joint had a computable local rotation");
-                    }
+                    const bool ok = _server ? _server->calibrate_rest_pose() : _estimator.calibrate_rest_pose();
+                    if (!ok) { spdlog::warn("calibrate: no joint had a computable local rotation"); }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Clear")) { _estimator.clear_rest_pose(); }
+                if (ImGui::Button("Clear")) {
+                    if (_server) { _server->clear_rest_pose(); } else { _estimator.clear_rest_pose(); }
+                }
             }
 
             // ----- Rotation filter options -----
@@ -538,7 +596,7 @@ namespace gui
                     return ImGui::DragScalar(label, ImGuiDataType_Double, &v, static_cast<float>(step), &lo, &hi, fmt, kFlags);
                 };
 
-                auto& opt = _estimator.options();
+                auto& opt = _est().options();
 
                 ImGui::Checkbox("Enable smoothing", &opt.enable_smoothing);
 
@@ -569,7 +627,7 @@ namespace gui
             // ----- Leg-hinge constraint options -----
             ImGui::SeparatorText("Hinge Constraint");
             {
-                auto& opt = _estimator.options();
+                auto& opt = _est().options();
                 ImGui::Checkbox("Enable hinge constraint", &opt.enable_hinge_constraint);
                 ImGui::SetItemTooltip("Reject the planar-ambiguity flip and constrain each joint to its\n"
                                       "1-DOF hinge axis. Needs a captured rest pose.");
@@ -651,7 +709,7 @@ namespace gui
         int ji = 0;
         for (const auto& info : pose::kJointsInfo)
         {
-            const auto& st = _estimator.get_joint_state(info.id);
+            const auto& st = _est().get_joint_state(info.id);
             const char* ref = (!_ui.relative_rot || pose::is_root_joint(info.id))
                 ? "camera" : pose::joint_info(info.parent).name.data();
             const auto rot = try_get_joint_rot(st, _ui.relative_rot);

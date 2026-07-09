@@ -4,6 +4,9 @@
 #include "hw/sensor_frame_provider.hh"
 #include "pose/exo_pose_estimator.hh"
 
+#include <opencv2/core.hpp>
+
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -13,54 +16,79 @@
 
 namespace net
 {
-    // forward declaration of worker-thread observer
-    class pose_frame_observer;
-
-    // Protocol correlation id (Message.request_id).
+    // Protocol correlation id (Message.request_id)
     using req_id_t = uint32_t;
 
     // request_id value reserved for messages the server sends on its own
     // (status/pose/ended notifications); clients must use a non-zero id.
     inline constexpr req_id_t kServerNotifyReqId{ 0 };
 
-    // uWS based pose server. (protocol: exo_pose_proto.fbs)
-    //
-    // NOTE: uWS runs one event loop on the calling thread.
-    //       The provider's worker thread only latches detections;
-    //       everything else happens on the loop thread, 
-    //       so no extra locking is needed here.
-    //       (command dispatch, estimator update, all sends ...)
+    // uWS based exo-pose server. (protocol: exo_pose_proto.fbs)
     class exo_pose_server final
     {
     public:
-        exo_pose_server(uint16_t port, const app::source_options& initial);
+        exo_pose_server(uint16_t port, const app::source_options& initial, bool annotate_frames = false);
+        ~exo_pose_server();
 
         exo_pose_server(const exo_pose_server&) = delete;
         exo_pose_server& operator=(const exo_pose_server&) = delete;
         exo_pose_server(exo_pose_server&&) = delete;
         exo_pose_server& operator=(exo_pose_server&&) = delete;
 
-        // blocks: listen + run the event loop
+        bool is_listening() const;
+        bool start(); // binds the WebSocket listener + event loop
+        void stop();  // tears down the listener (the pipeline + loop stay alive)
+
+        // Advance the server one tick (non-blocking): service the listener when up, and
+        // always pump the pose pipeline (pull detections, recompute, broadcast if up).
+        // The pipeline runs even while stopped, so an external render loop drives this
+        // every frame regardless of listener state.
+        void poll();
+
+        // Convenience blocking mode: start(), run the loop until it ends, then stop().
         int run();
+
+        // --- GUI Debugger accessors --------------------------------
+        // Single-threaded with poll(), so the debugger touches these directly.
+        pose::exo_pose_estimator& estimator();
+        const pose::exo_pose_estimator& estimator() const;
+        std::shared_ptr<hw::sensor_frame_provider> provider_shared() const;
+        bool is_source_recording() const;
+
+        // Pull the latest annotated frame for display.
+        // false if nothing new since last_seq.
+        bool try_get_annotated_frame(
+            cv::Mat& out_img,
+            std::vector<pose::tag_detection_t>& out_dets,
+            std::chrono::microseconds& out_ts,
+            uint64_t& last_seq
+        );
+
+        // GUI-driven source control (also broadcasts status to connected clients).
+        bool open_device(uint32_t index, std::optional<int32_t> exposure_us, std::optional<int32_t> gain);
+        bool open_recording(const std::string& path);
+        void close_source();
+        bool calibrate_rest_pose();
+        void clear_rest_pose();
 
     private:
         // Pipeline ops (loop thread)
         bool _do_open_source_stream(
             const std::string& source, // unsigned int: device index / else: recording path.
             double tag_size_m,
-            std::optional<int32_t> exposure_us, 
+            std::optional<int32_t> exposure_us,
             std::optional<int32_t> gain
         );
         void _do_close_source_stream();
         bool _do_calibrate_rest_pose();
         void _do_clear_rest_pose();
 
-        // Pull latched detections and recompute joint states;
-        // true if a new frame arrived.
-        bool _poll_new_detections();
+        // Advance the pipeline one step: pull latched detections, recompute joint states,
+        // and broadcast pose/status while the listener is up.
+        void _poll_pose_pipeline();
 
-        // True once per stream-end signal latched by the observer (worker thread).
-        bool _poll_stream_ended();
+        // Broadcast the current ServerStatus to all subscribers. (no-op while stopped)
+        void _publish_server_status();
 
         // Protocol serializers (loop thread) -> FlatBuffers `Message` bytes.
         // Pass req_id to echo the triggering command's id back on a reply;
@@ -69,24 +97,14 @@ namespace net
         std::string _serialize_server_status(req_id_t req_id = kServerNotifyReqId) const;
         std::string _serialize_source_stream_ended() const;
         std::string _serialize_ack(
-            bool ok, 
-            std::string_view msg, 
+            bool ok,
+            std::string_view msg,
             req_id_t req_id = kServerNotifyReqId
         ) const;
 
     private:
-        uint16_t _port;
-        app::source_options _initial;
-
-        std::shared_ptr<hw::sensor_frame_provider> _provider;
-        std::shared_ptr<pose_frame_observer> _observer;
-        pose::exo_pose_estimator _estimator;
-
-        std::vector<pose::tag_detection_t> _detections;
-        uint64_t _last_seq{ 0 };
-        std::chrono::microseconds _last_timestamp{ 0 }; // device timestamp of the latched frame
-        bool _is_recording{ false };
-        size_t _client_count{ 0 }; // connected clients; source is released when it hits 0
+        struct impl;
+        std::unique_ptr<impl> _imp;
     };
 
 } // namespace net

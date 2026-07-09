@@ -1,4 +1,4 @@
-#include "cli_options.hh"
+﻿#include "cli_options.hh"
 #include "gui/debug_gui_app.hh"
 #include "net/exo_pose_server.hh"
 
@@ -16,14 +16,17 @@ int main(int argc, char** argv)
 
     CLI::App cli{ "exo-skeleton-pose" };
 
-    // Bare invocation launches the debug GUI (backward compatible).
+    // Bare invocation launches the debug GUI, which embeds a WebSocket server the operator
+    // starts/stops from the Server menu.
     app::source_options gui_opt;
+    uint16_t gui_port{ 9002 };
     app::add_source_options(cli, gui_opt);
+    cli.add_option("-p,--port", gui_port, "WebSocket listen port for the embedded server")->default_val(9002);
 
-    // `serve` launches the WebSocket pose server instead.
+    // `serve` launches a headless WebSocket pose server instead.
     app::source_options serve_opt;
     uint16_t serve_port{ 9002 };
-    CLI::App* serve = cli.add_subcommand("serve", "Run the WebSocket pose server");
+    CLI::App* serve = cli.add_subcommand("serve", "Run the headless WebSocket pose server");
     app::add_source_options(*serve, serve_opt);
     serve->add_option("-p,--port", serve_port, "WebSocket listen port")->default_val(9002);
 
@@ -32,7 +35,11 @@ int main(int argc, char** argv)
     try
     {
         if (serve->parsed()) { return net::exo_pose_server{ serve_port, serve_opt }.run(); }
-        return gui::debug_gui_app{ gui_opt }.run();
+
+        // Debug GUI + embedded server (listener starts stopped; the GUI drives the pipeline
+        // pump each frame, so device/algorithm testing works whether or not it's running).
+        net::exo_pose_server server{ gui_port, gui_opt, /*annotate_frames*/ true };
+        return gui::debug_gui_app{ gui_opt, &server }.run();
     }
     catch (const std::exception& e)
     {

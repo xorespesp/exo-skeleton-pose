@@ -6,13 +6,18 @@
 #include "exo_pose_proto_generated.h"
 
 #include <App.h>         // uWS
-#include <libusockets.h> // us_create_timer / us_timer_set / us_timer_ext
+#include <libusockets.h> // us_create_timer / us_timer_set / us_timer_ext / us_timer_close
+#include <uv.h>          // uv_loop_t / uv_run
 
 #include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <charconv>
+#include <chrono>
+#include <functional>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <bit>
 
 namespace net
@@ -24,93 +29,497 @@ namespace net
     {
         // windows.h (pulled in by uWebSockets) defines a GetMessage macro that shadows
         // the generated flatbuffers GetMessage() accessor; isolate the workaround here.
-        const fb_proto::Message* get_root_message(const uint8_t* data)
+        const fb_proto::Message* get_fb_proto_root_msg(const uint8_t* data)
         {
 #pragma push_macro("GetMessage")
 #undef GetMessage
             return fb_proto::GetMessage(data);
 #pragma pop_macro("GetMessage")
         }
-    }
 
-    // --- observer (worker thread) ------------------------------------------------
-    // Worker-thread tag detection; latches the detections for the server loop to pull.
-    class pose_frame_observer final : public hw::sensor_frame_observer
-    {
-    public:
-        pose_frame_observer(const hw::sensor_frame_provider& provider, double tag_size_m)
-            : _provider{ provider }, _tag_size_m{ tag_size_m }
-        { }
-
-        // Returns false if nothing new since `last_seq`, else copies out + advances it.
-        bool try_get(
-            std::vector<pose::tag_detection_t>& out_dets,
-            std::chrono::microseconds& out_timestamp,
-            uint64_t& last_seq)
+        // Owns the libuv loop (server lifetime) and the per-listen uWS App + timer.
+        // The loop is bound to uWS once and reused across start/stop; the App and timer are
+        // rebuilt on each start_listening(). Teardown closes every socket and drains the loop
+        // before the App is destroyed, so no poll callback can fire against a freed context.
+        class uws_event_loop
         {
-            std::scoped_lock lk{ _mtx };
-            if (_seq == last_seq) { return false; }
-            out_dets = _detections;
-            out_timestamp = _timestamp;
-            last_seq = _seq;
-            return true;
-        }
-
-        // True once per stream-end signal (consumes the latched flag).
-        bool consume_stream_ended_signal() noexcept {
-            return _stream_ended.exchange(false);
-        }
-
-    public:
-        void on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& frame) override
-        {
-            if (!_detector.has_value()) // built once intrinsics are known (after open)
-            {
-                pose::tag_detector::options_t opt;
-                opt.intrinsics = _provider.get_calibration().color_intr;
-                opt.tag_size_m = _tag_size_m;
-                _detector.emplace(opt);
+        public:
+            uws_event_loop() {
+                if (::uv_loop_init(&_uv_loop) != 0) {
+                    throw std::runtime_error{ "uv_loop_init failed" };
+                }
             }
 
-            auto detections = _detector.value().detect(frame->color_image);
+            ~uws_event_loop() {
+                this->stop_listening();
+                this->_drain();
+                ::uv_loop_close(&_uv_loop);
+            }
 
-            std::scoped_lock lk{ _mtx };
-            _detections = std::move(detections);
-            _timestamp = frame->timestamp;
-            ++_seq;
-        }
+            uws_event_loop(const uws_event_loop&) = delete;
+            uws_event_loop& operator=(const uws_event_loop&) = delete;
 
-        void on_sensor_stream_reset() override {}
-        void on_sensor_stream_end() override { _stream_ended = true; }
+            // Advance the loop one non-blocking tick.
+            void tick() { ::uv_run(&_uv_loop, UV_RUN_NOWAIT); }
 
-    private:
-        const hw::sensor_frame_provider& _provider;
-        double _tag_size_m{};
-        std::optional<pose::tag_detector> _detector; // built once intrinsics are known (after open)
-        std::mutex _mtx;
-        std::vector<pose::tag_detection_t> _detections;
-        std::chrono::microseconds _timestamp{ 0 }; // device timestamp of the latched frame
-        uint64_t _seq{ 0 };
-        std::atomic<bool> _stream_ended{ false }; // set by the worker thread on stream end
+            // Block on the loop until it runs out of work. (the listen socket + timer keep it alive)
+            void run_blocking() { ::uv_run(&_uv_loop, UV_RUN_DEFAULT); }
+
+            bool is_listening() const { return _is_listening; }
+
+            // Bring the listener up: build the App, let `on_configure` register routes, start a
+            // periodic `on_tick`, and bind the listen socket. All-or-nothing; a failed listen
+            // rolls the App + timer back. `on_tick` fires every `tick_interval` and drives
+            // progress while blocked in run_blocking().
+            bool start_listening(
+                uint16_t port,
+                const std::function<void(uWS::App&)>& on_configure,
+                std::function<void()> on_tick,
+                std::chrono::milliseconds tick_interval)
+            {
+                if (_is_listening) { return true; }
+
+                // Seed uWS's thread-local loop with ours before the first App grabs it via
+                // Loop::get(). Idempotent: later calls return the cached loop and ignore the arg.
+                uWS::Loop::get(&_uv_loop);
+
+                _on_tick = std::move(on_tick);
+                _uws_app.emplace();
+                on_configure(_uws_app.value());
+
+                struct timer_context_t { uws_event_loop* self; };
+                _us_tick_timer = ::us_create_timer(std::bit_cast<us_loop_t*>(uWS::Loop::get()), 0, sizeof(timer_context_t));
+                std::bit_cast<timer_context_t*>(::us_timer_ext(_us_tick_timer))->self = this;
+                const int interval_ms = static_cast<int>(tick_interval.count());
+                ::us_timer_set(_us_tick_timer, [](us_timer_t* t) {
+                    std::bit_cast<timer_context_t*>(::us_timer_ext(t))->self->_on_tick();
+                }, interval_ms, interval_ms);
+
+                bool listening = false;
+                _uws_app->listen(port, [&listening](us_listen_socket_t* sock) {
+                    listening = (sock != nullptr); // uWS invokes this synchronously during listen()
+                });
+
+                if (!listening) {
+                    this->stop_listening(); // roll the half-built listener back
+                    return false;
+                }
+
+                _is_listening = true;
+                return true;
+            }
+
+            // Tear the listener down in the order uWS requires: gate publishing off, close every
+            // socket, drain the loop so their poll + close callbacks complete while the App is
+            // still alive, then destroy the App (now free of open sockets).
+            void stop_listening() {
+                if (!_uws_app) { return; }
+
+                _is_listening = false;
+                if (_us_tick_timer) {
+                    ::us_timer_close(_us_tick_timer);
+                    _us_tick_timer = nullptr;
+                }
+                _uws_app->close();
+                this->_drain();
+                _uws_app.reset();
+                _on_tick = nullptr;
+            }
+
+            // Publish to all subscribers of `topic`; no-op unless the listener is up.
+            bool publish(std::string_view topic, std::string_view msg) {
+                if (!_is_listening) { return false; }
+                return _uws_app->publish(topic, msg, uWS::OpCode::BINARY);
+            }
+
+        private:
+            // Pump pending close callbacks to completion. (bounded)
+            void _drain() {
+                for (int i = 0; i < 8 && ::uv_run(&_uv_loop, UV_RUN_NOWAIT) != 0; ++i) {}
+            }
+
+        private:
+            uv_loop_t _uv_loop{};
+            bool _is_listening{ false };
+            std::optional<uWS::App> _uws_app;    // listen socket + ws/http contexts, while listening
+            us_timer_t* _us_tick_timer{ nullptr };    // periodic pipeline tick, while listening
+            std::function<void()> _on_tick;
+        };
+
+        struct uws_socket_userdata_t
+        {
+            bool accepted{ false }; // false for a rejected (over-capacity) socket
+        };
+
+        // --- observer (worker thread) ------------------------------------------------
+        // Worker-thread tag detection; latches detections & annotated frame for the loop thread to pull.
+        class pose_frame_observer final : public hw::sensor_frame_observer
+        {
+        public:
+            pose_frame_observer(const hw::sensor_frame_provider& provider, double tag_size_m, bool annotate)
+                : _provider{ provider }, _tag_size_m{ tag_size_m }, _annotate{ annotate }
+            { }
+
+            // Returns false if nothing new since `last_seq`, else copies out + advances it.
+            bool try_get(
+                std::vector<pose::tag_detection_t>& out_dets,
+                std::chrono::microseconds& out_timestamp,
+                uint64_t& last_seq)
+            {
+                std::scoped_lock lk{ _mtx };
+                if (_seq == last_seq) { return false; }
+                out_dets = _detections;
+                out_timestamp = _timestamp;
+                last_seq = _seq;
+                return true;
+            }
+
+            // Like try_get, plus the annotated frame image. 
+            // Empty image if annotation is off.
+            bool try_get_frame(
+                cv::Mat& out_img,
+                std::vector<pose::tag_detection_t>& out_dets,
+                std::chrono::microseconds& out_timestamp,
+                uint64_t& last_seq)
+            {
+                std::scoped_lock lk{ _mtx };
+                if (_seq == last_seq) { return false; }
+                out_img = _annotated;
+                out_dets = _detections;
+                out_timestamp = _timestamp;
+                last_seq = _seq;
+                return true;
+            }
+
+            // True once per stream-end signal (consumes the latched flag).
+            bool consume_stream_ended_signal() noexcept {
+                return _stream_ended.exchange(false);
+            }
+
+        public:
+            void on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& frame) override
+            {
+                if (!_detector.has_value()) // built once intrinsics are known (after open)
+                {
+                    pose::tag_detector::options_t opt;
+                    opt.intrinsics = _provider.get_calibration().color_intr;
+                    opt.tag_size_m = _tag_size_m;
+                    _detector.emplace(opt);
+                }
+
+                cv::Mat annotated;
+                std::vector<pose::tag_detection_t> detections;
+                if (_annotate) {
+                    annotated = frame->color_image.clone();
+                    detections = _detector.value().detect(annotated);
+                    pose::draw_tag_detections(annotated, detections);
+                } else {
+                    detections = _detector.value().detect(frame->color_image);
+                }
+
+                std::scoped_lock lk{ _mtx };
+                _annotated = std::move(annotated);
+                _detections = std::move(detections);
+                _timestamp = frame->timestamp;
+                ++_seq;
+            }
+
+            void on_sensor_stream_reset() override {}
+            void on_sensor_stream_end() override {
+                _stream_ended = true;
+            }
+
+        private:
+            const hw::sensor_frame_provider& _provider;
+            double _tag_size_m{};
+            bool _annotate{ false }; // keep an annotated frame copy for a monitor GUI
+            std::optional<pose::tag_detector> _detector; // built once intrinsics are known (after open)
+            std::mutex _mtx;
+            cv::Mat _annotated; // annotated frame
+            std::vector<pose::tag_detection_t> _detections;
+            std::chrono::microseconds _timestamp{ 0 }; // device timestamp of the latched frame
+            uint64_t _seq{ 0 };
+            std::atomic<bool> _stream_ended{ false }; // set by the worker thread on stream end
+        };
+
+    } // namespace
+
+    // --- implementation --------------------------------------------------------------
+    struct exo_pose_server::impl
+    {
+        // config
+        uint16_t port;
+        app::source_options initial;
+        bool annotate_frames; // observer keeps an annotated frame for a monitor GUI
+
+        // uWS loop + listener
+        uws_event_loop uws_loop;
+
+        // pose pipeline
+        std::shared_ptr<hw::sensor_frame_provider> provider;
+        std::shared_ptr<pose_frame_observer> observer;
+        pose::exo_pose_estimator estimator;
+        std::vector<pose::tag_detection_t> detections;
+        uint64_t last_seq{ 0 };
+        std::chrono::microseconds last_timestamp{ 0 }; // device time of the latched frame
+        bool is_recording{ false };
+        size_t client_count{ 0 }; // connected clients; source released when it hits 0
+
+        impl(uint16_t p, const app::source_options& in, bool annotate)
+            : port{ p }, initial{ in }, annotate_frames{ annotate }
+        { }
     };
 
     // --- exo_pose_server -------------------------------------------------------------
     exo_pose_server::exo_pose_server(
-        uint16_t port, 
-        const app::source_options& initial)
-        : _port{ port }
-        , _initial{ initial }
+        uint16_t port,
+        const app::source_options& initial,
+        bool annotate_frames)
+        : _imp{ std::make_unique<impl>(port, initial, annotate_frames) }
     { }
 
+    exo_pose_server::~exo_pose_server() {
+        this->stop();
+    }
+
+    bool exo_pose_server::is_listening() const {
+        return _imp->uws_loop.is_listening();
+    }
+
+    bool exo_pose_server::start()
+    {
+        if (_imp->uws_loop.is_listening()) { return true; }
+
+        // Register the WebSocket route + command handlers. The handlers outlive start()
+        // (owned by the App) and the server outlives the loop, so capturing `this` is safe.
+        const auto on_configure = [this](uWS::App& app)
+        {
+            app.ws<uws_socket_userdata_t>("/*", {
+                .compression = uWS::DISABLED,
+                .open = [this](auto* ws) {
+                    if (_imp->client_count >= 1) {
+                        ws->end(1013, "another client is already connected"); // 1013 = Try Again Later
+                        return;
+                    }
+                    ws->getUserData()->accepted = true;
+                    ++_imp->client_count;
+                    spdlog::info("client connected");
+                    // Subscribe to the broadcast topics, then send the current status.
+                    ws->subscribe("pose");
+                    ws->subscribe("status");
+                    ws->send(this->_serialize_server_status(), uWS::OpCode::BINARY);
+                },
+                .message = [this](auto* ws, std::string_view msg, uWS::OpCode /*op*/) {
+                    if (!ws->getUserData()->accepted) { return; } // ignore a rejected socket still closing
+                    const auto* data = std::bit_cast<const uint8_t*>(msg.data());
+                    fb::Verifier verifier{ data, msg.size() };
+                    if (!fb_proto::VerifyMessageBuffer(verifier))
+                    {
+                        ws->send(this->_serialize_ack(false, "malformed message"), uWS::OpCode::BINARY);
+                        return;
+                    }
+
+                    const fb_proto::Message* m = get_fb_proto_root_msg(data);
+                    const req_id_t req = m->request_id(); // echoed back on the reply for correlation
+
+                    // A malformed request must never take down the loop; reply with an error Ack.
+                    try
+                    {
+                        if (req == kServerNotifyReqId) {
+                            // 0 is reserved for server notify events,
+                            // so a client command carrying request id 0 is a protocol violation.
+                            // reject it.
+                            ws->send(this->_serialize_ack(false, "request_id must be non-zero", kServerNotifyReqId), uWS::OpCode::BINARY);
+                            return;
+                        }
+
+                        // Pure query(no Ack, no broadcast):
+                        // reply with the current status to this client only.
+                        if (m->payload_type() == fb_proto::Payload_GetServerStatus)
+                        {
+                            ws->send(this->_serialize_server_status(req), uWS::OpCode::BINARY);
+                            return;
+                        }
+
+                        bool status_changed = false;
+                        std::string ack;
+
+                        switch (m->payload_type())
+                        {
+                            case fb_proto::Payload_OpenSourceStream:
+                            {
+                                const auto* o = m->payload_as_OpenSourceStream();
+                                const std::string src = o->source() ? o->source()->str() : std::string{};
+                                std::optional<int32_t> exposure, gain;
+                                if (const auto e = o->exposure_us()) { exposure = *e; }
+                                if (const auto g = o->gain()) { gain = *g; }
+                                const bool ok = this->_do_open_source_stream(src, o->tag_size_m(), exposure, gain);
+                                ack = this->_serialize_ack(ok, ok ? "source opened" : "open failed", req);
+                                status_changed = true;
+                                break;
+                            }
+                            case fb_proto::Payload_CloseSourceStream:
+                                this->_do_close_source_stream();
+                                ack = this->_serialize_ack(true, "source closed", req);
+                                status_changed = true;
+                                break;
+                            case fb_proto::Payload_CalibrateRestPose:
+                            {
+                                const bool ok = this->_do_calibrate_rest_pose();
+                                ack = this->_serialize_ack(ok, ok ? "rest pose calibrated" : "no computable joint rotation", req);
+                                status_changed = true;
+                                break;
+                            }
+                            case fb_proto::Payload_ClearRestPose:
+                                this->_do_clear_rest_pose();
+                                ack = this->_serialize_ack(true, "rest pose cleared", req);
+                                status_changed = true;
+                                break;
+                            default:
+                                ack = this->_serialize_ack(false, "unsupported message", req);
+                                break;
+                        }
+
+                        ws->send(ack, uWS::OpCode::BINARY);
+                        if (status_changed) { this->_publish_server_status(); }
+                    }
+                    catch (const std::exception& e)
+                    {
+                        spdlog::error("command handler error: {}", e.what());
+                        ws->send(this->_serialize_ack(false, "internal error", req), uWS::OpCode::BINARY);
+                    }
+                },
+                .close = [this](auto* ws, int /*code*/, std::string_view /*message*/) {
+                    if (!ws->getUserData()->accepted) { return; } // rejected socket was never counted
+                    --_imp->client_count;
+                    spdlog::info("client disconnected");
+                    // Release the source once the last client leaves so a monitor GUI reflects
+                    // it and a live device is freed.
+                    if (_imp->client_count == 0)
+                    {
+                        this->_do_close_source_stream();
+                        this->_publish_server_status();
+                        spdlog::info("last client disconnected; source released");
+                    }
+                }
+            });
+        };
+
+        const auto on_tick = [this]() {
+            this->_poll_pose_pipeline();
+        };
+
+        using namespace std::chrono_literals;
+        const bool ok = _imp->uws_loop.start_listening(
+            _imp->port,
+            on_configure,
+            on_tick,
+            8ms // ~120 Hz pipeline tick
+        );
+
+        if (ok) { spdlog::info("pose server listening on ws://localhost:{}", _imp->port); }
+        else { spdlog::error("failed to listen on port {}", _imp->port); }
+        return ok;
+    }
+
+    void exo_pose_server::stop()
+    {
+        _imp->uws_loop.stop_listening();
+        _imp->client_count = 0;
+    }
+
+    void exo_pose_server::poll()
+    {
+        // Service the listener when up (its timer ticks the pipeline inside uv_run), then
+        // tick directly so the pipeline still advances while stopped. The shared frame seq
+        // makes the direct call a no-op when the timer already consumed the frame.
+        if (_imp->uws_loop.is_listening()) {
+            _imp->uws_loop.tick();
+        }
+        this->_poll_pose_pipeline();
+    }
+
+    int exo_pose_server::run()
+    {
+        if (!this->start()) {
+            this->stop();
+            return -1;
+        }
+
+        // Optional: auto-open a recording passed on the command line.
+        if (!_imp->initial.input_path.empty())
+        {
+            this->_do_open_source_stream(
+                _imp->initial.input_path,
+                _imp->initial.tag_size_m,
+                _imp->initial.exposure_us,
+                _imp->initial.gain
+            );
+        }
+
+        // Blocks while the listen socket + timer keep the loop alive.
+        // (the timer drives _poll_pose_pipeline())
+        _imp->uws_loop.run_blocking();
+        this->stop();
+        return 0;
+    }
+
+    bool exo_pose_server::is_source_recording() const { return _imp->is_recording; }
+    pose::exo_pose_estimator& exo_pose_server::estimator() { return _imp->estimator; }
+    const pose::exo_pose_estimator& exo_pose_server::estimator() const { return _imp->estimator; }
+    std::shared_ptr<hw::sensor_frame_provider> exo_pose_server::provider_shared() const { return _imp->provider; }
+
+    bool exo_pose_server::try_get_annotated_frame(
+        cv::Mat& out_img,
+        std::vector<pose::tag_detection_t>& out_dets,
+        std::chrono::microseconds& out_ts,
+        uint64_t& last_seq)
+    {
+        return _imp->observer && _imp->observer->try_get_frame(out_img, out_dets, out_ts, last_seq);
+    }
+
+    bool exo_pose_server::open_device(uint32_t index, std::optional<int32_t> exposure_us, std::optional<int32_t> gain)
+    {
+        const bool ok = this->_do_open_source_stream(std::to_string(index), _imp->initial.tag_size_m, exposure_us, gain);
+        this->_publish_server_status();
+        return ok;
+    }
+
+    bool exo_pose_server::open_recording(const std::string& path)
+    {
+        const bool ok = this->_do_open_source_stream(path, _imp->initial.tag_size_m, std::nullopt, std::nullopt);
+        this->_publish_server_status();
+        return ok;
+    }
+
+    void exo_pose_server::close_source()
+    {
+        this->_do_close_source_stream();
+        this->_publish_server_status();
+    }
+
+    bool exo_pose_server::calibrate_rest_pose()
+    {
+        const bool ok = this->_do_calibrate_rest_pose();
+        this->_publish_server_status();
+        return ok;
+    }
+
+    void exo_pose_server::clear_rest_pose()
+    {
+        this->_do_clear_rest_pose();
+        this->_publish_server_status();
+    }
+
     bool exo_pose_server::_do_open_source_stream(
-        const std::string& source, 
+        const std::string& source,
         double tag_size_m,
-        std::optional<int32_t> exposure_us, 
+        std::optional<int32_t> exposure_us,
         std::optional<int32_t> gain)
     {
-        auto provider = std::make_shared<hw::sensor_frame_provider>();
-        auto observer = std::make_shared<pose_frame_observer>(*provider, tag_size_m);
-        provider->add_observer(observer);
+        auto new_provider = std::make_shared<hw::sensor_frame_provider>();
+        auto new_observer = std::make_shared<pose_frame_observer>(*new_provider, tag_size_m, _imp->annotate_frames);
+        new_provider->add_observer(new_observer);
 
         // Parse: a full unsigned integer is a device index, anything else a path.
         uint32_t device_index{};
@@ -118,53 +527,79 @@ namespace net
         const bool is_device = (ec == std::errc{} && ptr == source.data() + source.size());
 
         const bool ok = is_device
-            ? provider->open_device(device_index, exposure_us, gain)
-            : provider->open_recording(source);
-        if (!ok)
-        {
+            ? new_provider->open_device(device_index, exposure_us, gain)
+            : new_provider->open_recording(source);
+
+        if (!ok) {
             spdlog::error("failed to open source '{}'", source);
             return false;
         }
 
-        _provider = std::move(provider); // old provider closes/joins here
-        _observer = std::move(observer);
-        _is_recording = !is_device;
-        _last_seq = 0;
-        _estimator.clear_rest_pose();
-        spdlog::info("source '{}' opened", _provider->get_source_name());
+        _imp->provider = std::move(new_provider); // old provider closes/joins here
+        _imp->observer = std::move(new_observer);
+        _imp->is_recording = !is_device;
+        _imp->last_seq = 0;
+        _imp->estimator.clear_rest_pose();
+        spdlog::info("source '{}' opened", _imp->provider->get_source_name());
         return true;
     }
 
     void exo_pose_server::_do_close_source_stream()
     {
-        _provider.reset(); // stops/joins the worker thread
-        _observer.reset();
-        _is_recording = false;
-        _last_seq = 0;
+        _imp->provider.reset(); // stops/joins the worker thread
+        _imp->observer.reset();
+        _imp->is_recording = false;
+        _imp->last_seq = 0;
     }
 
     bool exo_pose_server::_do_calibrate_rest_pose()
     {
-        return _estimator.calibrate_rest_pose();
+        return _imp->estimator.calibrate_rest_pose();
     }
 
     void exo_pose_server::_do_clear_rest_pose()
     {
-        _estimator.clear_rest_pose();
+        _imp->estimator.clear_rest_pose();
     }
 
-    bool exo_pose_server::_poll_new_detections()
+    void exo_pose_server::_poll_pose_pipeline()
     {
-        if (!_observer || !_observer->try_get(_detections, _last_timestamp, _last_seq)) { return false; }
-        _estimator.update(_detections, _last_timestamp);
-        return true;
+        // Recompute joint states from the latest detections, then broadcast. Runs every tick
+        // even with no listener, so an external driver keeps the pipeline live while stopped.
+        const bool is_listening = _imp->uws_loop.is_listening();
+
+        // Poll detections: pull the newest latched frame and recompute joint states.
+        if (const bool has_new_pose =
+                _imp->observer &&
+                _imp->observer->try_get(_imp->detections, _imp->last_timestamp, _imp->last_seq);
+            has_new_pose)
+        {
+            _imp->estimator.update(_imp->detections, _imp->last_timestamp);
+
+            // Broadcast: push the new pose frame to all subscribers.
+            if (is_listening) {
+                _imp->uws_loop.publish("pose", this->_serialize_pose_frame());
+            }
+        }
+
+        // Poll stream end: consume the one-shot signal the worker thread raises at end of stream.
+        if (const bool is_stream_ended = _imp->observer && _imp->observer->consume_stream_ended_signal();
+            is_stream_ended)
+        {
+            // Broadcast: push a SourceStreamEnded message to all subscribers. (graceful EOF vs. device loss)
+            if (is_listening) {
+                _imp->uws_loop.publish("status", this->_serialize_source_stream_ended());
+            }
+        }
     }
 
-    bool exo_pose_server::_poll_stream_ended()
+    void exo_pose_server::_publish_server_status()
     {
-        return _observer && _observer->consume_stream_ended_signal();
+        if (_imp->uws_loop.is_listening()) {
+            _imp->uws_loop.publish("status", this->_serialize_server_status());
+        }
     }
-
+    
     std::string exo_pose_server::_serialize_pose_frame() const
     {
         fb::FlatBufferBuilder b;
@@ -173,7 +608,7 @@ namespace net
         joints.reserve(pose::kNumJoints);
         for (const auto& info : pose::kJointsInfo)
         {
-            const auto& st = _estimator.get_joint_state(info.id);
+            const auto& st = _imp->estimator.get_joint_state(info.id);
 
             const auto to_fb_quat = [](const Eigen::Quaterniond& q) {
                 return fb_proto::Quat{ q.x(), q.y(), q.z(), q.w() };
@@ -193,8 +628,8 @@ namespace net
         }
 
         const auto joints_vec = b.CreateVector(joints);
-        const uint32_t frame_id = _provider ? _provider->get_current_frame_id() : 0;
-        const auto pose_frame = fb_proto::CreatePoseFrame(b, frame_id, _last_timestamp.count(), _estimator.has_rest_pose(), joints_vec);
+        const uint32_t frame_id = _imp->provider ? _imp->provider->get_current_frame_id() : 0;
+        const auto pose_frame = fb_proto::CreatePoseFrame(b, frame_id, _imp->last_timestamp.count(), _imp->estimator.has_rest_pose(), joints_vec);
 
         b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_PoseFrame, pose_frame.Union(), kServerNotifyReqId));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
@@ -204,17 +639,17 @@ namespace net
     {
         fb::FlatBufferBuilder b;
 
-        const bool opened = static_cast<bool>(_provider);
-        const auto name = b.CreateString(opened ? _provider->get_source_name() : std::string{});
+        const bool opened = static_cast<bool>(_imp->provider);
+        const auto name = b.CreateString(opened ? _imp->provider->get_source_name() : std::string{});
         int32_t w = 0, h = 0;
         if (opened)
         {
-            const auto res = _provider->get_color_camera_resolution();
+            const auto res = _imp->provider->get_color_camera_resolution();
             w = res.x(); h = res.y();
         }
 
         const auto status = fb_proto::CreateServerStatus(
-            b, opened, name, w, h, _estimator.has_rest_pose()
+            b, opened, name, w, h, _imp->estimator.has_rest_pose()
         );
 
         b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_ServerStatus, status.Union(), req_id));
@@ -225,8 +660,8 @@ namespace net
     {
         fb::FlatBufferBuilder b;
         // Recording EOF is graceful; a live device stopping on its own is a loss.
-        const bool is_error = !_is_recording;
-        const char* msg = _is_recording ? "recording reached end" : "device stream ended";
+        const bool is_error = !_imp->is_recording;
+        const char* msg = _imp->is_recording ? "recording reached end" : "device stream ended";
         const auto ended = fb_proto::CreateSourceStreamEnded(b, is_error, b.CreateString(msg));
         b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_SourceStreamEnded, ended.Union(), kServerNotifyReqId));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
@@ -241,159 +676,6 @@ namespace net
         const auto ack = fb_proto::CreateAck(b, ok, b.CreateString(msg.data(), msg.size()));
         b.Finish(fb_proto::CreateMessage(b, fb_proto::Payload_Ack, ack.Union(), req_id));
         return std::string(std::bit_cast<const char*>(b.GetBufferPointer()), b.GetSize());
-    }
-
-    int exo_pose_server::run()
-    {
-        struct socket_data {
-            bool accepted{ false }; // false for a rejected (over-capacity) socket
-        };
-
-        uWS::App app;
-
-        app.ws<socket_data>("/*", {
-            .compression = uWS::DISABLED,
-            .open = [this](auto* ws) {
-                if (_client_count >= 1) {
-                    ws->end(1013, "another client is already connected"); // 1013 = Try Again Later
-                    return;
-                }
-                ws->getUserData()->accepted = true;
-                ++_client_count;
-                // Subscribe to the broadcast topics, then send the current status.
-                ws->subscribe("pose");
-                ws->subscribe("status");
-                ws->send(this->_serialize_server_status(), uWS::OpCode::BINARY);
-            },
-            .message = [this, &app](auto* ws, std::string_view msg, uWS::OpCode /*op*/) {
-                if (!ws->getUserData()->accepted) { return; } // ignore a rejected socket still closing
-                const auto* data = std::bit_cast<const uint8_t*>(msg.data());
-                fb::Verifier verifier{ data, msg.size() };
-                if (!fb_proto::VerifyMessageBuffer(verifier))
-                {
-                    ws->send(this->_serialize_ack(false, "malformed message"), uWS::OpCode::BINARY);
-                    return;
-                }
-
-                const fb_proto::Message* m = get_root_message(data);
-                const req_id_t req = m->request_id(); // echoed back on the reply for correlation
-
-                // A malformed request must never take down the loop; reply with an error Ack.
-                try
-                {
-                    if (req == kServerNotifyReqId) {
-                        // 0 is reserved for server notify events,
-                        // so a client command carrying request id 0 is a protocol violation.
-                        // reject it.
-                        ws->send(this->_serialize_ack(false, "request_id must be non-zero", kServerNotifyReqId), uWS::OpCode::BINARY);
-                        return;
-                    }
-
-                    // Pure query(no Ack, no broadcast):
-                    // reply with the current status to this client only.
-                    if (m->payload_type() == fb_proto::Payload_GetServerStatus)
-                    {
-                        ws->send(this->_serialize_server_status(req), uWS::OpCode::BINARY);
-                        return;
-                    }
-
-                    bool status_changed = false;
-                    std::string ack;
-
-                    switch (m->payload_type())
-                    {
-                        case fb_proto::Payload_OpenSourceStream:
-                        {
-                            const auto* o = m->payload_as_OpenSourceStream();
-                            const std::string src = o->source() ? o->source()->str() : std::string{};
-                            std::optional<int32_t> exposure, gain;
-                            if (const auto e = o->exposure_us()) { exposure = *e; }
-                            if (const auto g = o->gain()) { gain = *g; }
-                            const bool ok = this->_do_open_source_stream(src, o->tag_size_m(), exposure, gain);
-                            ack = this->_serialize_ack(ok, ok ? "source opened" : "open failed", req);
-                            status_changed = true;
-                            break;
-                        }
-                        case fb_proto::Payload_CloseSourceStream:
-                            this->_do_close_source_stream();
-                            ack = this->_serialize_ack(true, "source closed", req);
-                            status_changed = true;
-                            break;
-                        case fb_proto::Payload_CalibrateRestPose:
-                        {
-                            const bool ok = this->_do_calibrate_rest_pose();
-                            ack = this->_serialize_ack(ok, ok ? "rest pose calibrated" : "no computable joint rotation", req);
-                            status_changed = true;
-                            break;
-                        }
-                        case fb_proto::Payload_ClearRestPose:
-                            this->_do_clear_rest_pose();
-                            ack = this->_serialize_ack(true, "rest pose cleared", req);
-                            status_changed = true;
-                            break;
-                        default:
-                            ack = this->_serialize_ack(false, "unsupported message", req);
-                            break;
-                    }
-
-                    ws->send(ack, uWS::OpCode::BINARY);
-                    if (status_changed) { app.publish("status", this->_serialize_server_status(), uWS::OpCode::BINARY); }
-                }
-                catch (const std::exception& e)
-                {
-                    spdlog::error("command handler error: {}", e.what());
-                    ws->send(this->_serialize_ack(false, "internal error", req), uWS::OpCode::BINARY);
-                }
-            },
-            .close = [this](auto* ws, int /*code*/, std::string_view /*message*/) {
-                if (!ws->getUserData()->accepted) { return; } // rejected socket was never counted
-                // Release the shared source once the (only) client disconnects.
-                --_client_count;
-                if (_client_count == 0)
-                {
-                    this->_do_close_source_stream();
-                    spdlog::info("last client disconnected; source released");
-                }
-            }
-        });
-
-        // Periodic pump on the loop thread: pull the latest detections, update the
-        // estimator, and broadcast a PoseFrame. The provider's worker thread only
-        // latches, so this is the single place pose data is serialized and sent.
-        struct timer_ctx { exo_pose_server* self; uWS::App* app; };
-        auto* timer = ::us_create_timer(std::bit_cast<us_loop_t*>(uWS::Loop::get()), 0, sizeof(timer_ctx));
-        auto* ctx = std::bit_cast<timer_ctx*>(::us_timer_ext(timer));
-        ctx->self = this;
-        ctx->app = &app;
-        ::us_timer_set(timer, [](us_timer_t* t) {
-            auto* c = std::bit_cast<timer_ctx*>(::us_timer_ext(t));
-            if (c->self->_poll_new_detections())
-            {
-                c->app->publish("pose", c->self->_serialize_pose_frame(), uWS::OpCode::BINARY);
-            }
-            if (c->self->_poll_stream_ended())
-            {
-                c->app->publish("status", c->self->_serialize_source_stream_ended(), uWS::OpCode::BINARY);
-            }
-        }, 8, 8); // ~120 Hz
-
-        // Optional: auto-open a recording passed on the command line.
-        if (!_initial.input_path.empty())
-        {
-            this->_do_open_source_stream(
-                _initial.input_path, 
-                _initial.tag_size_m,
-                _initial.exposure_us, 
-                _initial.gain
-            );
-        }
-
-        app.listen(_port, [this](auto* token) {
-            if (token) { spdlog::info("pose server listening on ws://localhost:{}", _port); }
-            else { spdlog::error("failed to listen on port {}", _port); }
-        }).run();
-
-        return 0;
     }
 
 } // namespace net

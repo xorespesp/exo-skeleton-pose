@@ -15,11 +15,14 @@
 #include <opencv2/core.hpp>
 #include <Eigen/Geometry>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+namespace net { class exo_pose_server; }
 
 namespace gui
 {
@@ -30,11 +33,15 @@ namespace gui
 
     enum class source_kind_t { device, recording };
 
-    // Debug GUI: live tag detection + per-joint pose visualization (imgui/implot3d).
+    // Debugger GUI app
     class debug_gui_app final : public app_base<app_renderer_sdl3>
     {
     public:
-        explicit debug_gui_app(const app::source_options& opt);
+        // `server` null: own the source. non-null: monitor/control the server's source.
+        explicit debug_gui_app(
+            const app::source_options& opt, 
+            net::exo_pose_server* server = nullptr
+        );
 
         int run(); // create window, open the initial source, loop, destroy
 
@@ -42,6 +49,10 @@ namespace gui
         void render_ui() override;
 
     private:
+        // Active pipeline: the server's when monitoring, else this GUI's own.
+        pose::exo_pose_estimator& _est();
+        bool _is_source_recording() const;
+
         void _open_device(uint32_t index);
         void _open_recording(const std::string& path);
 
@@ -86,6 +97,7 @@ namespace gui
         };
 
         app::source_options _opt;
+        net::exo_pose_server* _server{ nullptr }; // non-null -> monitor mode
 
         std::shared_ptr<hw::sensor_frame_provider> _provider;
         std::shared_ptr<debug_gui_observer> _observer;

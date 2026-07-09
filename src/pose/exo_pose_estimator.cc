@@ -1,6 +1,8 @@
 ﻿#include "exo_pose_estimator.hh"
 #include "rotation_constraint.hh"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <limits>
 
@@ -22,23 +24,31 @@ namespace pose
             return (parent.conjugate() * child).normalized();
         }
 
-        // Under a swing-twist decomposition about the leg-hinge axis, the twist is the real joint
-        // motion and the swing (off-axis part) is pose error: candidates are ranked by least swing
-        // and the chosen rotation keeps only its twist about the axis.
-        //
-        // Returns the index of the candidate closest to a pure leg-hinge rotation (least off-axis swing).
-        [[nodiscard]] size_t min_off_axis(std::span<const Eigen::Quaterniond> cands, const Eigen::Vector3d& axis) noexcept
+        constexpr double kRadToDeg = 57.29577951308232;
+
+        // How a candidate pose reads as joint motion: its rotation relative to the captured rest
+        // pose, expressed in the parent's frame, split about the hinge axis. These are the two
+        // quantities a physical joint-limit gate would test.
+        struct hinge_angles_t
         {
-            size_t best = 0;
-            double min_swing = std::numeric_limits<double>::max();
-            for (size_t i = 0; i < cands.size(); ++i) {
-                // Swing angle = how far this candidate departs from a pure rotation about the leg-hinge axis;
-                // the planar-ambiguity flip swings off-axis, the correct pose stays near it.
-                const double swing = swing_angle(cands[i], axis);
-                if (swing < min_swing) { min_swing = swing; best = i; }
-            }
-            return best;
+            double flex_deg;     // signed rotation about the hinge axis (the joint's only real DOF)
+            double off_axis_deg; // magnitude of what is left after removing the flexion (0 for an ideal hinge)
+        };
+
+        // `cand_global` / `parent_global` are camera-frame rotations;
+        // `rest_local` is the joint's captured rest rotation in its parent's frame.
+        hinge_angles_t hinge_angles_of(
+            const Eigen::Quaterniond& cand_global,
+            const Eigen::Quaterniond& parent_global,
+            const Eigen::Quaterniond& rest_local)
+        {
+            const Eigen::Quaterniond anim = q_relative(rest_local, q_relative(parent_global, cand_global));
+            return {
+                twist_angle(anim, kExoHingeLocalAxis) * kRadToDeg,
+                swing_angle(anim, kExoHingeLocalAxis) * kRadToDeg
+            };
         }
+
     } // namespace
 
     struct exo_pose_estimator::context_t
@@ -56,6 +66,7 @@ namespace pose
         struct tag_pose_candidates_t
         {
             std::array<Eigen::Isometry3d, 2> transform{}; // tag->camera per candidate (obj_err ascending)
+            std::array<double, 2> obj_err{};              // object-space error per candidate (drives flip rejection)
             int n{ 0 };
         };
 
@@ -154,6 +165,7 @@ namespace pose
             curr_j_pose_candidates.n = curr_tag_det.num_pose_candidates;
             for (int k = 0; k < curr_tag_det.num_pose_candidates; ++k) {
                 curr_j_pose_candidates.transform[k] = curr_tag_det.pose_candidates[k].transform;
+                curr_j_pose_candidates.obj_err[k] = curr_tag_det.pose_candidates[k].obj_err;
             }
         }
 
@@ -194,25 +206,119 @@ namespace pose
                 : _ctx->last_frame_joint_states[index_of(curr_j_info.parent)].global_rot;
 
             // Candidate selection: default to the best geometric fit (candidates[0] = min obj_err).
-            // With a rest and a resolved parent, prefer the candidate closest to a pure leg-hinge
-            // rotation (least off-axis swing), which rejects the planar-ambiguity flip.
+            // Reject the planar-ambiguity flip (the second candidate, whose twist points the
+            // opposite way). obj_err discriminates the true fit from the flip strongly (typically
+            // 20-100x), so trust it unless the two are near-tied; only in a genuine near-tie (tag
+            // near head-on) fall back to temporal continuity -- keep the candidate whose absolute
+            // rotation stays closest to the last smoothed output, since the flip is always a large
+            // discrete jump. swing is deliberately NOT used to select: it rewards the flip whenever
+            // the leg twists off the hinge plane, which was the original opposite-leg bug.
             size_t selected_candidate_idx = 0;
-            if (_opt.enable_hinge_constraint 
+            if (_opt.enable_hinge_constraint
                 && curr_j_rest_rot.has_value()
                 && (is_root_joint(curr_j_info.id) || curr_j_parent_global.has_value()))
             {
-                std::array<Eigen::Quaterniond, 2> local_anim_rot_candidates;
-                for (int k = 0; k < curr_j_pose_candidates.n; ++k) {
-                    const Eigen::Quaterniond child_abs = rot_of(curr_j_pose_candidates.transform[k]);
-                    const Eigen::Quaterniond local = is_root_joint(curr_j_info.id)
-                        ? child_abs
-                        : q_relative(curr_j_parent_global.value(), child_abs);
-                    local_anim_rot_candidates[k] = q_relative(curr_j_rest_rot.value(), local);
+                if (curr_j_pose_candidates.n == 2 && curr_j_fstate.last_out.has_value()) {
+                    constexpr double kObjErrDecisiveRatio = 8.0; // err1 >= 8*err0 => trust min-obj_err candidate#0
+                    const double e0 = curr_j_pose_candidates.obj_err[0];
+                    const double e1 = curr_j_pose_candidates.obj_err[1];
+                    if (e1 < kObjErrDecisiveRatio * e0) {
+                        // near-tie: keep the branch closest to the last smoothed absolute rotation
+                        const Eigen::Quaterniond& prev = curr_j_fstate.last_out.value();
+                        double best = std::numeric_limits<double>::max();
+                        for (int k = 0; k < curr_j_pose_candidates.n; ++k) {
+                            const double d = prev.angularDistance(rot_of(curr_j_pose_candidates.transform[k]));
+                            if (d < best) { best = d; selected_candidate_idx = static_cast<size_t>(k); }
+                        }
+                    }
                 }
-                selected_candidate_idx = min_off_axis(
-                    std::span<const Eigen::Quaterniond>{ local_anim_rot_candidates.data(), static_cast<size_t>(curr_j_pose_candidates.n) }, 
-                    kExoHingeLocalAxis
+            }
+
+            // TODO(physical-gate): drop physically impossible candidates before selecting, once the
+            // rig is the real robot. Selection has exactly one weak spot: the seed. Cold start, and
+            // reseed after an occlusion longer than `reset_gap`, resolve to `candidates[0]` with no
+            // track to check it against, so a near-tied flip on that single frame locks the track
+            // until obj_err turns decisive again. A gate closes that hole, because the flip is then
+            // absent from the candidate set no matter what the seed logic would have preferred.
+            //
+            // Deriving the limits from the `[hinge-diag]` lines below (run at debug level):
+            //   1. Sweep each joint through its full mechanical range. The `flex` values logged for
+            //      the selected candidate trace out that joint's real [flex_min, flex_max].
+            //   2. Hold the joint still at several angles. The frame-to-frame spread of `flex`/`off`
+            //      on the selected candidate is the measurement noise, i.e. the margin to add.
+            //   3. Induce flips and compare the rejected candidate's `flex`/`off` to that envelope.
+            //      A gate earns its place only if the flip lands clearly outside it.
+            // Then reject a candidate whose `flex` leaves [flex_min - margin, flex_max + margin], or
+            // whose `off` exceeds the largest `off` seen on a correct pose plus margin. Per-joint
+            // limits belong in a `kJointsInfo` column, not in constants here.
+            //
+            // Keep the gate loose: it must never reject a real pose, only obvious impossibilities.
+            // Never rank near-tied candidates by `off_axis_deg`. Real off-axis motion inflates it on
+            // the true candidate, which is precisely what made an earlier selector prefer the flip.
+            // Fine discrimination stays with obj_err and temporal continuity.
+            //
+            // NOTE: the current rig is a folded-paper mock with no mechanical stops. Its flex range
+            // is whatever the operator's hand does and its `off` carries the paper's slop, so limits
+            // measured on it do not transfer. Collect these on the robot.
+            if (_opt.enable_hinge_constraint
+                && !is_root_joint(curr_j_info.id)
+                && curr_j_rest_rot.has_value()
+                && curr_j_parent_global.has_value()
+                && spdlog::should_log(spdlog::level::debug))
+            {
+                const auto a0 = hinge_angles_of(
+                    rot_of(curr_j_pose_candidates.transform[0]),
+                    curr_j_parent_global.value(),
+                    curr_j_rest_rot.value()
                 );
+
+                if (curr_j_pose_candidates.n == 2) {
+                    const auto a1 = hinge_angles_of(
+                        rot_of(curr_j_pose_candidates.transform[1]),
+                        curr_j_parent_global.value(),
+                        curr_j_rest_rot.value()
+                    );
+                    const double e0 = curr_j_pose_candidates.obj_err[0];
+                    const double e1 = curr_j_pose_candidates.obj_err[1];
+                    spdlog::debug(
+                        "[hinge-diag] {} sel=c{}"
+                        " | c0 err={:.6f} flex={:+7.2f} off={:6.2f}"
+                        " | c1 err={:.6f} flex={:+7.2f} off={:6.2f}"
+                        " | err_ratio={:.2f}",
+                        curr_j_info.name, selected_candidate_idx,
+                        e0, a0.flex_deg, a0.off_axis_deg,
+                        e1, a1.flex_deg, a1.off_axis_deg,
+                        e0 > 0.0 ? e1 / e0 : std::numeric_limits<double>::infinity()
+                    );
+                } else {
+                    spdlog::debug(
+                        "[hinge-diag] {} sel=c0 | c0 err={:.6f} flex={:+7.2f} off={:6.2f} | c1 none",
+                        curr_j_info.name,
+                        curr_j_pose_candidates.obj_err[0], a0.flex_deg, a0.off_axis_deg
+                    );
+                }
+            }
+
+            // Flip warning: the annotated frame draws the detector's min-error candidate
+            // (candidates[0]). When that candidate jumps far from this joint's stable track (the
+            // previous smoothed rotation), the planar-ambiguity flip is showing in the annotated
+            // view. Warn so the flip is visible + logged; the skeleton itself follows the selected
+            // candidate, which temporal continuity keeps stable.
+            if (curr_j_pose_candidates.n == 2 && 
+                curr_j_fstate.last_out.has_value())
+            {
+                constexpr double kFlipWarnDeg = 60.0; // one-frame jump beyond any real joint motion
+                const double min_err_jump_deg =
+                    curr_j_fstate.last_out->angularDistance(rot_of(curr_j_pose_candidates.transform[0])) * kRadToDeg;
+                
+                if (min_err_jump_deg > kFlipWarnDeg)
+                {
+                    spdlog::warn(
+                        "[flip] {}: min-error pose jumped {:.0f} deg from track "
+                        "(planar-ambiguity flip; skeleton uses candidate#{})",
+                        curr_j_info.name, min_err_jump_deg, selected_candidate_idx
+                    );
+                }
             }
 
             curr_j_state.view_pose = curr_j_pose_candidates.transform[selected_candidate_idx]; // reflect the selection in the raw (absolute) view
@@ -229,6 +335,8 @@ namespace pose
 
             // Reseed on cold start, after a long gap, or when smoothing is disabled
             // (disabled -> raw passthrough while keeping the kernel synced for re-enable).
+            // A reseed adopts the selected candidate with no prior track to validate it against,
+            // which is the seed path the TODO(physical-gate) above is meant to protect.
             if (!_opt.enable_smoothing || !curr_j_fstate.last_out.has_value() || (t - curr_j_fstate.last_seen) > _opt.reset_gap) {
                 curr_j_fstate.smoother->reset(q);
                 curr_j_fstate.last_out = q;

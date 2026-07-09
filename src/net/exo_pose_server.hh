@@ -16,6 +16,8 @@
 
 namespace net
 {
+    class exo_pose_pipeline;
+
     // Protocol correlation id (Message.request_id)
     using req_id_t = uint32_t;
 
@@ -48,8 +50,15 @@ namespace net
         // Convenience blocking mode: start(), run the loop until it ends, then stop().
         int run();
 
+        // The pose pipeline this server drives. 
+        // A GUI debugger reads/controls the source and estimator through this.
+        // single-threaded with poll().
+        exo_pose_pipeline& pipeline();
+        const exo_pose_pipeline& pipeline() const;
+
         // --- GUI Debugger accessors --------------------------------
-        // Single-threaded with poll(), so the debugger touches these directly.
+        // Single-threaded with poll(), so the debugger touches these directly. Broadcasts a
+        // status update to connected clients where the underlying pipeline state changes.
         pose::exo_pose_estimator& estimator();
         const pose::exo_pose_estimator& estimator() const;
         std::shared_ptr<hw::sensor_frame_provider> provider_shared() const;
@@ -72,20 +81,8 @@ namespace net
         void clear_rest_pose();
 
     private:
-        // Pipeline ops (loop thread)
-        bool _do_open_source_stream(
-            const std::string& source, // unsigned int: device index / else: recording path.
-            double tag_size_m,
-            std::optional<int32_t> exposure_us,
-            std::optional<int32_t> gain
-        );
-        void _do_close_source_stream();
-        bool _do_calibrate_rest_pose();
-        void _do_clear_rest_pose();
-
-        // Advance the pipeline one step: pull latched detections, recompute joint states,
-        // and broadcast pose/status while the listener is up.
-        void _poll_pose_pipeline();
+        // Advance the pipeline one step and broadcast pose/status while the listener is up.
+        void _pump_pipeline();
 
         // Broadcast the current ServerStatus to all subscribers. (no-op while stopped)
         void _publish_server_status();

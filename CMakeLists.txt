@@ -62,6 +62,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/gui/debug_gui_app.cc"
 
     # server (websocket + flatbuffers protocol)
+    "src/net/exo_pose_pipeline.hh"
+    "src/net/exo_pose_pipeline.cc"
     "src/net/exo_pose_server.hh"
     "src/net/exo_pose_server.cc"
 )

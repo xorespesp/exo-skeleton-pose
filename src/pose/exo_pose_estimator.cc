@@ -264,7 +264,7 @@ namespace pose
                 && !is_root_joint(curr_j_info.id)
                 && curr_j_rest_rot.has_value()
                 && curr_j_parent_global.has_value()
-                && spdlog::should_log(spdlog::level::debug))
+                && spdlog::should_log(spdlog::level::trace)) // per-frame, per-joint: trace, or it drowns the log
             {
                 const auto a0 = hinge_angles_of(
                     rot_of(curr_j_pose_candidates.transform[0]),
@@ -280,7 +280,7 @@ namespace pose
                     );
                     const double e0 = curr_j_pose_candidates.obj_err[0];
                     const double e1 = curr_j_pose_candidates.obj_err[1];
-                    spdlog::debug(
+                    spdlog::trace(
                         "[hinge-diag] {} sel=c{}"
                         " | c0 err={:.6f} flex={:+7.2f} off={:6.2f}"
                         " | c1 err={:.6f} flex={:+7.2f} off={:6.2f}"
@@ -291,7 +291,7 @@ namespace pose
                         e0 > 0.0 ? e1 / e0 : std::numeric_limits<double>::infinity()
                     );
                 } else {
-                    spdlog::debug(
+                    spdlog::trace(
                         "[hinge-diag] {} sel=c0 | c0 err={:.6f} flex={:+7.2f} off={:6.2f} | c1 none",
                         curr_j_info.name,
                         curr_j_pose_candidates.obj_err[0], a0.flex_deg, a0.off_axis_deg

@@ -130,6 +130,10 @@ namespace gui
 
         // Mirror spdlog output into the in-GUI log console. Registered here (main thread,
         // before any capture worker exists) so appending to the sink list is race-free.
+        //
+        // Records every severity, unlike the terminal sink: the console's own toggles filter the
+        // view, and a level turned back on must be able to reveal what it already missed.
+        _log_console.sink()->set_level(spdlog::level::trace);
         spdlog::default_logger()->sinks().push_back(_log_console.sink());
     }
 
@@ -143,7 +147,11 @@ namespace gui
             return -1;
         }
 
+        spdlog::info("debugger ready: open a source from File > Open..., start the listener from Server > Start Server");
+
         this->app_base::run();
+
+        spdlog::info("debugger shutting down");
         this->destroy();
         return 0;
     }
@@ -452,9 +460,7 @@ namespace gui
             {
                 ImGui::TextUnformatted(pipe.estimator().has_rest_pose() ? "Rest Pose: calibrated" : "Rest Pose: N/A");
                 ImGui::SameLine();
-                if (ImGui::Button("Calibrate")) {
-                    if (!pipe.calibrate_rest_pose()) { spdlog::warn("calibrate: no joint had a computable local rotation"); }
-                }
+                if (ImGui::Button("Calibrate")) { pipe.calibrate_rest_pose(); } // the pipeline logs the outcome
                 ImGui::SameLine();
                 if (ImGui::Button("Clear")) { pipe.clear_rest_pose(); }
             }

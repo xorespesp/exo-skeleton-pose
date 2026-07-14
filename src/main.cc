@@ -11,8 +11,13 @@
 int main(int argc, char** argv)
 {
     spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
-    spdlog::set_level(spdlog::level::info);
     spdlog::flush_on(spdlog::level::info);
+
+    // The logger passes every severity; each sink decides what it keeps. The terminal takes
+    // info and up, while the debugger's in-GUI console attaches a sink that records everything
+    // (its severity toggles filter the view, so a record must be there to be revealed later).
+    spdlog::set_level(spdlog::level::trace);
+    for (auto& sink : spdlog::default_logger()->sinks()) { sink->set_level(spdlog::level::info); }
 
     CLI::App cli{ "exo-skeleton-pose" };
 

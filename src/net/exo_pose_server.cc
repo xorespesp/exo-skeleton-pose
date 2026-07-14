@@ -198,13 +198,15 @@ namespace net
             app.ws<uws_socket_userdata_t>("/*", {
                 .compression = uWS::DISABLED,
                 .open = [this](auto* ws) {
+                    const std::string peer{ ws->getRemoteAddressAsText() };
                     if (_imp->client_count >= 1) {
+                        spdlog::warn("rejecting client {}: another client already holds the single slot", peer);
                         ws->end(kCloseTryAgainLater, "another client is already connected");
                         return;
                     }
                     ws->getUserData()->accepted = true;
                     ++_imp->client_count;
-                    spdlog::info("client connected, waiting handshake..");
+                    spdlog::info("client {} connected, waiting handshake..", peer);
                 },
                 .message = [this](auto* ws, std::string_view msg, uWS::OpCode /*op*/) {
                     if (!ws->getUserData()->accepted) { return; } // ignore a rejected socket still closing
@@ -225,6 +227,9 @@ namespace net
 
                     const fb_proto::Message* m = get_fb_proto_root_msg(data);
                     const req_id_t req = m->request_id(); // echoed back on the reply for correlation
+
+                    spdlog::debug("rx {} (request id {}, {} bytes)",
+                        fb_proto::EnumNamePayload(m->payload_type()), req, msg.size());
 
                     if (const bool is_valid_req_id = req != kServerNotifyReqId;
                         !is_valid_req_id)
@@ -311,6 +316,7 @@ namespace net
                                 ack = this->_serialize_ack(true, "rest pose cleared", req);
                                 break;
                             default:
+                                spdlog::warn("unsupported message: {}", fb_proto::EnumNamePayload(m->payload_type()));
                                 ack = this->_serialize_ack(false, "unsupported message", req);
                                 break;
                         }
@@ -323,10 +329,11 @@ namespace net
                         ws->send(this->_serialize_ack(false, "internal error", req), uWS::OpCode::BINARY);
                     }
                 },
-                .close = [this](auto* ws, int /*code*/, std::string_view /*message*/) {
+                .close = [this](auto* ws, int code, std::string_view message) {
                     if (!ws->getUserData()->accepted) { return; } // rejected socket was never counted
                     --_imp->client_count;
-                    spdlog::info("client disconnected");
+                    spdlog::info("client disconnected (code {}{}{})",
+                        code, message.empty() ? "" : ": ", message);
                     // Release the source once the last client leaves so a monitor GUI reflects
                     // it and a live device is freed.
                     if (_imp->client_count == 0)
@@ -352,13 +359,22 @@ namespace net
             8ms // ~120 Hz pipeline tick
         );
 
-        if (ok) { spdlog::info("pose server listening on ws://localhost:{}", _imp->port); }
-        else { spdlog::error("failed to listen on port {}", _imp->port); }
+        if (ok) {
+            spdlog::info("pose server listening on ws://localhost:{} (protocol version {})",
+                _imp->port, static_cast<uint32_t>(fb_proto::ProtocolVersion_Current));
+        }
+        else {
+            spdlog::error("failed to listen on port {} (already in use?)", _imp->port);
+        }
         return ok;
     }
 
     void exo_pose_server::stop()
     {
+        if (_imp->uws_loop.is_listening())
+        {
+            spdlog::info("pose server stopping ({} client(s) will be dropped)", _imp->client_count);
+        }
         _imp->uws_loop.stop_listening();
         _imp->client_count = 0;
     }
@@ -384,6 +400,7 @@ namespace net
         // Optional: auto-open a recording passed on the command line.
         if (!_imp->initial.input_path.empty())
         {
+            spdlog::info("auto-opening the source given on the command line");
             _imp->pipeline.open_source(
                 _imp->initial.input_path,
                 _imp->initial.tag_size_m,
@@ -407,9 +424,26 @@ namespace net
         const exo_pose_pipeline::poll_result r = _imp->pipeline.poll();
         if (_imp->uws_loop.is_listening())
         {
-            if (r.new_pose) { _imp->uws_loop.publish("pose", this->_serialize_pose_frame()); }
-            if (r.stream_ended) { _imp->uws_loop.publish("status", this->_serialize_source_stream_ended()); }
-            if (r.status_changed) { _imp->uws_loop.publish("status", this->_serialize_server_status()); }
+            // Pose frames go out at source rate, so they are logged at trace; the two rare
+            // status broadcasts get a debug line each.
+            if (r.new_pose)
+            {
+                const std::string frame = this->_serialize_pose_frame();
+                spdlog::trace("tx PoseFrame #{} ({} bytes) to {} client(s)",
+                    _imp->pipeline.current_frame_id(), frame.size(), _imp->client_count);
+                _imp->uws_loop.publish("pose", frame);
+            }
+            if (r.stream_ended)
+            {
+                spdlog::debug("tx SourceStreamEnded");
+                _imp->uws_loop.publish("status", this->_serialize_source_stream_ended());
+            }
+            if (r.status_changed)
+            {
+                spdlog::debug("tx ServerStatus (source open: {}, rest pose: {})",
+                    _imp->pipeline.is_source_open(), _imp->pipeline.estimator().has_rest_pose());
+                _imp->uws_loop.publish("status", this->_serialize_server_status());
+            }
         }
     }
 

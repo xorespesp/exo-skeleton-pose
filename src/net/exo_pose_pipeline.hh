@@ -5,6 +5,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -86,6 +87,14 @@ namespace net
         void seek_to_end();
 
     private:
+        // Log what changed since the last frame (tags appearing/disappearing, joints gaining or
+        // losing tracking) instead of restating the same state every frame, plus a throughput
+        // line on a timer. Cleared whenever the source changes.
+        void _log_frame_diff();
+        void _log_periodic_stats();
+        void _reset_frame_log_state();
+
+    private:
         double _default_tag_size_m;
         bool _annotate_frames; // observer keeps an annotated frame for a monitor GUI
 
@@ -97,6 +106,13 @@ namespace net
         std::chrono::microseconds _last_timestamp{ 0 }; // device time of the latched frame
         bool _is_recording{ false };
         bool _status_changed{ false }; // a source/rest command changed the reported status; consumed by poll()
+
+        // --- frame-log state (transitions + throughput; see _log_frame_diff) --------------
+        uint64_t _seen_tag_mask{ 0 };  // bit t = tag id t was detected in the previous frame
+        std::array<bool, pose::kNumJoints> _joint_tracked{}; // per joint: had a local rotation last frame
+        std::chrono::steady_clock::time_point _stats_since{}; // start of the current summary window
+        uint32_t _stats_frames{ 0 };   // frames polled in the window
+        uint32_t _stats_detections{ 0 }; // tags detected across those frames
     };
 
 } // namespace net

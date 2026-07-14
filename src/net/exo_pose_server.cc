@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <format>
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -144,8 +145,13 @@ namespace net
 
         struct uws_socket_userdata_t
         {
-            bool accepted{ false }; // false for a rejected (over-capacity) socket
+            bool accepted{ false };   // false for a rejected (over-capacity) socket
+            bool handshaked{ false }; // set once a Hello carrying our protocol version arrives
         };
+
+        // WebSocket close codes used on rejection.
+        constexpr int kCloseTryAgainLater = 1013; // another client already holds the single slot
+        constexpr int kCloseProtocolError = 1002; // the client is not speaking this protocol
 
     } // namespace
 
@@ -193,41 +199,78 @@ namespace net
                 .compression = uWS::DISABLED,
                 .open = [this](auto* ws) {
                     if (_imp->client_count >= 1) {
-                        ws->end(1013, "another client is already connected"); // 1013 = Try Again Later
+                        ws->end(kCloseTryAgainLater, "another client is already connected");
                         return;
                     }
                     ws->getUserData()->accepted = true;
                     ++_imp->client_count;
-                    spdlog::info("client connected");
-                    // Subscribe to the broadcast topics, then send the current status.
-                    ws->subscribe("pose");
-                    ws->subscribe("status");
-                    ws->send(this->_serialize_server_status(), uWS::OpCode::BINARY);
+                    spdlog::info("client connected, waiting handshake..");
                 },
                 .message = [this](auto* ws, std::string_view msg, uWS::OpCode /*op*/) {
                     if (!ws->getUserData()->accepted) { return; } // ignore a rejected socket still closing
+
+                    // Drop the client: log the reason and put it on the websocket close frame
+                    const auto reject_client = [ws](int close_code, std::string_view reason) {
+                        spdlog::warn("rejecting client: {}", reason);
+                        ws->end(close_code, reason);
+                    };
+
                     const auto* data = std::bit_cast<const uint8_t*>(msg.data());
                     fb::Verifier verifier{ data, msg.size() };
                     if (!fb_proto::VerifyMessageBuffer(verifier))
                     {
-                        ws->send(this->_serialize_ack(false, "malformed message"), uWS::OpCode::BINARY);
+                        reject_client(kCloseProtocolError, "malformed message");
                         return;
                     }
 
                     const fb_proto::Message* m = get_fb_proto_root_msg(data);
                     const req_id_t req = m->request_id(); // echoed back on the reply for correlation
 
-                    // A malformed request must never take down the loop; reply with an error Ack.
-                    try
+                    if (const bool is_valid_req_id = req != kServerNotifyReqId;
+                        !is_valid_req_id)
                     {
-                        if (req == kServerNotifyReqId) {
-                            // 0 is reserved for server notify events,
-                            // so a client command carrying request id 0 is a protocol violation.
-                            // reject it.
-                            ws->send(this->_serialize_ack(false, "request_id must be non-zero", kServerNotifyReqId), uWS::OpCode::BINARY);
+                        // 0 is reserved for server notify events,
+                        // so a client command carrying request id 0 is a protocol violation. reject it.
+                        reject_client(kCloseProtocolError, "request_id must be non-zero");
+                        return;
+                    }
+
+                    // Handshake: Check protocol version
+                    if (m->payload_type() == fb_proto::Payload_Hello)
+                    {
+                        const auto client_ver = m->payload_as_Hello()->proto_version();
+                        const auto server_ver = static_cast<uint32_t>(fb_proto::ProtocolVersion_Current);
+                        if (client_ver != server_ver) {
+                            reject_client(kCloseProtocolError, std::format("protocol version mismatch: server {}, client {}", server_ver, client_ver));
                             return;
                         }
 
+                        ws->getUserData()->handshaked = true;
+                        spdlog::info("client handshake ok (proto version: {})", server_ver);
+
+                        // Both peers now agree on the schema, so payloads are safe to send:
+                        // subscribe to the broadcast topics and hand over the current status.
+                        ws->subscribe("pose");
+                        ws->subscribe("status");
+                        ws->send(this->_serialize_ack(true, "handshake ok", req), uWS::OpCode::BINARY);
+                        ws->send(this->_serialize_server_status(), uWS::OpCode::BINARY);
+                        return;
+                    }
+
+                    if (!ws->getUserData()->handshaked)
+                    {
+                        reject_client(kCloseProtocolError, "handshake required: Hello must be the first message");
+                        return;
+                    }
+
+                    /////////////////////////////////////////////////////////////////////////////////////
+                    // NOTE: Past this point, the client is known to speak our protocol version
+                    /////////////////////////////////////////////////////////////////////////////////////
+
+                    // Commands reach into the pipeline, the only code here that can throw; a failing
+                    // one must never take down the loop, so it ends in an error Ack.
+                    try
+                    {
                         // Pure query(no Ack, no broadcast):
                         // reply with the current status to this client only.
                         if (m->payload_type() == fb_proto::Payload_GetServerStatus)
@@ -360,7 +403,7 @@ namespace net
     {
         // poll() consumes the pipeline's per-step signals; broadcast each while the listener is up.
         // A status change (from a client command or a GUI action) is dropped while stopped, since
-        // there are no subscribers; a connecting client receives the current status on open.
+        // there are no subscribers; a client receives the current status once its handshake completes.
         const exo_pose_pipeline::poll_result r = _imp->pipeline.poll();
         if (_imp->uws_loop.is_listening())
         {

@@ -41,14 +41,26 @@ let pending = false;     // a command is awaiting its Ack
 const client = new PoseClient();
 
 client.onOpen = () => {
+    // The socket is up but the protocol handshake is still in flight; 
+    // commands stay disabled until the server accepts our version. (onReady)
+    ui.connection = 'handshaking';
+    refresh();
+};
+client.onReady = () => {
     connecting = false; connected = true;
     ui.connection = 'connected';
     startStatusPoll(); // resync ServerStatus while connected
     refresh();
 };
+client.onProtocolError = (reason) => {
+    // The server has closed the socket on us; onClose resets the rest of the state.
+    ui.connection = 'protocol error';
+    console.error(`rejected by the server: ${reason}`);
+};
 client.onClose = () => {
     connecting = false; connected = false; opened = false; pending = false;
-    ui.connection = 'disconnected';
+    // A rejected client is closed by the server; keep the reason on screen.
+    if (ui.connection !== 'protocol error') { ui.connection = 'disconnected'; }
     ui.source_name = '(none)';
     ui.rest_pose = 'none';
     stopStatusPoll();
@@ -88,6 +100,7 @@ client.onPoseFrame = (frame) => {
 function doConnect() {
     if (connected || connecting) { return; }
     connecting = true;
+    ui.connection = 'connecting';
     client.connect(ui.url);
     refresh();
 }

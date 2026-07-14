@@ -7,7 +7,10 @@
 
 namespace exo.proto;
 
-// Lower-limb joints. Values match pose::joint_id_t on the server.
+// Current version of this schema
+enum ProtocolVersion : uint { Current = 26071400 } // YYMMDDrr
+
+// Lower-limb joints id. (pose::joint_id_t)
 enum JointId : ubyte {
     Pelvis = 0, 
     RKnee, 
@@ -22,11 +25,18 @@ enum JointId : ubyte {
 // Client -> Server commands
 // ---------------------------------------------------------------------------
 
+// Handshake. (client's mandatory first message)
+// On success -> the server replies Ack(ok) followed by a ServerStatus.
+// On failure -> the server closes with WebSocket code 1002 and the reason.
+table Hello {
+    proto_version: uint;
+}
+
 table OpenSourceStream {
-    source: string; // device index or recording path
-    tag_size_m: double = 0.05;
-    exposure_us: int = null; // optional (null == auto)
-    gain: int = null; // optional (null == auto)
+    source: string;            // source identifier (e.g. camera device index)
+    tag_size_m: double = 0.05; // marker's black square edge length, in meters
+    exposure_us: int = null;   // color exposure time, in microseconds; optional (null == auto)
+    gain: int = null;          // color sensor gain; optional (null == auto)
 }
 table CloseSourceStream {}
 table CalibrateRestPose {} // latch the current pose as the rest (bind) reference
@@ -34,17 +44,16 @@ table ClearRestPose {}     // drop the captured rest pose
 table GetServerStatus {}   // request the current ServerStatus (reply a ServerStatus, no Ack)
 
 // ---------------------------------------------------------------------------
-// Server -> Client events
+// Server -> Client messages
 // ---------------------------------------------------------------------------
 
 struct Quat { x: double; y: double; z: double; w: double; }
 
-// One joint's rotation. Both rotations share presence: present when the joint has a
-// usable rotation (tag detected, or held through a brief occlusion), null when lost.
+// One joint's rotation. Both rotations share presence: both set, or both null. (joint lost)
 table JointPose {
     id: JointId;
-    local_rot: Quat;      // relative to the parent joint; optional (null == lost)
-    local_anim_rot: Quat; // relative to the captured rest pose (drives skeleton); optional (null == lost)
+    local_rot: Quat;      // relative to the parent joint
+    local_anim_rot: Quat; // relative to the captured rest pose (drives skeleton)
 }
 
 // One estimation step, broadcast to subscribed clients per new frame.
@@ -55,20 +64,19 @@ table PoseFrame {
     joints: [JointPose];
 }
 
-// Current server state, pushed on connect, on change, or on GetServerStatus request.
+// Current server state, pushed after the handshake, on change, or on GetServerStatus request.
 table ServerStatus {
     is_stream_opened: bool;
     source_name: string;
-    width: int;
-    height: int;
+    width: int;  // color frame width, in pixels
+    height: int; // color frame height, in pixels
     has_rest_pose: bool;
 }
 
-// Sent when the source stream stops on its own:
-// live device was lost (is_error = true) or a recording reached its end (is_error = false).
+// Sent when the source stream stops on its own.
 // The pose stream halts; the client decides whether to close/re-open.
 table SourceStreamEnded {
-    is_error: bool;
+    is_error: bool; // whether the source terminated abnormally
     message: string;
 }
 
@@ -76,12 +84,13 @@ table SourceStreamEnded {
 table Ack { ok: bool; message: string; }
 
 union Payload {
-    OpenSourceStream, CloseSourceStream, CalibrateRestPose, ClearRestPose, GetServerStatus,  // client -> server
-    PoseFrame, ServerStatus, SourceStreamEnded, Ack                                          // server -> client
+    Hello, OpenSourceStream, CloseSourceStream, CalibrateRestPose, ClearRestPose, GetServerStatus, // client -> server
+    PoseFrame, ServerStatus, SourceStreamEnded, Ack                                                // server -> client
 }
 
-// request_id lets a client match a reply to its command: send a non-zero id and
-// the server echoes it on the Ack (or GetServerStatus reply). 
-// NOTE: 0 is reserved for the server's own notifications (pose/status/ended)
+// request id lets a client match a reply to its command: 
+// send a non-zero id and the server echoes it on the Ack. (or GetServerStatus reply) 
+// request id 0 is reserved for the server's own notifications(pose/status/ended),
+// so a command carrying it is a protocol violation and closes the socket.
 table Message { payload: Payload; request_id: uint = 0; }
 root_type Message;

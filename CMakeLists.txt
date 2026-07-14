@@ -58,8 +58,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/gui/plot_buffer.hh"
     "src/gui/log_console.hh"
     "src/gui/log_console.cc"
-    "src/gui/debug_gui_app.hh"
-    "src/gui/debug_gui_app.cc"
+    "src/gui/debugger_app.hh"
+    "src/gui/debugger_app.cc"
 
     # server (websocket + flatbuffers protocol)
     "src/net/exo_pose_pipeline.hh"

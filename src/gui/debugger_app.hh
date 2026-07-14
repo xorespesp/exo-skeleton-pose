@@ -29,14 +29,14 @@ namespace gui
 
     enum class source_kind_t { device, recording };
 
-    // Debug GUI for the pose server: starts/stops the WebSocket listener and drives the pose
+    // Debugger GUI for the pose server: starts/stops the WebSocket listener and drives the pose
     // pipeline (source open/close, rest-pose calibration) while visualizing the annotated frame
     // and per-joint rotations. Owns the server; the listener starts stopped.
-    class debug_gui_app final : public app_base<app_renderer_sdl3>
+    class debugger_app final : public app_base<app_renderer_sdl3>
     {
     public:
-        debug_gui_app(const app::source_options& opt, uint16_t port);
-        ~debug_gui_app();
+        debugger_app(const app::source_options& opt, uint16_t port);
+        ~debugger_app();
 
         int run(); // create window, loop, destroy
 

@@ -1,4 +1,4 @@
-﻿#include "debug_gui_app.hh"
+﻿#include "debugger_app.hh"
 
 #include "net/exo_pose_server.hh"
 #include "net/exo_pose_pipeline.hh"
@@ -114,7 +114,7 @@ namespace gui
 
     } // namespace
 
-    debug_gui_app::debug_gui_app(const app::source_options& opt, uint16_t port)
+    debugger_app::debugger_app(const app::source_options& opt, uint16_t port)
         : _opt{ opt }
         , _server{ std::make_unique<net::exo_pose_server>(port, opt, /*annotate_frames*/ true) }
     {
@@ -133,13 +133,13 @@ namespace gui
         spdlog::default_logger()->sinks().push_back(_log_console.sink());
     }
 
-    debug_gui_app::~debug_gui_app() = default;
+    debugger_app::~debugger_app() = default;
 
-    int debug_gui_app::run()
+    int debugger_app::run()
     {
-        if (!this->create("exo-skeleton-pose", 1440, 900))
+        if (!this->create("exo-skeleton-pose debugger", 1440, 900))
         {
-            spdlog::error("failed to create GUI window");
+            spdlog::error("failed to create debugger window");
             return -1;
         }
 
@@ -148,7 +148,7 @@ namespace gui
         return 0;
     }
 
-    void debug_gui_app::render_ui()
+    void debugger_app::render_ui()
     {
         if (!_texture.has_value()) { _texture.emplace(this->renderer().sdl_renderer()); }
 
@@ -249,7 +249,7 @@ namespace gui
         }
     }
 
-    void debug_gui_app::_open_device(uint32_t index)
+    void debugger_app::_open_device(uint32_t index)
     {
         _server->pipeline().open_device(index, _opt.exposure_us, _opt.gain);
         _last_seq = 0;
@@ -257,7 +257,7 @@ namespace gui
         _quat_bufs.clear();
     }
 
-    void debug_gui_app::_open_recording(const std::string& path)
+    void debugger_app::_open_recording(const std::string& path)
     {
         _server->pipeline().open_recording(path);
         _last_seq = 0;
@@ -265,7 +265,7 @@ namespace gui
         _quat_bufs.clear();
     }
 
-    void debug_gui_app::_do_open_source()
+    void debugger_app::_do_open_source()
     {
         if (_ui.open_kind == source_kind_t::recording)
         {
@@ -283,7 +283,7 @@ namespace gui
         _ui.show_open = false;
     }
 
-    void debug_gui_app::_do_close_source()
+    void debugger_app::_do_close_source()
     {
         _server->pipeline().close_source();
         _last_seq = 0;
@@ -291,7 +291,7 @@ namespace gui
         _quat_bufs.clear();
     }
 
-    void debug_gui_app::_update_pose_frame()
+    void debugger_app::_update_pose_frame()
     {
         // Pull the server's latest annotated frame + detections. The server owns and updates the
         // estimator; nothing to do until a new frame arrives.
@@ -328,7 +328,7 @@ namespace gui
         }
     }
 
-    void debug_gui_app::_render_menu_bar()
+    void debugger_app::_render_menu_bar()
     {
         if (!ImGui::BeginMainMenuBar()) { return; }
         if (ImGui::BeginMenu("File"))
@@ -355,7 +355,7 @@ namespace gui
         ImGui::EndMainMenuBar();
     }
 
-    void debug_gui_app::_render_control_panel()
+    void debugger_app::_render_control_panel()
     {
         net::exo_pose_pipeline& pipe = _server->pipeline();
 
@@ -509,7 +509,7 @@ namespace gui
 
     // Axis-frame sync/reset via the internal ImPlot3DPlot (implot3d has no public links).
     // Called inside each BeginPlot/EndPlot, after SetupAxesLimits.
-    void debug_gui_app::_sync_axis_frame()
+    void debugger_app::_sync_axis_frame()
     {
         ImPlot3DPlot* plot = ImPlot3D::GetCurrentPlot();
         if (!plot) { return; }
@@ -545,7 +545,7 @@ namespace gui
         }
     }
 
-    void debug_gui_app::_render_plot_panel()
+    void debugger_app::_render_plot_panel()
     {
         const int n = static_cast<int>(pose::kNumJoints);
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
@@ -654,7 +654,7 @@ namespace gui
         _reset_plots = false; // one-shot: the ranges were forced this frame
     }
 
-    float debug_gui_app::_log_split_height()
+    float debugger_app::_log_split_height()
     {
         const float avail_y = ImGui::GetContentRegionAvail().y;
         const float max_log = std::max(kLogMinH, avail_y - kSplitHit - kLogMinH);
@@ -662,7 +662,7 @@ namespace gui
         return avail_y - _ui.log_h - kSplitHit;
     }
 
-    void debug_gui_app::_render_log_panel()
+    void debugger_app::_render_log_panel()
     {
         // Starting a new line after the content row already advanced the cursor by one
         // ItemSpacing.y; undo it so the grip sits flush against the row. Without this the
@@ -683,7 +683,7 @@ namespace gui
         ImGui::EndChild();
     }
 
-    void debug_gui_app::_render_open_dialog()
+    void debugger_app::_render_open_dialog()
     {
         if (!_ui.show_open) { return; }
         ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);

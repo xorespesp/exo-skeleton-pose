@@ -1,5 +1,5 @@
 ﻿#include "cli_options.hh"
-#include "gui/debug_gui_app.hh"
+#include "gui/debugger_app.hh"
 #include "net/exo_pose_server.hh"
 
 #include <CLI/CLI.hpp>
@@ -16,7 +16,7 @@ int main(int argc, char** argv)
 
     CLI::App cli{ "exo-skeleton-pose" };
 
-    // Bare invocation launches the debug GUI, which embeds a WebSocket server the operator
+    // Bare invocation launches the debugger GUI, which embeds a WebSocket server the operator
     // starts/stops from the Server menu.
     app::source_options gui_opt;
     uint16_t gui_port{ 9002 };
@@ -39,7 +39,7 @@ int main(int argc, char** argv)
         }
 
         // Debugger GUI
-        return gui::debug_gui_app{ gui_opt, gui_port }.run();
+        return gui::debugger_app{ gui_opt, gui_port }.run();
     }
     catch (const std::exception& e)
     {

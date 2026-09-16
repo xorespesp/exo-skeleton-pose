@@ -100,6 +100,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/gui/open_source_dialog.cc"
     "src/gui/debugger_app.hh"
     "src/gui/debugger_app.cc"
+    "src/gui/camera_test_app.hh"
+    "src/gui/camera_test_app.cc"
 
     # server (websocket + flatbuffers protocol)
     "src/net/exo_pose_pipeline.hh"

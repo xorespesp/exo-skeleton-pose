@@ -1,6 +1,7 @@
 #include "app_config.hh"
 #include "cli_options.hh"
 #include "gui/debugger_app.hh"
+#include "gui/camera_test_app.hh"
 #include "net/exo_pose_server.hh"
 
 #include <CLI/CLI.hpp>
@@ -37,16 +38,37 @@ int main(int argc, char** argv)
     CLI::App* serve = cli.add_subcommand("serve", "Run the headless WebSocket pose server");
     app::add_cli_options(*serve, serve_cli);
 
+    int camera_test_verbosity = 0;
+    CLI::App* camera_test = cli.add_subcommand("camera-test", "Run the camera test GUI");
+    camera_test->add_flag("-v,--verbose", camera_test_verbosity,
+        "Lower the terminal log level: -v for debug, -vv for trace");
+    camera_test->excludes(cli.get_option("--config"));
+    camera_test->excludes(cli.get_option("--port"));
+    camera_test->excludes(cli.get_option("--dump-config"));
+    cli.require_subcommand(0, 1);
+
     CLI11_PARSE(cli, argc, argv);
 
     const app::cli_options_t& parsed = serve->parsed() ? serve_cli : gui_cli;
+    const int verbosity = camera_test->parsed()
+        ? camera_test_verbosity + gui_cli.verbosity : parsed.verbosity;
 
     // The terminal is the only sink standing here; the debugger's console attaches its own later.
-    if (parsed.verbosity > 0)
+    if (verbosity > 0)
     {
-        const auto level = parsed.verbosity >= 2 ? spdlog::level::trace : spdlog::level::debug;
+        const auto level = verbosity >= 2 ? spdlog::level::trace : spdlog::level::debug;
         for (auto& sink : spdlog::default_logger()->sinks()) { sink->set_level(level); }
         spdlog::flush_on(level);
+    }
+
+    if (camera_test->parsed()) {
+        try {
+            return gui::camera_test_app{}.run();
+        }
+        catch (const std::exception& e) {
+            spdlog::error("camera-test: fatal: {}", e.what());
+            return -1;
+        }
     }
 
     app::app_config_t config;

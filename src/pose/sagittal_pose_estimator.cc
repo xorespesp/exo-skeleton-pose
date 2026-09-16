@@ -1,4 +1,4 @@
-﻿#include "sagittal_pose_estimator.hh"
+#include "sagittal_pose_estimator.hh"
 #include "hinge_angle.hh"
 
 #include <algorithm>
@@ -455,6 +455,34 @@ namespace pose
             }
         }
 
+        // ----- The unseen leg reports the tracked leg's angles and rotation -----
+        // For a client that requires a full pair of legs. Both chains are walked from their hips
+        // in lockstep, and a twin pair shares one clinical conversion, so a state carries across
+        // as it stands. The positions stay behind: they mark where a marker was seen, which is how
+        // the viewers and the trace's detected/held/lost bookkeeping read them.
+        // Flag and copy sit together: deleting this block reports measurements only.
+        constexpr bool kMirrorTrackedLegOntoUnseenLeg = true;
+        if constexpr (kMirrorTrackedLegOntoUnseenLeg)
+        {
+            if (_ctx->tracked_side.has_value())
+            {
+                const joint_side_t unseen = (_ctx->tracked_side.value() == joint_side_t::left)
+                    ? joint_side_t::right : joint_side_t::left;
+
+                std::optional<joint_id_t> src = hip_of_side(_ctx->tracked_side);
+                std::optional<joint_id_t> dst = hip_of_side(unseen);
+                while (src.has_value() && dst.has_value())
+                {
+                    joint_state_t st = _ctx->last_frame_joint_states[index_of(src.value())];
+                    st.raw_position.reset();
+                    st.position.reset();
+                    _ctx->last_frame_joint_states[index_of(dst.value())] = st;
+
+                    src = get_child_joint(src.value());
+                    dst = get_child_joint(dst.value());
+                }
+            }
+        }
     }
 
     bool sagittal_pose_estimator::calibrate_rest_pose()

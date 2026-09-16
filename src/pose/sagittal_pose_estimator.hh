@@ -25,7 +25,7 @@ namespace pose
     // points alone: no marker->camera pose, no depth, no camera intrinsics. That makes this the cheap
     // path and immune to depth noise.
     //
-    // Only the marked leg carries a position, an angle or a rotation. 
+    // Only the marked leg carries a position, an angle or a rotation.
     // Which leg that is follows from the joints this frame measured, and with it which side the camera stands on.
     //
     // Angles follow the model laid out at the top of the implementation file: geometry is

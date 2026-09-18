@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "recording_reader.hh"
 
 #include "hw/sensor_frame_source.hh"

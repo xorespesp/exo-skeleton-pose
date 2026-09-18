@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "source_address.hh"
 
 #include "hw/frame_format.hh"

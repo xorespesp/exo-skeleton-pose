@@ -1,4 +1,4 @@
-﻿#include "mcap_record_player.hh"
+#include "mcap_record_player.hh"
 
 #include <spdlog/spdlog.h>
 

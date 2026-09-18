@@ -1,4 +1,4 @@
-﻿#include "camera_test_app.hh"
+#include "camera_test_app.hh"
 
 #include "frame_texture.hh"
 #include "log_console.hh"

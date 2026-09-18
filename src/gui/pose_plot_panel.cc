@@ -1,4 +1,4 @@
-﻿#include "pose_plot_panel.hh"
+#include "pose_plot_panel.hh"
 #include "pose/hinge_angle.hh"
 
 #include <imgui.h>

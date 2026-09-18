@@ -1,4 +1,4 @@
-﻿#include "frameset_synchronizer.hh"
+#include "frameset_synchronizer.hh"
 
 #include <spdlog/spdlog.h>
 

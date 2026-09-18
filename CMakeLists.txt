@@ -1,4 +1,4 @@
-﻿cmake_minimum_required (VERSION 3.28 FATAL_ERROR)
+cmake_minimum_required (VERSION 3.28 FATAL_ERROR)
 
 # Enable Hot Reload for MSVC compilers if supported.
 if (POLICY CMP0141)
@@ -120,9 +120,13 @@ target_include_directories(${TARGET_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 if (WIN32)
-    target_compile_definitions(${TARGET_NAME} PRIVATE 
-        NOMINMAX 
+    target_compile_definitions(${TARGET_NAME} PRIVATE
+        NOMINMAX
         WIN32_LEAN_AND_MEAN)
+endif()
+
+if (MSVC)
+    target_compile_options(${TARGET_NAME} PRIVATE /utf-8)
 endif()
 
 include(FetchCLI11)
@@ -253,6 +257,9 @@ target_include_directories(${K4AMKV2MCAP_NAME} PRIVATE
 if (WIN32)
     target_compile_definitions(${K4AMKV2MCAP_NAME} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+if (MSVC)
+    target_compile_options(${K4AMKV2MCAP_NAME} PRIVATE /utf-8)
+endif()
 target_link_libraries(${K4AMKV2MCAP_NAME} PRIVATE
     Eigen3::Eigen
     spdlog::spdlog_header_only
@@ -300,7 +307,7 @@ if (VZ_SDK_AVAILABLE)
     target_compile_definitions(${VZ_BACKEND_NAME} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     # The SDK headers carry non-UTF-8 bytes in their comments, which floods C4828 on a
     # UTF-8 build. Nothing here reads those comments, so silence it where they are included.
-    target_compile_options(${VZ_BACKEND_NAME} PRIVATE /wd4828)
+    target_compile_options(${VZ_BACKEND_NAME} PRIVATE /utf-8 /wd4828)
     target_link_libraries(${VZ_BACKEND_NAME}
         PUBLIC  ${OpenCV_LIBS} # cv::Mat crosses the interface
                 Eigen3::Eigen  # so does calibration_t
@@ -344,6 +351,7 @@ if (VZ_SDK_AVAILABLE)
     )
     target_include_directories(${VZCAM_TEST_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_definitions(${VZCAM_TEST_NAME} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(${VZCAM_TEST_NAME} PRIVATE /utf-8)
     target_link_libraries(${VZCAM_TEST_NAME} PRIVATE
         ${VZ_BACKEND_NAME}
         Eigen3::Eigen

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "joint_measurement.hh"
 #include "joints_def.hh"
 

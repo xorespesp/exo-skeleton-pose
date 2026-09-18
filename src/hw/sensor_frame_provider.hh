@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "calibration.hh"
 #include "frameset_synchronizer.hh"
 #include "frameset_observer.hh"

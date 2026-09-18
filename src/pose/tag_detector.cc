@@ -1,4 +1,4 @@
-﻿#include "tag_detector.hh"
+#include "tag_detector.hh"
 
 #include <apriltag.h>
 #include <apriltag_pose.h>

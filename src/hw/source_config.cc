@@ -1,4 +1,4 @@
-﻿#include "source_config.hh"
+#include "source_config.hh"
 
 #include <format>
 #include <variant>

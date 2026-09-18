@@ -1,4 +1,4 @@
-﻿// Maps the protocol's joints onto the Xbot rig and applies incoming rotations.
+// Maps the protocol's joints onto the Xbot rig and applies incoming rotations.
 //
 // Two drive sources, both ending in the same application:
 //

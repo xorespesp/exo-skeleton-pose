@@ -1,4 +1,4 @@
-﻿#include "vz_frame_source.hh"
+#include "vz_frame_source.hh"
 
 #include <spdlog/spdlog.h>
 

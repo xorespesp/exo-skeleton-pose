@@ -1,4 +1,4 @@
-﻿// three.js scene setup and character loading.
+// three.js scene setup and character loading.
 // The character is the rigged Xbot glTF.
 // We collect its bones by name so the pose protocol can drive them later.
 

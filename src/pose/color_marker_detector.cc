@@ -1,4 +1,4 @@
-﻿#include "color_marker_detector.hh"
+#include "color_marker_detector.hh"
 
 #include <opencv2/imgproc.hpp>
 

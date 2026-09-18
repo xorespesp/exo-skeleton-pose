@@ -1,4 +1,4 @@
-﻿#include "marker_tracker.hh"
+#include "marker_tracker.hh"
 
 #include <opencv2/imgproc.hpp>
 

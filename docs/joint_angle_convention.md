@@ -1,4 +1,4 @@
-﻿# 하지 관절 각도 측정 컨벤션 (Lower Limb Angle Conventions)
+# 하지 관절 각도 측정 컨벤션 (Lower Limb Angle Conventions)
 
 본 문서는 이 프로젝트의 프로토콜이 실어 나르는 하지(Hip, Knee, Ankle) 시상면(Sagittal Plane) 관절 각도의 컨벤션을 정의한다.  
 세 각도 모두 생체역학·보행 분석에서 쓰이는 표준 컨벤션을 그대로 따르며, 본 문서는 그 표준이 어느 필드에 어떤 부호로 실리는지를 확정한다.

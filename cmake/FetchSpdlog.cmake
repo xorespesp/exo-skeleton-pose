@@ -1,4 +1,4 @@
-﻿if (NOT TARGET spdlog::spdlog)
+if (NOT TARGET spdlog::spdlog)
     message(STATUS "Fetching spdlog...")
 
     FetchContent_Declare(spdlog

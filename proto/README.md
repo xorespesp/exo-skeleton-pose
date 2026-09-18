@@ -1,4 +1,4 @@
-﻿# Pose protocol
+# Pose protocol
 
 Network protocol between the `exo-skeleton-pose` server (`serve` subcommand) and its clients. 
 `exo_pose_proto.fbs` is the single source of truth; all bindings are generated from it with [FlatBuffers](https://flatbuffers.dev/) `flatc`.

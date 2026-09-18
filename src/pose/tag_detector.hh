@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "joint_measurement.hh"
 
 #include "hw/calibration.hh" // hw::intrinsic_t

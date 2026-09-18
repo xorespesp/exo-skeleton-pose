@@ -1,4 +1,4 @@
-﻿#include "app_renderer_sdl3.hh"
+#include "app_renderer_sdl3.hh"
 
 #include <spdlog/spdlog.h>
 

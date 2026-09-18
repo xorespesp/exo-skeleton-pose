@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "calibration.hh"
 #include "frame_format.hh"
 #include "roi.hh"

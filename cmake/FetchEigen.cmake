@@ -1,4 +1,4 @@
-﻿if (NOT TARGET Eigen3::Eigen)
+if (NOT TARGET Eigen3::Eigen)
     message(STATUS "Fetching Eigen...")
 
     FetchContent_Declare(

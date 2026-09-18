@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "joints_def.hh"
 
 #include <Eigen/Geometry>

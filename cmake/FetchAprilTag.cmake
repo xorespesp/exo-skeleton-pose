@@ -1,4 +1,4 @@
-﻿if (NOT TARGET apriltag::apriltag)
+if (NOT TARGET apriltag::apriltag)
     message(STATUS "Fetching AprilTag...")
 
     FetchContent_Declare(

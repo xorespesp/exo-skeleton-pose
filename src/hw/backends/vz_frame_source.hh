@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "hw/backends/vz_device.hh"
 #include "hw/clock_anchor.hh"
 #include "hw/sensor_frame_source.hh"

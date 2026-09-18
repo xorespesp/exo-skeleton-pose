@@ -1,4 +1,4 @@
-﻿#include "frontal_pose_estimator.hh"
+#include "frontal_pose_estimator.hh"
 #include "hinge_angle.hh"
 #include "leg_ik.hh"
 

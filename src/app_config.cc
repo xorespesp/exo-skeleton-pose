@@ -1,4 +1,4 @@
-﻿#include "app_config.hh"
+#include "app_config.hh"
 
 #include "utils/serializable.hh"
 

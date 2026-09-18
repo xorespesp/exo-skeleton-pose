@@ -1,4 +1,4 @@
-﻿// Ported from: https://github.com/casiez/OneEuroFilter
+// Ported from: https://github.com/casiez/OneEuroFilter
 #pragma once
 
 #include "utils/serializable.hh"

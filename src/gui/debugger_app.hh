@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "app_base.hh"
 #include "app_renderer_sdl3.hh"
 #include "frame_texture.hh"

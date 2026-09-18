@@ -1,4 +1,4 @@
-﻿if (NOT TARGET CLI11::CLI11)
+if (NOT TARGET CLI11::CLI11)
     message(STATUS "Fetching CLI11...")
 
     FetchContent_Declare(

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "plot_buffer.hh"
 
 #include "pose/joints_def.hh"

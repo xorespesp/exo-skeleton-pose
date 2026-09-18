@@ -1,4 +1,4 @@
-﻿#include "debugger_app.hh"
+#include "debugger_app.hh"
 
 #include "net/exo_pose_server.hh"
 #include "net/exo_pose_pipeline.hh"

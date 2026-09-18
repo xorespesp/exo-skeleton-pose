@@ -1,4 +1,4 @@
-﻿include_guard(GLOBAL)
+include_guard(GLOBAL)
 
 # uWebSockets ships no CMake and is header-only C++, but its C dependency uSockets
 # must be compiled. On Windows the only working event-loop backend is libuv, so we

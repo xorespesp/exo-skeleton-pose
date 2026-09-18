@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "color_marker_detector.hh"
 #include "joint_measurement.hh"
 #include "tag_detector.hh"

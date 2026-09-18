@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "app_config.hh"
 
 #include <cstdint>

@@ -1,4 +1,4 @@
-﻿#include "sensor_frame_provider.hh"
+#include "sensor_frame_provider.hh"
 
 #include "backends/k4a_frame_source.hh"
 #ifdef EXO_HAS_VZ_BACKEND

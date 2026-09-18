@@ -1,4 +1,4 @@
-﻿include_guard(GLOBAL)
+include_guard(GLOBAL)
 
 if (NOT WIN32)
     message(FATAL_ERROR "FetchOrbbecK4A.cmake module currently supports Windows platform only.")

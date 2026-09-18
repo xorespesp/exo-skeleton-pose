@@ -1,4 +1,4 @@
-﻿#include "open_source_dialog.hh"
+#include "open_source_dialog.hh"
 
 #include <imgui.h>
 #include <spdlog/spdlog.h>

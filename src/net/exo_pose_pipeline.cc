@@ -1,4 +1,4 @@
-﻿#include "exo_pose_pipeline.hh"
+#include "exo_pose_pipeline.hh"
 
 #include "hw/frameset_observer.hh"
 #include "io/calibration_io.hh"

@@ -1,4 +1,4 @@
-﻿#include "vz_device.hh"
+#include "vz_device.hh"
 
 #include <GalaxyIncludes.h>
 

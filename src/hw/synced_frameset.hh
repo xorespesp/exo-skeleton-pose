@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "sensor_frameset.hh"
 #include "timestamp.hh"
 

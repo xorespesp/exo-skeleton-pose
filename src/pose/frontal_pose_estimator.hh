@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "pose_estimator_base.hh"
 #include "joints_def.hh"
 #include "joint_measurement.hh"

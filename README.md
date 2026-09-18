@@ -1,1 +1,1 @@
-﻿# exo-skeleton-pose
+# exo-skeleton-pose

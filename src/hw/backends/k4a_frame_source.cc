@@ -1,4 +1,4 @@
-﻿#include "k4a_frame_source.hh"
+#include "k4a_frame_source.hh"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>

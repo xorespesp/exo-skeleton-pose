@@ -1,13 +1,14 @@
 #pragma once
 #include "recording_message.hh"
-#include "recording_writer.hh" // stream_id_t
+#include "recording_writer.hh"
 
 #include "hw/calibration.hh"
-#include "hw/source_backend.hh"
+#include "hw/sensor_backend.hh"
 
 #include <opencv2/core.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -21,18 +22,10 @@ namespace io
 {
     struct recorded_camera_stream_t
     {
-        std::string stream_name; // e.g, "color0"
-        stream_id_t stream_id{}; // identifies this stream to seek_timestamp()/fetch_next_frame()
+        std::size_t stream_idx{};
         image_codec_t codec{};
-        hw::frame_format_t color_format{}; // the layout fetch_next_frame() hands back
-        hw::calibration_t calibration{};
 
-        // What produced the frames, as the recording reports it. Empty where the recording
-        // says nothing, says something this build cannot read, or the camera chose the value.
-        std::optional<hw::source_backend_t> source_backend;
-        std::string source_name;
-        std::optional<double> exposure_us;
-        std::optional<double> gain;
+        camera_stream_info_t stream_info{};
     };
 
     // Reads back what recording_writer produced. 
@@ -47,11 +40,14 @@ namespace io
         recording_reader(const recording_reader&) = delete;
         recording_reader& operator=(const recording_reader&) = delete;
 
-        // Fails if the file is not a recording of ours, or has no camera stream.
+        // Fails if the file is not a recording of ours, has no camera stream, carries a stream this
+        // build cannot decode or whose camera backend it does not know, or numbers its streams with
+        // a gap.
         [[nodiscard]] bool open(const std::filesystem::path& path) noexcept;
         bool is_opened() const noexcept { return _opened; }
         void close() noexcept;
 
+        // In stream index order: element i is stream i.
         std::span<const recorded_camera_stream_t> camera_streams() const noexcept { return _streams; }
 
         hw::timestamp_t first_timestamp() const noexcept { return _first_timestamp; }
@@ -63,20 +59,20 @@ namespace io
             cv::Mat image; // in the stream's `color_format`
         };
 
-        // Each stream advances and seeks on its own cursor, so reading or seeking one does
-        // not disturb the others. `stream_id` is a handle from camera_streams().
+        // Each stream advances and seeks on its own cursor, 
+        // so reading or seeking one does not disturb the others.
 
         // Restarts the stream's iteration at the first frame at or after `timestamp`.
-        void seek_timestamp(stream_id_t stream_id, hw::timestamp_t timestamp) noexcept;
+        void seek_timestamp(std::size_t stream_idx, hw::timestamp_t timestamp) noexcept;
 
         // nullopt at the end of the stream. Only this stream's frames are decoded.
-        [[nodiscard]] std::optional<frame_t> fetch_next_frame(stream_id_t stream_id) noexcept;
+        [[nodiscard]] std::optional<frame_t> fetch_next_frame(std::size_t stream_idx) noexcept;
 
     private:
         // Builds a fresh cursor for the stream, positioned at `from`. 
         // MCAP's iterator is forward-only and its start time is fixed when the view is created, 
         // so seeking is rebuilding the view; open and seek_timestamp both go through here.
-        void _restart_cursor(stream_id_t stream_id, hw::timestamp_t from);
+        void _restart_cursor(std::size_t stream_idx, hw::timestamp_t from);
 
     private:
         // A message view paired with its iterator: the iterator points into the view, so the

@@ -1,4 +1,4 @@
-#include "mcap_record_player.hh"
+﻿#include "mcap_record_player.hh"
 
 #include <spdlog/spdlog.h>
 
@@ -16,10 +16,10 @@ namespace io
             std::weak_ptr<mcap_record_player> player, 
             const recorded_camera_stream_t& stream)
             : _player{ std::move(player) }
-            , _stream_id{ stream.stream_id }
-            , _stream_name{ stream.stream_name }
-            , _calibration{ stream.calibration }
-            , _frame_format{ stream.color_format }
+            , _stream_idx{ stream.stream_idx }
+            , _descriptor{ .sensor_backend = stream.stream_info.sensor_backend, .device_serial = stream.stream_info.device_serial }
+            , _calibration{ stream.stream_info.calibration }
+            , _frame_format{ stream.stream_info.color_format }
         { }
 
         bool is_valid() const override
@@ -33,15 +33,7 @@ namespace io
 
         const hw::calibration_t& get_calibration() const override { return _calibration; }
         hw::frame_format_t get_frame_format() const override { return _frame_format; }
-
-        hw::stream_descriptor_t get_stream_descriptor() const override
-        {
-            return hw::stream_descriptor_t{
-                .stream_name = _stream_name,
-                .device_serial = {}, // 파일에는 가리킬 장치가 기록되지 않음
-                .source_backend = hw::source_backend_t::recording,
-            };
-        }
+        hw::stream_descriptor_t get_stream_descriptor() const override { return _descriptor; }
 
         // 녹화는 전체 프레임을 담고 있으므로 소프트웨어 크롭이다.
         std::optional<hw::roi_t> try_set_roi(const hw::roi_t& roi) override
@@ -68,7 +60,7 @@ namespace io
             std::scoped_lock lk{ player->_mtx };
             if (!player->_opened) { return std::nullopt; }
 
-            std::optional<recording_reader::frame_t> frame = player->_reader.fetch_next_frame(_stream_id);
+            std::optional<recording_reader::frame_t> frame = player->_reader.fetch_next_frame(_stream_idx);
             if (!frame.has_value()) { return std::nullopt; } // EOF
 
             cv::Mat image = std::move(frame->image);
@@ -85,8 +77,8 @@ namespace io
 
     private:
         std::weak_ptr<mcap_record_player> _player;
-        const stream_id_t _stream_id;
-        const std::string _stream_name;
+        const std::size_t _stream_idx;
+        const hw::stream_descriptor_t _descriptor;
         const hw::calibration_t _calibration; // 전체 프레임 기준
         const hw::frame_format_t _frame_format;
         std::optional<hw::roi_t> _roi; // nullopt: 전체 프레임
@@ -125,13 +117,13 @@ namespace io
             , _recording_streams.size()
             , std::chrono::duration_cast<std::chrono::milliseconds>(_last_timestamp - _first_timestamp).count()
         );
-        std::size_t stream_idx = 0;
         for (const recorded_camera_stream_t& stream : _reader.camera_streams())
         {
-            spdlog::info("recording stream {} '{}': {}"
-                , stream_idx++
-                , stream.stream_name
-                , hw::frame_format_to_str(stream.color_format)
+            spdlog::info("recording stream {}: {}, {} '{}'"
+                , stream.stream_idx
+                , hw::frame_format_to_str(stream.stream_info.color_format)
+                , hw::sensor_backend_to_str(stream.stream_info.sensor_backend)
+                , stream.stream_info.device_serial
             );
         }
         return true;
@@ -173,7 +165,7 @@ namespace io
         std::scoped_lock lk{ _mtx };
         if (!_opened) { return; }
         for (const recorded_camera_stream_t& stream : _reader.camera_streams()) {
-            _reader.seek_timestamp(stream.stream_id, timestamp);
+            _reader.seek_timestamp(stream.stream_idx, timestamp);
         }
     }
 

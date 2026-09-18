@@ -1,4 +1,4 @@
-#include "k4a_frame_source.hh"
+﻿#include "k4a_frame_source.hh"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -148,33 +148,6 @@ namespace hw
         this->close();
     }
 
-    std::vector<device_info_t> k4a_device_capturer::enumerate()
-    {
-        std::vector<device_info_t> found;
-        const uint32_t count = ::k4a_device_get_installed_count();
-        for (uint32_t device_index = 0; device_index < count; ++device_index)
-        {
-            device_info_t info{
-                .source_backend = source_backend_t::k4a,
-                .device_index = device_index,
-            };
-
-            // 시리얼은 열어야 읽힌다. 이미 열려 있는 장치는 열리지 않으므로 인덱스만 남는다.
-            k4a_device_t device = nullptr;
-            if (K4A_SUCCEEDED(::k4a_device_open(device_index, &device)))
-            {
-                info.device_serial = read_serialnum(device);
-                ::k4a_device_close(device);
-            }
-
-            info.display_name = info.device_serial.empty()
-                ? std::format("k4a device #{}", device_index)
-                : std::format("k4a device #{} (S/N {})", device_index, info.device_serial);
-            found.push_back(std::move(info));
-        }
-        return found;
-    }
-
     bool k4a_device_capturer::open(const k4a_device_config_t& config) noexcept try
     {
         std::scoped_lock lk{ _mtx };
@@ -282,9 +255,8 @@ namespace hw
     {
         std::scoped_lock lk{ _mtx };
         return stream_descriptor_t{
-            .stream_name = default_stream_name(0),
+            .sensor_backend = sensor_backend_t::k4a,
             .device_serial = _serialnum,
-            .source_backend = source_backend_t::k4a,
         };
     }
 

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "app_config.hh"
 #include "source_address.hh"
 
@@ -7,7 +7,7 @@
 #include "hw/roi.hh"
 #include "hw/frameset_observer.hh"
 #include "hw/sensor_frame_provider.hh"
-#include "hw/source_backend.hh"
+#include "hw/sensor_backend.hh"
 #include "io/frame_recorder.hh"
 #include "pose/frontal_pose_estimator.hh"
 #include "pose/marker_tracker.hh"
@@ -129,7 +129,9 @@ namespace net
         bool try_get_annotated_frame(cv::Mat& out_img, cv::Mat& out_source, uint64_t& last_seq);
 
         // --- source metadata ----------------------------------------------------------
-        hw::source_backend_t source_backend() const;
+        // The sensor whose frames the pose stream reads, which on playback is the sensor the
+        // recording was made with. Throws std::logic_error without an open source.
+        hw::sensor_backend_t sensor_backend() const;
         std::string source_name() const;
         Eigen::Vector2i source_resolution() const;
         Eigen::Vector2i source_full_resolution() const;

@@ -41,11 +41,11 @@ namespace gui
         }
 
         std::string default_recording_name(
-            const hw::source_backend_t backend,
+            const hw::sensor_backend_t backend,
             const pose::view_plane_t view_plane)
         {
             return std::format("capture-{}-{}-{}.mcap"
-                , hw::source_backend_to_str(backend)
+                , hw::sensor_backend_to_str(backend)
                 , pose::view_plane_name(view_plane)
                 , local_stamp()
             );
@@ -457,7 +457,7 @@ namespace gui
             {
                 if (_ui.record_dlg_path.empty()) {
                     _ui.record_dlg_path = (
-                        app::project_dir("recordings") / default_recording_name(pipe.source_backend(), pipe.view_plane())
+                        app::project_dir("recordings") / default_recording_name(pipe.sensor_backend(), pipe.view_plane())
                     ).string();
                 }
                 _ui.record_dlg_show = true;

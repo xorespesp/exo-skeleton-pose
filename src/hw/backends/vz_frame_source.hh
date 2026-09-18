@@ -22,8 +22,6 @@ namespace hw
         vz_frame_source() = default;
         ~vz_frame_source() override;
 
-        [[nodiscard]] static std::vector<device_info_t> enumerate();
-
         // Configures the camera and leaves it idle; acquisition begins with the first fetch.
         [[nodiscard]] bool open(const vz_device_config_t& config) noexcept;
 

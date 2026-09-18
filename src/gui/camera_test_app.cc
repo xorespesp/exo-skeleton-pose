@@ -2,15 +2,22 @@
 
 #include "frame_texture.hh"
 #include "log_console.hh"
+#include "app_config.hh"
 #include "hw/sensor_frame_provider.hh"
+#include "io/frame_recorder.hh"
 #include "pose/marker_tracker.hh"
 #include "pose/tag_detector.hh"
+#ifdef EXO_HAS_VZ_BACKEND
+#include "hw/backends/vz_device.hh"
+#endif
 
 #include <imfilebrowser.h>
 #include <implot.h>
+#include <k4a/k4a.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -21,11 +28,16 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 // 동기화 검증용 임시 하네스. 핵심 모듈(provider, synchronizer, tracker_thread)을 그대로 쓰기만 하고,
-// 여기에만 있는 로직은 UI 뿐이다. 검증이 끝나면 통째로 걷어 낸다.
+// 여기에만 있는 로직은 UI 와 장치 열거뿐이다. 검증이 끝나면 통째로 걷어 낸다.
+//
+// 장치 열거는 카메라 SDK 에 직접 닿는다(K4A C API, `vz::device`). 소비자가 이 파일뿐이라 핵심에 seam 을
+// 두지 않고, 파일이 지워질 때 함께 사라지게 한 것이다.
 namespace gui
 {
     namespace
@@ -33,10 +45,99 @@ namespace gui
         constexpr std::size_t kMaxCameraRows = 4;
         constexpr std::size_t kSkewHistoryLength = 256;
         constexpr double kTagSizeM = 0.05; // 검출 수와 시간만 보므로 포즈 스케일은 아무 값이어도 된다
+        constexpr uint32_t kVzEnumerateTimeoutMs = 500; // 인터페이스 스캔 한도. 넘기면 그 위의 카메라는 없는 것으로 친다
+
+        // 꽂혀 있는 카메라 하나. 기종은 열거한 목록이 말한다.
+        struct device_info_t
+        {
+            uint32_t device_index{ 0 };
+            std::string device_serial; // SDK 가 주지 않으면 비어 있다
+            std::string display_name;
+        };
+
+        // SDK 가 붙이는 널 종단을 떼고 돌려준다. 읽지 못하면 비어 있다.
+        std::string read_k4a_serialnum(k4a_device_t device)
+        {
+            std::string serialnum;
+            size_t needed = 0;
+            if (::k4a_device_get_serialnum(device, nullptr, &needed) == K4A_BUFFER_RESULT_TOO_SMALL && needed > 1)
+            {
+                serialnum.resize(needed);
+                if (::k4a_device_get_serialnum(device, &serialnum[0], &needed) == K4A_BUFFER_RESULT_SUCCEEDED
+                    && !serialnum.empty() && serialnum.back() == '\0')
+                {
+                    serialnum.pop_back();
+                }
+                else
+                {
+                    serialnum.clear();
+                }
+            }
+            return serialnum;
+        }
+
+        // 시리얼은 열어야 읽힌다. 이미 열려 있는 장치는 열리지 않으므로 인덱스만 남는다.
+        std::vector<device_info_t> enumerate_k4a_devices()
+        {
+            std::vector<device_info_t> found;
+            const uint32_t count = ::k4a_device_get_installed_count();
+            for (uint32_t device_index = 0; device_index < count; ++device_index)
+            {
+                device_info_t info{ .device_index = device_index };
+                k4a_device_t device = nullptr;
+                if (K4A_SUCCEEDED(::k4a_device_open(device_index, &device)))
+                {
+                    info.device_serial = read_k4a_serialnum(device);
+                    ::k4a_device_close(device);
+                }
+                info.display_name = info.device_serial.empty()
+                    ? std::format("k4a device #{}", device_index)
+                    : std::format("k4a device #{} (S/N {})", device_index, info.device_serial);
+                found.push_back(std::move(info));
+            }
+            return found;
+        }
+
+        std::vector<device_info_t> enumerate_vz_devices()
+        {
+            std::vector<device_info_t> found;
+#ifdef EXO_HAS_VZ_BACKEND
+            std::string err_msg;
+            const std::vector<vz::device_info_t> devices = vz::device::enumerate(kVzEnumerateTimeoutMs, &err_msg);
+            if (!err_msg.empty()) { spdlog::warn("camera-test: vz enumeration: {}", err_msg); }
+            for (uint32_t device_index = 0; device_index < devices.size(); ++device_index)
+            {
+                found.push_back(device_info_t{
+                    .device_index = device_index,
+                    .device_serial = devices[device_index].serial,
+                    .display_name = std::format("vz device #{} (S/N {})", device_index, devices[device_index].serial),
+                });
+            }
+#endif
+            return found;
+        }
+
+        // 코덱 콤보 항목. `io::kImageCodecs` 와 같은 순서.
+        constexpr std::array<const char*, io::kImageCodecs.size()> kCodecLabels{
+            "JPEG (compressed)",
+            "Raw (lossless)",
+        };
 
         float to_ms(const std::chrono::nanoseconds ns)
         {
             return std::chrono::duration<float, std::milli>{ ns }.count();
+        }
+
+        // 녹화 파일 이름에 넣을 지역 시각.
+        std::string local_stamp()
+        {
+            const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+            try {
+                return std::format("{:%y%m%d%H%M%S}", std::chrono::zoned_time{ std::chrono::current_zone(), now });
+            }
+            catch (const std::exception&) {
+                return std::format("{:%y%m%d%H%M%S}", now); // 시간대 DB 가 없으면 UTC
+            }
         }
 
         // 워커가 슬롯별 스냅샷 하나와 최근 Δt 이력을 발행하고, GUI 가 텍스처 작업을 전부 소유한다.
@@ -160,12 +261,17 @@ namespace gui
         float tag_quad_decimate{ 2.0f };
         std::vector<std::shared_ptr<pose::tracker_thread>> tracker_threads;
 
+        // 녹화. 열린 스트림 전부를 파일 하나에 담는다.
+        std::shared_ptr<io::frame_recorder> recorder; // 녹화 중에만 non-null
+        int record_codec{ 0 }; // kCodecLabels 인덱스
+        int record_jpeg_quality{ 90 };
+
         ImGui::FileBrowser browser;
         std::filesystem::path recording;
         int source_mode{ 0 }; // 0 = 카메라, 1 = MCAP 녹화
         std::vector<camera_row_t> camera_rows{ camera_row_t{} };
-        std::vector<hw::device_info_t> k4a_devices;
-        std::vector<hw::device_info_t> vz_devices;
+        std::vector<device_info_t> k4a_devices;
+        std::vector<device_info_t> vz_devices;
         bool devices_enumerated{ false };
         int reference_stream_idx{ 0 };
         float max_pair_skew_ms{ 0.0f }; // 0: 기준 스트림 간격의 절반으로 자동
@@ -210,8 +316,80 @@ namespace gui
             apriltag_test = true;
         }
 
+        void stop_recording()
+        {
+            if (!recorder) { return; }
+
+            if (provider) { provider->remove_observer(recorder); }
+            recorder->stop();
+
+            const io::recording_stats_t stats = recorder->stats();
+            spdlog::info("camera-test: recording stopped ({} frames over {:.1f} s, {} dropped, {:.1f} MB)"
+                , stats.frames_written
+                , std::chrono::duration<double>{ stats.duration }.count()
+                , stats.frames_dropped
+                , static_cast<double>(stats.file_bytes) / (1024.0 * 1024.0)
+            );
+            recorder.reset();
+        }
+
+        void start_recording()
+        {
+            error.clear();
+            if (!provider || recorder) { return; }
+            if (playback) {
+                error = "A playback source is not recorded.";
+                return;
+            }
+
+            // 출처는 descriptor 가 말한다. 노출·게인은 그 스트림을 연 카메라 행의 수동값이고, auto 로 둔 것은
+            // 비워 둔다.
+            std::vector<io::camera_stream_info_t> stream_infos;
+            for (std::size_t stream_idx = 0; stream_idx < provider->stream_count(); ++stream_idx)
+            {
+                const hw::stream_descriptor_t descriptor = provider->get_stream_descriptor(stream_idx);
+                const camera_row_t* row = stream_idx < camera_rows.size() ? &camera_rows[stream_idx] : nullptr;
+                stream_infos.push_back(io::camera_stream_info_t{
+                    .calibration = provider->get_calibration(stream_idx),
+                    .color_format = provider->get_frame_format(stream_idx),
+                    .sensor_backend = descriptor.sensor_backend,
+                    .device_serial = descriptor.device_serial,
+                    .exposure_us = (row && row->manual_exposure) ? std::optional<double>{ row->exposure_us } : std::nullopt,
+                    .gain = (row && row->manual_gain) ? std::optional<double>{ row->gain } : std::nullopt,
+                });
+            }
+
+            const std::size_t codec_idx = std::clamp<std::size_t>(
+                static_cast<std::size_t>(record_codec), 0, io::kImageCodecs.size() - 1);
+            const io::recording_options_t options{
+                .codec = io::kImageCodecs[codec_idx].codec,
+                .encode = { .jpeg_quality = record_jpeg_quality },
+            };
+
+            std::error_code ec;
+            const std::filesystem::path dir = app::project_dir("recordings");
+            std::filesystem::create_directories(dir, ec); // 실패는 아래 start 가 알린다
+            const std::filesystem::path path = dir / std::format("camera-test-{}.mcap", local_stamp());
+            if (std::filesystem::exists(path, ec)) {
+                // 이름이 초 단위라, 방금 닫은 파일을 같은 초 안에 다시 열면 덮어쓰게 된다.
+                error = "A recording of this second already exists; try again.";
+                return;
+            }
+
+            // 관찰자로 붙이기 전에 시작해 두어, 처음 보는 frameset 부터 쓸 수 있게 한다.
+            auto next_recorder = std::make_shared<io::frame_recorder>(options);
+            if (!next_recorder->start(path, stream_infos)) {
+                error = "Could not start the recording. See the log for details.";
+                return;
+            }
+            provider->add_observer(next_recorder);
+            recorder = std::move(next_recorder);
+            spdlog::info("camera-test: recording {} stream(s) to '{}'", stream_infos.size(), path.string());
+        }
+
         void close()
         {
+            stop_recording();
             stop_apriltag_test();
             // 캡처 워커를 먼저 join 하고 그 관찰자와 GUI 로그 싱크를 놓는다.
             provider.reset();
@@ -225,8 +403,8 @@ namespace gui
 
         void refresh_devices()
         {
-            k4a_devices = hw::enumerate_devices(hw::source_backend_t::k4a);
-            vz_devices = hw::enumerate_devices(hw::source_backend_t::vz);
+            k4a_devices = enumerate_k4a_devices();
+            vz_devices = enumerate_vz_devices();
             devices_enumerated = true;
             spdlog::info("camera-test: found {} K4A, {} VZ", k4a_devices.size(), vz_devices.size());
 
@@ -237,13 +415,13 @@ namespace gui
             for (camera_row_t& row : camera_rows)
             {
                 std::size_t& next = row.backend_kind == 1 ? next_vz : next_k4a;
-                const std::vector<hw::device_info_t>& devices = devices_for(row);
+                const std::vector<device_info_t>& devices = devices_for(row);
                 if (row.device_choice < 0 && next < devices.size()) { row.device_choice = static_cast<int>(next); }
                 ++next;
             }
         }
 
-        const std::vector<hw::device_info_t>& devices_for(const camera_row_t& row) const
+        const std::vector<device_info_t>& devices_for(const camera_row_t& row) const
         {
             return row.backend_kind == 1 ? vz_devices : k4a_devices;
         }
@@ -253,11 +431,11 @@ namespace gui
             const auto format = row.format_index == 0 ? hw::frame_format_t::bgr8 : hw::frame_format_t::gray8;
 
             // 열거 목록에서 고른 장치에 시리얼이 있으면 시리얼로 고정하고, 그 외에는 인덱스로 연다.
-            const std::vector<hw::device_info_t>& devices = devices_for(row);
+            const std::vector<device_info_t>& devices = devices_for(row);
             hw::device_selector_t device_selector = hw::device_index_t{ static_cast<uint32_t>(std::max(0, row.device_index)) };
             if (row.device_choice >= 0 && row.device_choice < static_cast<int>(devices.size()))
             {
-                const hw::device_info_t& chosen = devices[row.device_choice];
+                const device_info_t& chosen = devices[row.device_choice];
                 if (chosen.device_serial.empty()) { device_selector = hw::device_index_t{ chosen.device_index }; }
                 else { device_selector = hw::device_serial_t{ chosen.device_serial }; }
             }
@@ -376,7 +554,7 @@ namespace gui
             {
                 if (ImGui::Combo("Backend", &row.backend_kind, "K4A\0VZ\0")) { row.device_choice = -1; }
 
-                const std::vector<hw::device_info_t>& devices = devices_for(row);
+                const std::vector<device_info_t>& devices = devices_for(row);
                 const bool chosen = row.device_choice >= 0 && row.device_choice < static_cast<int>(devices.size());
                 const std::string preview = chosen ? devices[row.device_choice].display_name : std::string{ "(by index)" };
                 if (ImGui::BeginCombo("Device", preview.c_str()))
@@ -431,7 +609,8 @@ namespace gui
             const auto format = hw::frame_format_to_str(provider->get_frame_format(stream_idx));
 
             ImGui::Separator();
-            ImGui::Text("Stream %zu '%s'", stream_idx, descriptor.stream_name.c_str());
+            const std::string_view backend = hw::sensor_backend_to_str(descriptor.sensor_backend);
+            ImGui::Text("Stream %zu | %.*s", stream_idx, static_cast<int>(backend.size()), backend.data());
             if (!descriptor.device_serial.empty()) { ImGui::Text("S/N %s", descriptor.device_serial.c_str()); }
             ImGui::Text("%d x %d of %d x %d | %.*s", resolution.x(), resolution.y(), full.x(), full.y(),
                 static_cast<int>(format.size()), format.data());
@@ -451,15 +630,20 @@ namespace gui
                 : "whole frame");
             if (stream_idx < roi_editors.size())
             {
+                // 녹화 파일은 스트림마다 프레임 크기를 한 번만 선언하므로 녹화 중에는 ROI 를 못 움직인다.
+                const bool recording = recorder != nullptr;
+                ImGui::BeginDisabled(recording);
                 ImGui::InputInt4("x y w h", roi_editors[stream_idx].fields);
                 const int* fields = roi_editors[stream_idx].fields;
-                if (ImGui::Button("Apply ROI")) {
+                if (ImGui::Button("Apply ROI") && !recording) {
                     provider->set_roi(stream_idx, hw::roi_t{ fields[0], fields[1], fields[2], fields[3] });
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Whole frame")) {
+                if (ImGui::Button("Whole frame") && !recording) {
                     provider->set_roi(stream_idx, std::nullopt);
                 }
+                ImGui::EndDisabled();
+                if (recording) { ImGui::TextUnformatted("ROI is locked while recording"); }
             }
 
             ImGui::PopID();
@@ -576,8 +760,50 @@ namespace gui
                 else { stop_apriltag_test(); }
             }
 
+            draw_recording_controls();
+
             const std::size_t stream_count = provider->stream_count();
             for (std::size_t stream_idx = 0; stream_idx < stream_count; ++stream_idx) { draw_stream_panel(stream_idx); }
+        }
+
+        void draw_recording_controls()
+        {
+            // 스트림이 끝나거나 기하가 바뀌면 녹화기가 스스로 파일을 닫는다. 그것을 보고 관찰자를 뗀다.
+            if (recorder && !recorder->is_started()) { stop_recording(); }
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Recording");
+
+            if (!recorder)
+            {
+                ImGui::Combo("Codec", &record_codec, kCodecLabels.data(), static_cast<int>(kCodecLabels.size()));
+                const bool is_jpeg = io::kImageCodecs[static_cast<std::size_t>(record_codec)].codec == io::image_codec_t::jpeg;
+                ImGui::BeginDisabled(!is_jpeg);
+                ImGui::SliderInt("JPEG quality", &record_jpeg_quality, 1, 100);
+                ImGui::EndDisabled();
+
+                ImGui::BeginDisabled(playback);
+                if (ImGui::Button("Start recording")) { start_recording(); }
+                ImGui::EndDisabled();
+                if (playback) { ImGui::TextUnformatted("A playback source is not recorded"); }
+                return;
+            }
+
+            const io::recording_stats_t stats = recorder->stats();
+            const double seconds = std::chrono::duration<double>{ stats.duration }.count();
+            const double megabytes = static_cast<double>(stats.file_bytes) / (1024.0 * 1024.0);
+            ImGui::TextColored(ImVec4{ 0.90f, 0.30f, 0.30f, 1.0f }, "REC %s", recorder->path().filename().string().c_str());
+            ImGui::Text("%zu stream(s) | %.1f s | %llu frames written | %.1f MB (%.1f MB/s)"
+                , recorder->stream_count()
+                , seconds
+                , static_cast<unsigned long long>(stats.frames_written)
+                , megabytes
+                , seconds > 0.0 ? megabytes / seconds : 0.0);
+            if (stats.frames_dropped > 0) {
+                ImGui::TextColored(ImVec4{ 0.90f, 0.60f, 0.20f, 1.0f }, "Dropped: %llu frame(s)"
+                    , static_cast<unsigned long long>(stats.frames_dropped));
+            }
+            if (ImGui::Button("Stop recording")) { stop_recording(); }
         }
 
         void draw_preview(SDL_Renderer* renderer)

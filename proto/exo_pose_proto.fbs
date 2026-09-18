@@ -1,4 +1,4 @@
-﻿// exo-skeleton-pose network protocol.
+// exo-skeleton-pose network protocol.
 //
 // codegen:
 //   C++ : flatc --cpp    -o <out> exo_pose_proto.fbs

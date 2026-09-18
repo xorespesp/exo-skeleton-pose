@@ -33,7 +33,7 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/hw/roi.hh"
     "src/hw/frame_format.hh"
     "src/hw/calibration.hh"
-    "src/hw/source_backend.hh"
+    "src/hw/sensor_backend.hh"
     "src/hw/source_config.hh"
     "src/hw/source_config.cc"
     "src/hw/sensor_frameset.hh"

@@ -1,4 +1,4 @@
-﻿#include "exo_pose_server.hh"
+#include "exo_pose_server.hh"
 
 #include "exo_pose_pipeline.hh"
 
@@ -517,9 +517,14 @@ namespace net
 
         const auto source_name_str = to_fb_string(
             is_streaming ? _imp->pipeline.source_name() : std::string{});
-        const auto source_backend_str = to_fb_string(is_streaming
-            ? hw::source_backend_to_str(_imp->pipeline.source_backend())
-            : std::string_view{});
+
+        std::string_view source_backend_label;
+        if (is_streaming) {
+            source_backend_label = _imp->pipeline.is_playback_source()
+                ? std::string_view{ "recording" }
+                : hw::sensor_backend_to_str(_imp->pipeline.sensor_backend());
+        }
+        const auto source_backend_str = to_fb_string(source_backend_label);
 
         int32_t w = 0, h = 0;
         if (is_streaming) {

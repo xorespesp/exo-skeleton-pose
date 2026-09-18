@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "hw/clock_anchor.hh"
 #include "hw/sensor_frame_source.hh"
 #include "hw/source_config.hh"
@@ -42,8 +42,6 @@ namespace hw
     public:
         k4a_device_capturer() = default;
         ~k4a_device_capturer() override;
-        
-        [[nodiscard]] static std::vector<device_info_t> enumerate();
 
         [[nodiscard]] bool open(const k4a_device_config_t& config) noexcept;
         bool is_valid() const override;

@@ -132,24 +132,6 @@ namespace hw
         this->close();
     }
 
-    std::vector<device_info_t> vz_frame_source::enumerate()
-    {
-        std::vector<device_info_t> found;
-        std::string err_msg;
-        const std::vector<vz::device_info_t> devices = vz::device::enumerate(kEnumerateTimeoutMs, &err_msg);
-        if (!err_msg.empty()) { spdlog::warn("vz: enumeration: {}", err_msg); }
-        for (uint32_t device_index = 0; device_index < devices.size(); ++device_index)
-        {
-            found.push_back(device_info_t{
-                .source_backend = source_backend_t::vz,
-                .device_index = device_index,
-                .device_serial = devices[device_index].serial,
-                .display_name = std::format("vz device #{} (S/N {})", device_index, devices[device_index].serial),
-            });
-        }
-        return found;
-    }
-
     bool vz_frame_source::open(const vz_device_config_t& config) noexcept try
     {
         std::scoped_lock lk{ _mtx };
@@ -312,9 +294,8 @@ namespace hw
     {
         std::scoped_lock lk{ _mtx };
         return stream_descriptor_t{
-            .stream_name = default_stream_name(0),
+            .sensor_backend = sensor_backend_t::vz,
             .device_serial = _device_serial,
-            .source_backend = source_backend_t::vz,
         };
     }
 

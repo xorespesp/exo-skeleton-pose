@@ -1,15 +1,13 @@
-#pragma once
+﻿#pragma once
 #include "calibration.hh"
 #include "frame_format.hh"
 #include "roi.hh"
-#include "source_backend.hh"
 
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <variant>
-#include <vector>
 
 namespace hw
 {
@@ -68,24 +66,6 @@ namespace hw
     };
 
     using source_config_t = std::variant<k4a_device_config_t, vz_device_config_t, recording_config_t>;
-
-    // 이 config 가 고르는 백엔드.
-    source_backend_t get_source_backend(const source_config_t& config);
-
-    struct device_info_t
-    {
-        source_backend_t source_backend{};
-        uint32_t device_index{ 0 };
-        std::string device_serial; // SDK 가 주지 않으면 비어 있다
-        std::string display_name;
-    };
-
-    // `backend` 의 카메라를 나열한다. 여는 경로가 아니라 무엇을 열 수 있는지 묻는 경로다: 설정을 만드는
-    // 쪽이 시리얼을 고르거나, 설정의 시리얼이 꽂혀 있는지 미리 확인할 때 쓴다. SDK 헤더가 `hw/` 밖으로
-    // 새지 않도록 백엔드의 열거를 여기서 한 번 감싼다.
-    // 스트리밍 중이 아닐 때 부른다. K4A 는 시리얼을 읽으려면 장치를 열어야 하므로, 이미 열려 있는 장치는
-    // 시리얼 없이 인덱스만 보고된다.
-    std::vector<device_info_t> enumerate_devices(source_backend_t backend);
 
     // 사람이 읽는 짧은 라벨.
     // 예: "k4a device #0", "vz device 'VZ12345'", "recording 'walk.mcap'".

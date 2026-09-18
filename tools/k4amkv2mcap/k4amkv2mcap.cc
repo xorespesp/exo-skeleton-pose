@@ -29,6 +29,28 @@ namespace
         k4a_playback_t h{ nullptr };
         ~playback_handle_t() { if (h) { ::k4a_playback_close(h); } }
     };
+
+    // A recording tag the K4A recorder wrote, without the SDK's null terminator. Empty when the
+    // recording has no such tag.
+    std::string read_playback_tag(k4a_playback_t playback, const char* name)
+    {
+        std::string value;
+        size_t needed = 0;
+        if (::k4a_playback_get_tag(playback, name, nullptr, &needed) == K4A_BUFFER_RESULT_TOO_SMALL && needed > 1)
+        {
+            value.resize(needed);
+            if (::k4a_playback_get_tag(playback, name, &value[0], &needed) == K4A_BUFFER_RESULT_SUCCEEDED
+                && !value.empty() && value.back() == '\0')
+            {
+                value.pop_back();
+            }
+            else
+            {
+                value.clear();
+            }
+        }
+        return value;
+    }
 } // namespace
 
 int main(int argc, char** argv) try
@@ -100,11 +122,10 @@ int main(int argc, char** argv) try
     }
 
     const auto stream = writer.add_camera_stream(io::camera_stream_info_t{
-        .stream_name = "color0",
         .calibration = hw::k4a_to_calibration(k4a_calib),
         .color_format = hw::frame_format_t::bgr8,
-        .source_backend = hw::source_backend_t::k4a,
-        .source_name = input.filename().string(),
+        .sensor_backend = hw::sensor_backend_t::k4a,
+        .device_serial = read_playback_tag(playback.h, "K4A_DEVICE_SERIAL_NUMBER"), // the recorder tags the device it captured from
         // K4A recordings do not expose the per-capture exposure/gain through this path,
         // so they are left unset rather than guessed.
         .exposure_us = std::nullopt,

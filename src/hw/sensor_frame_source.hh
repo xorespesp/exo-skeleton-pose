@@ -1,14 +1,13 @@
-#pragma once
+﻿#pragma once
 #include "calibration.hh"
 #include "frame_format.hh"
 #include "roi.hh"
 #include "sensor_frameset.hh"
-#include "source_backend.hh"
+#include "sensor_backend.hh"
 #include "timestamp.hh"
 
 #include <chrono>
 #include <cstddef>
-#include <format>
 #include <memory>
 #include <optional>
 #include <span>
@@ -18,15 +17,9 @@ namespace hw
 {
     struct stream_descriptor_t
     {
-        std::string stream_name;
+        sensor_backend_t sensor_backend{};
         std::string device_serial; // optional
-        source_backend_t source_backend{};
     };
-
-    inline std::string default_stream_name(const std::size_t stream_idx)
-    {
-        return std::format("color{}", stream_idx);
-    }
 
     // Abstract camera backend interface. SDK-agnostic.
     class sensor_frame_source {

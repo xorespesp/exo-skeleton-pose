@@ -1,23 +1,19 @@
-﻿#include "frame_recorder.hh"
+#include "frame_recorder.hh"
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <format>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace io
 {
-    namespace
-    {
-        constexpr std::size_t kRecordStreamIdx = 0; // 녹화하는 스트림
-    }
-
     frame_recorder::frame_recorder(
-        const recording_options_t& options, 
-        const size_t queue_depth)
-        : hw::single_stream_frameset_observer{ kRecordStreamIdx }
-        , _queue_depth{ std::max<size_t>(1, queue_depth) }
+        const recording_options_t& options,
+        const std::size_t queue_depth_per_stream)
+        : _queue_depth_per_stream{ std::max<std::size_t>(1, queue_depth_per_stream) }
         , _writer{ options }
     { }
 
@@ -28,22 +24,30 @@ namespace io
 
     bool frame_recorder::start(
         const std::filesystem::path& path,
-        const camera_stream_info_t& camera) noexcept try
+        const std::span<const camera_stream_info_t> stream_infos) noexcept try
     {
         if (_is_started.load(std::memory_order_relaxed)) {
             throw std::runtime_error{ "frame_recorder: already started" };
+        }
+        if (stream_infos.empty()) {
+            throw std::invalid_argument{ "frame_recorder: no camera stream to record" };
         }
 
         if (!_writer.open(path)) {
             throw std::runtime_error{ "frame_recorder: failed to open the recording" };
         }
 
-        const std::optional<stream_id_t> new_stream = _writer.add_camera_stream(camera);
-        if (!new_stream.has_value()) {
-            _writer.close();
-            throw std::runtime_error{ "frame_recorder: failed to register the camera stream" };
+        // 슬롯 순서로 등록하므로 writer 가 매기는 스트림 인덱스가 슬롯 인덱스와 같다.
+        for (std::size_t stream_idx = 0; stream_idx < stream_infos.size(); ++stream_idx)
+        {
+            const std::optional<std::size_t> registered_idx = _writer.add_camera_stream(stream_infos[stream_idx]);
+            if (registered_idx != stream_idx) {
+                _writer.close();
+                throw std::runtime_error{ std::format("frame_recorder: failed to register camera stream {}", stream_idx) };
+            }
         }
-        _stream_id = *new_stream;
+        _stream_count = stream_infos.size();
+        _queue_depth = _queue_depth_per_stream * _stream_count;
 
         {
             std::scoped_lock lk{ _mtx };
@@ -76,58 +80,67 @@ namespace io
     void frame_recorder::_worker(std::stop_token stop)
     {
         for (;;) {
-            std::shared_ptr<hw::sensor_frame> frame;
+            queued_frame_t queued;
             {
                 std::unique_lock lk{ _mtx };
                 _queue_cv.wait(lk, stop, [this] { return !_queue.empty(); });
 
-                // Empty here means the stop was requested and the queue is drained.
+                // 여기서 비어 있으면 정지 요청이 왔고 큐를 다 비운 것이다.
                 if (_queue.empty()) { return; }
 
-                frame = std::move(_queue.front());
+                queued = std::move(_queue.front());
                 _queue.pop_front();
             }
 
-            // Encoded outside the lock, or the observer callback would block behind it on push.
+            // 인코딩은 락 밖에서. 안 그러면 관찰자 콜백이 push 에서 그 뒤에 막힌다.
             [[maybe_unused]] const bool succeeded = _writer.write_frame(
-                _stream_id,
-                frame->image(),
-                frame->timestamp()
+                queued.stream_idx,
+                queued.frame->image(),
+                queued.frame->timestamp() // 슬롯마다 자기 캡처의 시각
             );
         }
     }
 
-    void frame_recorder::on_sensor_frameset_update(const hw::sensor_frameset& new_frameset)
+    void frame_recorder::on_synced_frameset_update(const hw::synced_frameset& new_frameset)
     {
         if (!_is_started.load(std::memory_order_relaxed)) { return; }
 
-        const std::shared_ptr<hw::sensor_frame>& new_sensor_frame = new_frameset.frame();
-        if (new_sensor_frame->image().empty()) { return; }
+        // 등록한 스트림의 슬롯을 모은다. 파일 안의 순간은 모든 스트림이 갖춰져 있어야 하므로, 슬롯 하나라도
+        // 없거나 비어 있으면 그 순간은 쓰지 않는다. provider 는 슬롯이 빈 frameset 을 내보내지 않는다.
+        std::vector<queued_frame_t> frames;
+        frames.reserve(_stream_count);
+        for (std::size_t stream_idx = 0; stream_idx < _stream_count; ++stream_idx)
+        {
+            const hw::sensor_frameset* capture = new_frameset.stream_frameset(stream_idx);
+            if (!capture || capture->frame()->image().empty()) { return; }
+            frames.push_back(queued_frame_t{ stream_idx, capture->frame() });
+        }
 
         {
             std::scoped_lock lk{ _mtx };
-            if (_queue.size() >= _queue_depth) {
-                // Encoding is behind. Dropping keeps memory bounded; the count makes the loss visible.
-                ++_frames_dropped;
+            if (_queue.size() + frames.size() > _queue_depth) {
+                // 인코딩이 밀렸다. 순간을 통째로 버려 메모리를 묶어 두고, 잃은 수를 기록한다.
+                _frames_dropped += frames.size();
                 return;
             }
-            _queue.push_back(new_sensor_frame);
+            for (queued_frame_t& queued : frames) { _queue.push_back(std::move(queued)); }
         }
         _queue_cv.notify_one();
     }
 
     void frame_recorder::on_sensor_stream_reset()
     {
-        // A seek or a new source does not end a recording; the owner decides when to stop.
+        // seek 이나 새 소스는 녹화를 끝내지 않는다. 언제 멈출지는 소유자가 정한다.
     }
 
-    void frame_recorder::on_sensor_frame_geometry_changed()
+    void frame_recorder::on_sensor_frame_geometry_changed(const std::size_t stream_idx)
     {
-        // The stream was declared with one calibration, frame size included, so frames of another
-        // cannot join it. Finalizing keeps what was captured readable.
+        // 스트림은 프레임 크기까지 든 캘리브레이션 하나로 선언되어 다른 크기의 프레임은 들어갈 수 없다.
+        // 어느 스트림이든 하나가 바뀌면 파일 전체를 닫아 지금까지 담긴 것을 읽을 수 있게 남긴다.
         if (!_is_started.load(std::memory_order_relaxed)) { return; }
 
-        spdlog::warn("recorder: the frame geometry changed; finalizing '{}'", _writer.path().string());
+        spdlog::warn("recorder: the frame geometry of stream {} changed; finalizing '{}'"
+            , stream_idx, _writer.path().string());
         this->stop();
     }
 

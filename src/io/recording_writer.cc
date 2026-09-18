@@ -3,7 +3,7 @@
 #include <mcap/writer.hpp>
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
+#include <charconv>
 #include <format>
 #include <stdexcept>
 
@@ -12,7 +12,9 @@ namespace io
     namespace
     {
         // Current Recording Format Version (YYMMDDRR)
-        constexpr std::string_view kFormatVersion{ "26080200" };
+        constexpr std::string_view kFormatVersion{ "26091800" };
+
+        constexpr std::string_view kStreamNamePrefix{ "color" };
 
         // FlatBuffers is the message encoding for every channel we write.
         constexpr std::string_view kMessageEncoding{ "flatbuffer" };
@@ -34,6 +36,25 @@ namespace io
                 std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
         }
     } // namespace
+
+    std::string stream_name_of(const std::size_t stream_idx)
+    {
+        return std::format("{}{}", kStreamNamePrefix, stream_idx);
+    }
+
+    std::optional<std::size_t> stream_idx_of(std::string_view stream_name) noexcept
+    {
+        if (!stream_name.starts_with(kStreamNamePrefix)) { return std::nullopt; }
+        stream_name.remove_prefix(kStreamNamePrefix.size());
+
+        // Only the digits stream_name_of() prints: no sign, no leading zero, nothing trailing.
+        if (stream_name.empty() || (stream_name.size() > 1 && stream_name.front() == '0')) { return std::nullopt; }
+
+        std::size_t stream_idx = 0;
+        const auto [end, ec] = std::from_chars(stream_name.data(), stream_name.data() + stream_name.size(), stream_idx);
+        if (ec != std::errc{} || end != stream_name.data() + stream_name.size()) { return std::nullopt; }
+        return stream_idx;
+    }
 
     recording_writer::recording_writer(const recording_options_t& options)
         : _options{ options }
@@ -100,30 +121,23 @@ namespace io
         return false;
     }
 
-    std::optional<stream_id_t> recording_writer::add_camera_stream(const camera_stream_info_t& info) noexcept try
+    std::optional<std::size_t> recording_writer::add_camera_stream(const camera_stream_info_t& info) noexcept try
     {
         if (!_writer) { throw std::runtime_error{ "recording_writer: not opened" }; }
-        if (info.stream_name.empty()) { throw std::invalid_argument{ "recording_writer: camera stream needs a name" }; }
-
-        const bool duplicate = std::ranges::any_of(_streams,
-            [&info](const camera_stream_t& s) { return s.stream_name == info.stream_name; }
-        );
-
-        if (duplicate) {
-            throw std::invalid_argument{ std::format(
-                "recording_writer: camera stream '{}' already registered", info.stream_name) };
-        }
 
         const image_codec_desc_t* codec = find_image_codec(_options.codec);
         if (!codec) { throw std::invalid_argument{ "recording_writer: unknown image codec" }; }
 
-        // Everything about this stream sits on its image channel: 
+        // Named by position, so the name states the stream's index and is unique by construction.
+        const std::string stream_name = stream_name_of(_streams.size());
+
+        // Everything about this stream sits on its image channel:
         // how to decode it, what layout it carries, and which camera produced it.
         mcap::KeyValueMap image_metadata{
             { "codec", std::string{ codec->id } },
             { "color_format", std::string{ hw::frame_format_to_str(info.color_format) } },
-            { "source_backend", std::string{ hw::source_backend_to_str(info.source_backend) } },
-            { "source_name", info.source_name },
+            { "sensor_backend", std::string{ hw::sensor_backend_to_str(info.sensor_backend) } },
+            { "device_serial", info.device_serial },
             { "exposure_us", encode_camera_setting(info.exposure_us) },
             { "gain", encode_camera_setting(info.gain) },
         };
@@ -134,7 +148,7 @@ namespace io
         }
 
         mcap::Channel image_channel{
-            /*topic*/std::format("/camera/{}/image", info.stream_name),
+            /*topic*/std::format("/camera/{}/image", stream_name),
             /*messageEncoding*/kMessageEncoding,
             /*schemaId*/_image_schema_id,
             /*metadata*/std::move(image_metadata)
@@ -143,28 +157,30 @@ namespace io
 
         // NOTE: The calibration travels in the message itself, so the channel carries no metadata.
         mcap::Channel calibration_channel{
-            /*topic*/std::format("/camera/{}/calibration", info.stream_name),
+            /*topic*/std::format("/camera/{}/calibration", stream_name),
             /*messageEncoding*/kMessageEncoding,
             /*schemaId*/_calibration_schema_id
         };
         _writer->addChannel(calibration_channel);
 
         _streams.push_back(camera_stream_t{
-            .stream_name = info.stream_name,
+            .stream_name = stream_name,
             .color_format = info.color_format,
             .image_channel_id = image_channel.id,
             .calibration_channel_id = calibration_channel.id,
             .calibration = info.calibration,
         });
 
-        spdlog::info("recording: camera stream '{}' registered ({}x{}, {})"
-            , info.stream_name
+        spdlog::info("recording: camera stream '{}' registered ({}x{}, {}, {} '{}')"
+            , stream_name
             , info.calibration.frame_resolution.x()
             , info.calibration.frame_resolution.y()
             , hw::frame_format_to_str(info.color_format)
+            , hw::sensor_backend_to_str(info.sensor_backend)
+            , info.device_serial
         );
 
-        return static_cast<stream_id_t>(_streams.size() - 1);
+        return _streams.size() - 1;
     }
     catch (const std::exception& e)
     {
@@ -173,14 +189,14 @@ namespace io
     }
 
     bool recording_writer::write_frame(
-        const stream_id_t stream_id,
+        const std::size_t stream_idx,
         const cv::Mat& image,
         const hw::timestamp_t timestamp) noexcept try
     {
         if (!_writer) { throw std::runtime_error{ "recording_writer: not opened" }; }
-        if (stream_id >= _streams.size()) { throw std::invalid_argument{ "recording_writer: unknown camera stream" }; }
+        if (stream_idx >= _streams.size()) { throw std::invalid_argument{ "recording_writer: unknown camera stream" }; }
 
-        camera_stream_t& s = _streams[stream_id];
+        camera_stream_t& s = _streams[stream_idx];
 
         // The stream declares one calibration for the whole file, frame size included, so a frame
         // of another size cannot join it: the file would say one thing and hold another.

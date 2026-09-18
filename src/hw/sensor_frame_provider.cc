@@ -152,7 +152,6 @@ namespace hw
         void _install_source(
             std::unique_ptr<frameset_synchronizer> synchronizer,
             std::shared_ptr<record_player_source> player,
-            source_backend_t source_backend,
             std::string source_name,
             const std::vector<std::optional<roi_t>>& requested_rois
         );
@@ -222,7 +221,6 @@ namespace hw
         std::vector<stream_info_t> _stream_infos;
 
         // open 에서 정해지고 스트리밍 중에는 불변.
-        source_backend_t _source_backend{};
         std::string _source_name;
 
         std::atomic<uint32_t> _frameset_seq{ 0 };
@@ -291,7 +289,6 @@ namespace hw
         this->_install_source(
             std::move(synchronizer),
             std::move(player),
-            hw::get_source_backend(config),
             describe(config),
             requested_rois
         );
@@ -366,7 +363,6 @@ namespace hw
         this->_install_source(
             std::make_unique<frameset_synchronizer>(std::move(cameras), sync_options),
             nullptr,
-            hw::get_source_backend(member_configs.front()),
             std::move(source_name),
             requested_rois
         );
@@ -381,7 +377,6 @@ namespace hw
     void sensor_frame_provider::impl::_install_source(
         std::unique_ptr<frameset_synchronizer> synchronizer,
         std::shared_ptr<record_player_source> player,
-        const source_backend_t source_backend,
         std::string source_name,
         const std::vector<std::optional<roi_t>>& requested_rois)
     {
@@ -415,7 +410,6 @@ namespace hw
             _stream_infos = std::move(stream_infos);
         }
 
-        _source_backend = source_backend;
         _source_name = std::move(source_name);
 
         _frameset_seq.store(0);
@@ -455,9 +449,11 @@ namespace hw
         spdlog::info("provider opened: {} ({} stream(s))", _source_name, stream_count);
         for (std::size_t stream_idx = 0; stream_idx < stream_count; ++stream_idx)
         {
-            spdlog::info("provider stream {} '{}': {}, {}"
+            const stream_descriptor_t descriptor = this->get_stream_descriptor(stream_idx);
+            spdlog::info("provider stream {}: {} '{}', {}, {}"
                 , stream_idx
-                , this->get_stream_descriptor(stream_idx).stream_name
+                , sensor_backend_to_str(descriptor.sensor_backend)
+                , descriptor.device_serial
                 , frame_format_to_str(this->get_frame_format(stream_idx))
                 , describe_roi(this->get_effective_roi(stream_idx))
             );
@@ -1027,7 +1023,6 @@ namespace hw
     }
     void sensor_frame_provider::close() { _imp->close(); }
 
-    source_backend_t sensor_frame_provider::get_source_backend() const { return _imp->_source_backend; }
     const std::string& sensor_frame_provider::get_source_name() const { return _imp->_source_name; }
     std::size_t sensor_frame_provider::stream_count() const { return _imp->stream_count(); }
 

@@ -11,8 +11,10 @@
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace net
 {
@@ -409,25 +411,32 @@ namespace net
             spdlog::error("pipeline: cannot record without an open source");
             return false;
         }
+        // A recorder that finalized on its own (stream end, geometry change) is released here as
+        // well as in poll(), so a start issued before the next poll is not turned away.
+        if (_recorder && !_recorder->is_started()) { this->stop_recording(); }
         if (_recorder) {
             spdlog::warn("pipeline: already recording to '{}'", _recorder->path().string());
             return false;
         }
 
-        const io::camera_stream_info_t color_stream_info{
-            .stream_name = "color0", // first color stream
-            .calibration = _provider->get_calibration(kPoseStreamIdx),
-            .color_format = _provider->get_frame_format(kPoseStreamIdx),
-            .source_backend = _provider->get_source_backend(),
-            .source_name = _provider->get_source_name(),
-            .exposure_us = _exposure_us,
-            .gain = _gain,
-        };
+        std::vector<io::camera_stream_info_t> stream_infos;
+        for (std::size_t stream_idx = 0; stream_idx < _provider->stream_count(); ++stream_idx)
+        {
+            const hw::stream_descriptor_t descriptor = _provider->get_stream_descriptor(stream_idx);
+            stream_infos.push_back(io::camera_stream_info_t{
+                .calibration = _provider->get_calibration(stream_idx),
+                .color_format = _provider->get_frame_format(stream_idx),
+                .sensor_backend = descriptor.sensor_backend,
+                .device_serial = descriptor.device_serial,
+                .exposure_us = _exposure_us,
+                .gain = _gain,
+            });
+        }
 
-        // Start the recorder before it is subscribed, 
+        // Start the recorder before it is subscribed,
         // so the first frame it sees is one it can already write.
         auto recorder = std::make_shared<io::frame_recorder>(options);
-        if (!recorder->start(path, color_stream_info)) { return false; }
+        if (!recorder->start(path, stream_infos)) { return false; }
 
         _provider->add_observer(recorder);
         _recorder = std::move(recorder);
@@ -644,6 +653,10 @@ namespace net
             if (r.stream_end_reason == hw::stream_end_reason_t::failed) { this->close_source(); }
         }
 
+        // The recorder finalizes its file on its own when the stream ends or a frame geometry
+        // changes. Releasing it here is what lets the next start_recording() go through.
+        if (_recorder && !_recorder->is_started()) { this->stop_recording(); }
+
         // Status: consume the flag set by the last source/rest command.
         r.status_changed = std::exchange(_status_changed, false);
         if (r.status_changed) { 
@@ -736,9 +749,10 @@ namespace net
         return _observer && _observer->try_get_frame(out_img, out_source, last_seq);
     }
 
-    hw::source_backend_t exo_pose_pipeline::source_backend() const
+    hw::sensor_backend_t exo_pose_pipeline::sensor_backend() const
     {
-        return _provider ? _provider->get_source_backend() : hw::source_backend_t{};
+        if (!_provider) { throw std::logic_error{ "pipeline: no source is open" }; }
+        return _provider->get_stream_descriptor(kPoseStreamIdx).sensor_backend;
     }
 
     std::string exo_pose_pipeline::source_name() const

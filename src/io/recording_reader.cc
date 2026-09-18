@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <format>
 #include <stdexcept>
+#include <utility>
 
 namespace io
 {
@@ -141,63 +142,67 @@ namespace io
             spdlog::debug("  {} = {}", key, value);
         }
 
-        // Every camera stream in the file, discovered from its channels. Nothing here
-        // knows how many cameras there are supposed to be.
+        // Every camera stream in the file, discovered from its channels. Nothing here knows how
+        // many cameras there are supposed to be. Each stream's index is what its name states;
+        // the order the container lists channels in is not consulted. A stream this build
+        // cannot decode fails the open, since dropping it would leave a hole in the indices and
+        // a consumer addressing that index would silently get nothing.
         std::vector<recorded_camera_stream_t> streams;
         for (const auto& [channel_id, channel] : reader->channels()) {
             const std::string_view stream_name = stream_name_from_image_topic(channel->topic);
             if (stream_name.empty()) { continue; }
 
+            const std::optional<std::size_t> stream_idx = stream_idx_of(stream_name);
+            if (!stream_idx.has_value()) {
+                throw std::runtime_error{ std::format(
+                    "channel '{}': stream name '{}' does not state a stream index", channel->topic, stream_name) };
+            }
+
             const auto codec_it = channel->metadata.find("codec");
             if (codec_it == channel->metadata.end()) {
-                spdlog::warn("recording_reader: channel '{}' has no codec; skipping", channel->topic);
-                continue;
+                throw std::runtime_error{ std::format("channel '{}' has no codec", channel->topic) };
             }
 
             const image_codec_desc_t* codec = find_image_codec(codec_it->second);
             if (!codec) {
-                spdlog::warn("recording_reader: channel '{}' uses unknown codec '{}'; skipping",
-                    channel->topic, codec_it->second);
-                continue;
+                throw std::runtime_error{ std::format(
+                    "channel '{}' uses unknown codec '{}'", channel->topic, codec_it->second) };
             }
 
             const auto format_it = channel->metadata.find("color_format");
             if (format_it == channel->metadata.end()) {
-                spdlog::warn("recording_reader: channel '{}' has no color format; skipping", channel->topic);
-                continue;
+                throw std::runtime_error{ std::format("channel '{}' has no color format", channel->topic) };
             }
 
             const std::optional<hw::frame_format_t> color_format = hw::frame_format_from_str(format_it->second);
             if (!color_format.has_value()) {
-                spdlog::warn("recording_reader: channel '{}' uses unknown color format '{}'; skipping",
-                    channel->topic, format_it->second);
-                continue;
+                throw std::runtime_error{ std::format(
+                    "channel '{}' uses unknown color format '{}'", channel->topic, format_it->second) };
             }
 
-            // Provenance is for diagnosis, not decoding, so a stream stays usable
-            // even when this build cannot make sense of the backend it names.
-            std::optional<hw::source_backend_t> source_backend;
-            if (const std::string_view backend = channel_metadata(*channel, "source_backend");
-                !backend.empty())
-            {
-                source_backend = hw::source_backend_from_str(backend);
-                if (!source_backend.has_value()) {
-                    spdlog::warn("recording_reader: channel '{}' names an unknown source backend '{}'"
-                        , channel->topic
-                        , backend
-                    );
-                }
+            // The sensor behind a stream is part of what the stream is, so a playback stream has
+            // to be able to state it just as a live one does.
+            std::string_view backend_str = channel_metadata(*channel, "sensor_backend");
+            if (backend_str.empty()) { backend_str = channel_metadata(*channel, "source_backend"); }
+            if (backend_str.empty()) {
+                throw std::runtime_error{ std::format("channel '{}' has no sensor backend", channel->topic) };
+            }
+            const std::optional<hw::sensor_backend_t> sensor_backend = hw::sensor_backend_from_str(backend_str);
+            if (!sensor_backend.has_value()) {
+                throw std::runtime_error{ std::format(
+                    "channel '{}' names an unknown sensor backend '{}'", channel->topic, backend_str) };
             }
 
             streams.push_back(recorded_camera_stream_t{
-                .stream_name = std::string{ stream_name },
-                .stream_id = static_cast<stream_id_t>(streams.size()),
+                .stream_idx = *stream_idx, // as the name states; held against the position below
                 .codec = codec->codec,
-                .color_format = *color_format,
-                .source_backend = source_backend,
-                .source_name = std::string{ channel_metadata(*channel, "source_name") },
-                .exposure_us = decode_camera_setting(channel_metadata(*channel, "exposure_us")),
-                .gain = decode_camera_setting(channel_metadata(*channel, "gain")),
+                .stream_info = camera_stream_info_t{
+                    .color_format = *color_format,
+                    .sensor_backend = *sensor_backend,
+                    .device_serial = std::string{ channel_metadata(*channel, "device_serial") },
+                    .exposure_us = decode_camera_setting(channel_metadata(*channel, "exposure_us")),
+                    .gain = decode_camera_setting(channel_metadata(*channel, "gain")),
+                },
             });
         }
 
@@ -205,10 +210,24 @@ namespace io
             throw std::runtime_error{ "recording has no camera stream" };
         }
 
+        // N streams have to be numbered 0..N-1 once each for the index to be the position in
+        // camera_streams(). Sorted by the number the name states and checked position against
+        // number: a number at or beyond N shows at the last position, a repeat or a gap at the
+        // position after it.
+        std::ranges::sort(streams, {}, &recorded_camera_stream_t::stream_idx);
+        for (std::size_t position = 0; position < streams.size(); ++position) {
+            if (streams[position].stream_idx != position) {
+                throw std::runtime_error{ std::format(
+                    "recording stream '{}' does not fit: its {} stream(s) must be numbered 0..{} once each",
+                    stream_name_of(streams[position].stream_idx), streams.size(), streams.size() - 1) };
+            }
+        }
+
         // Each stream's calibration is a single message on its own topic, read once here so
         // the playback cursors carry only frames.
         for (recorded_camera_stream_t& stream : streams) {
-            const std::string topic = std::format("/camera/{}/calibration", stream.stream_name);
+            const std::string stream_name = stream_name_of(stream.stream_idx);
+            const std::string topic = std::format("/camera/{}/calibration", stream_name);
 
             mcap::ReadMessageOptions options{};
             options.topicFilter = [&topic](const std::string_view candidate) { return candidate == topic; };
@@ -216,10 +235,10 @@ namespace io
             mcap::LinearMessageView view = reader->readMessages(log_problem, options);
             const auto it = view.begin();
             if (it == view.end()) {
-                spdlog::warn("recording_reader: camera stream '{}' has no calibration", stream.stream_name);
+                spdlog::warn("recording_reader: camera stream '{}' has no calibration", stream_name);
                 continue;
             }
-            stream.calibration = decode_calibration(payload_of(it->message));
+            stream.stream_info.calibration = decode_calibration(payload_of(it->message));
         }
 
         _reader = std::move(reader);
@@ -230,7 +249,7 @@ namespace io
 
         _cursors.resize(_streams.size());
         for (const recorded_camera_stream_t& stream : _streams) {
-            this->_restart_cursor(stream.stream_id, _first_timestamp);
+            this->_restart_cursor(stream.stream_idx, _first_timestamp);
         }
 
         spdlog::info("recording opened: {} ({} camera stream(s), {:.1f} s)",
@@ -258,36 +277,36 @@ namespace io
     }
 
     void recording_reader::seek_timestamp(
-        const stream_id_t stream_id,
+        const std::size_t stream_idx,
         const hw::timestamp_t timestamp) noexcept try
     {
-        if (!_opened || stream_id >= _cursors.size()) { return; }
+        if (!_opened || stream_idx >= _cursors.size()) { return; }
 
         const auto upper = std::max(_first_timestamp, _last_timestamp);
-        this->_restart_cursor(stream_id, std::clamp(timestamp, _first_timestamp, upper));
+        this->_restart_cursor(stream_idx, std::clamp(timestamp, _first_timestamp, upper));
     }
     catch (const std::exception& e)
     {
         spdlog::error("recording_reader::seek_timestamp failed: {}", e.what());
-        if (stream_id < _cursors.size()) { _cursors[stream_id].reset(); }
+        if (stream_idx < _cursors.size()) { _cursors[stream_idx].reset(); }
     }
 
     std::optional<recording_reader::frame_t> recording_reader::fetch_next_frame(
-        const stream_id_t stream_id) noexcept try
+        const std::size_t stream_idx) noexcept try
     {
-        if (!_opened || stream_id >= _cursors.size()) { return std::nullopt; }
+        if (!_opened || stream_idx >= _cursors.size()) { return std::nullopt; }
 
-        playback_cursor_t* cursor = _cursors[stream_id].get();
+        playback_cursor_t* cursor = _cursors[stream_idx].get();
         if (!cursor) { return std::nullopt; }
 
-        const recorded_camera_stream_t& cam = _streams[stream_id]; // parallel to _cursors; index already checked
+        const recorded_camera_stream_t& cam = _streams[stream_idx]; // parallel to _cursors; index already checked
 
         while (cursor->it != cursor->end) {
             const mcap::MessageView& view = *cursor->it;
             const auto timestamp = hw::timestamp_t{ std::chrono::nanoseconds{ view.message.logTime } };
 
             // The payload dies when the iterator advances, so decode before stepping.
-            cv::Mat image = decode_frame(cam.codec, payload_of(view.message), cam.color_format);
+            cv::Mat image = decode_frame(cam.codec, payload_of(view.message), cam.stream_info.color_format);
             ++cursor->it;
 
             if (image.empty()) { continue; } // already logged; skip the bad frame rather than end playback
@@ -307,10 +326,10 @@ namespace io
     }
 
     void recording_reader::_restart_cursor(
-        const stream_id_t stream_id,
+        const std::size_t stream_idx,
         const hw::timestamp_t from)
     {
-        _cursors[stream_id].reset();
+        _cursors[stream_idx].reset();
 
         // startTime is baked into the view here and cannot be changed afterwards
         // (the iterator only moves forward), so a new position means a new view.
@@ -319,11 +338,11 @@ namespace io
         // Filter to this stream's image topic, so the cursor never touches another stream's
         // messages and only this stream's frames reach fetch_next_frame().
         options.readOrder = mcap::ReadMessageOptions::ReadOrder::LogTimeOrder;
-        options.topicFilter = [topic = image_topic(_streams[stream_id].stream_name)](const std::string_view t) {
+        options.topicFilter = [topic = image_topic(stream_name_of(stream_idx))](const std::string_view t) {
             return t == topic;
         };
 
-        _cursors[stream_id] = std::make_unique<playback_cursor_t>(*_reader, options);
+        _cursors[stream_idx] = std::make_unique<playback_cursor_t>(*_reader, options);
     }
 
 } // namespace io

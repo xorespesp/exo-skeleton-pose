@@ -2,36 +2,44 @@
 #include "recording_message.hh"
 
 #include "hw/calibration.hh"
-#include "hw/source_backend.hh"
+#include "hw/sensor_backend.hh"
 
 #include <opencv2/core.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mcap { class McapWriter; }
 
 namespace io
 {
-    // Handle for a camera stream within a recording.
-    using stream_id_t = uint16_t;
+    // A stream inside a recording is addressed by the same `stream_idx` as everywhere else. The
+    // name it carries is that index spelled out: it forms the topic paths and doubles as the
+    // camera's coordinate frame name. A file thereby states the index of every stream it holds,
+    // and a reader never has to infer it from container order.
+    [[nodiscard]] std::string stream_name_of(std::size_t stream_idx);
+
+    // Inverse of stream_name_of(). nullopt when the name is not of that shape.
+    [[nodiscard]] std::optional<std::size_t> stream_idx_of(std::string_view stream_name) noexcept;
 
     struct camera_stream_info_t
     {
-        // Labels this stream within the recording: it forms the topic paths and doubles as
-        // the camera's coordinate frame name.
-        std::string stream_name{ "color0" };
         hw::calibration_t calibration{};
         hw::frame_format_t color_format{ hw::frame_format_t::bgr8 }; // the layout every frame of this stream carries
-        hw::source_backend_t source_backend{};
-        std::string source_name{};
+
+        // The camera that produced the frames. A reader hands the backend back on every stream.
+        hw::sensor_backend_t sensor_backend{};
+        std::string device_serial{}; // empty when unknown
+
         std::optional<double> exposure_us{}; // nullopt = the camera was left on auto
         std::optional<double> gain{};
     };
@@ -68,13 +76,14 @@ namespace io
         [[nodiscard]] bool is_opened() const noexcept { return _writer != nullptr; }
         void close() noexcept; // idempotent; stats() stays readable afterwards
 
-        // Registers a new camera stream. Call before write_frame().
-        [[nodiscard]] std::optional<stream_id_t> add_camera_stream(const camera_stream_info_t& info) noexcept;
+        // Registers a new camera stream and returns its `stream_idx`. Call before write_frame().
+        // Registration order is the index (stream_name_of()), so register streams in index order.
+        [[nodiscard]] std::optional<std::size_t> add_camera_stream(const camera_stream_info_t& info) noexcept;
 
         // Write a frame to the given stream.
         // Fails if the image is not in the layout the stream was registered with.
         [[nodiscard]] bool write_frame(
-            stream_id_t stream_id,
+            std::size_t stream_idx,
             const cv::Mat& image,
             hw::timestamp_t timestamp // the recording's time axis; seeking and playback pacing run on it
         ) noexcept;

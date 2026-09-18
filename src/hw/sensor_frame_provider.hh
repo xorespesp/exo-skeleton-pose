@@ -52,7 +52,6 @@ namespace hw
 
         void close();
 
-        source_backend_t get_source_backend() const;
         const std::string& get_source_name() const;
 
         // 열린 소스가 내는 스트림 수. 아무것도 안 열려 있으면 0.

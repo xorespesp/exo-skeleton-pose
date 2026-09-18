@@ -156,7 +156,7 @@ namespace net
     } // namespace
 
     // --- implementation --------------------------------------------------------------
-    struct exo_pose_server::impl_t
+    struct exo_pose_server::impl
     {
         app::app_config_t config; // the installation this server serves
 
@@ -164,7 +164,7 @@ namespace net
         exo_pose_pipeline pipeline; // source + detection + estimator
         size_t client_count{ 0 };   // connected clients; source released when it hits 0
 
-        impl_t(
+        impl(
             const app::app_config_t& cfg, 
             bool annotate)
             : config{ cfg }
@@ -176,7 +176,7 @@ namespace net
     exo_pose_server::exo_pose_server(
         const app::app_config_t& config, 
         bool annotate_frames)
-        : _imp{ std::make_unique<impl_t>(config, annotate_frames) }
+        : _imp{ std::make_unique<impl>(config, annotate_frames) }
     { }
 
     exo_pose_server::~exo_pose_server() {

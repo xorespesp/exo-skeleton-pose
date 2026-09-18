@@ -1,14 +1,18 @@
 #pragma once
 #include "hw/clock_anchor.hh"
 #include "hw/sensor_frame_source.hh"
+#include "hw/source_config.hh"
 
 #include <k4a/k4a.h>
 #include <k4a/k4a.hpp>
 #include <opencv2/core.hpp>
 
+#include <chrono>
+#include <cstddef>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace hw
 {
@@ -36,26 +40,19 @@ namespace hw
     // Live camera source.
     class k4a_device_capturer final : public sensor_frame_source {
     public:
-        // Manual color controls; nullopt leaves the camera on auto.
-        struct color_controls_t {
-            std::optional<int32_t> exposure_us; // manual exposure time [us]
-            std::optional<int32_t> gain; // manual gain
-        };
-
         k4a_device_capturer() = default;
         ~k4a_device_capturer() override;
+        
+        [[nodiscard]] static std::vector<device_info_t> enumerate();
 
-        [[nodiscard]] bool open(
-            uint32_t device_index,
-            const color_controls_t& controls = {},
-            frame_format_t frame_format = frame_format_t::bgr8 // what delivered frames carry
-        ) noexcept;
-
+        [[nodiscard]] bool open(const k4a_device_config_t& config) noexcept;
         bool is_valid() const override;
         void close() override;
 
+        const std::string& get_device_serial() const { return _serialnum; }
         const calibration_t& get_calibration() const override { return _calib; }
         frame_format_t get_frame_format() const override { return _frame_format; }
+        stream_descriptor_t get_stream_descriptor() const override;
 
         // NOTE: The k4a device supports no hardware ROI, so this is a software crop.
         std::optional<roi_t> try_set_roi(const roi_t& roi) override;
@@ -70,7 +67,10 @@ namespace hw
         std::string _serialnum;
         frame_format_t _frame_format{ frame_format_t::bgr8 };
         std::optional<roi_t> _roi; // nullopt: whole frames
-        clock_anchor_t _clock_anchor;    // maps the device clock onto Unix time
+
+        // 카메라의 캡처 클럭을 Unix 시각으로 옮기는 앵커. warmup 동안 offset 의 최솟값을 모은 뒤 초기화 수행.
+        std::optional<clock_anchor_t> _clock_anchor;
+        std::size_t _clock_warmup_samples{ 0 };
     };
 
 } // namespace hw

@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <optional>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -120,7 +121,7 @@ int main(int argc, char** argv) try
     // A .mkv carries device timestamps and no wall clock, and the playback API exposes no
     // capture date, so the frames are anchored at the moment of conversion. Their spacing is
     // exact; their absolute times say when this file was made, matching `create_timestamp`.
-    hw::clock_anchor_t clock_anchor;
+    std::optional<hw::clock_anchor_t> clock_anchor;
 
     uint64_t frames = 0;
     uint64_t skipped = 0;
@@ -139,7 +140,9 @@ int main(int argc, char** argv) try
 
         // Whole frames, in the layout the stream was registered with.
         const cv::Mat bgr = hw::k4a_color_to_mat(color, hw::frame_format_t::bgr8, std::nullopt);
-        const auto ts = clock_anchor.to_unix(color.get_device_timestamp());
+        const std::chrono::nanoseconds device_ts = color.get_device_timestamp();
+        if (!clock_anchor.has_value()) { clock_anchor.emplace(device_ts); }
+        const hw::timestamp_t ts = clock_anchor->to_unix(device_ts);
         if (!writer.write_frame(*stream, bgr, ts)) {
             spdlog::error("failed to write frame {}", frames);
             return 1;

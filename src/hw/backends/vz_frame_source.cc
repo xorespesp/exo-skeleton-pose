@@ -7,11 +7,15 @@
 #include <initializer_list>
 #include <optional>
 #include <string>
+#include <variant>
+#include <vector>
 
 namespace hw
 {
     namespace
     {
+        template <class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+
         // How long one capture may take before the provider is handed nothing and loops. Long
         // enough for a slow trigger, short enough that `close()` is never stuck behind a grab.
         constexpr uint32_t kGrabTimeoutMs = 500;
@@ -128,28 +132,59 @@ namespace hw
         this->close();
     }
 
+    std::vector<device_info_t> vz_frame_source::enumerate()
+    {
+        std::vector<device_info_t> found;
+        std::string err_msg;
+        const std::vector<vz::device_info_t> devices = vz::device::enumerate(kEnumerateTimeoutMs, &err_msg);
+        if (!err_msg.empty()) { spdlog::warn("vz: enumeration: {}", err_msg); }
+        for (uint32_t device_index = 0; device_index < devices.size(); ++device_index)
+        {
+            found.push_back(device_info_t{
+                .source_backend = source_backend_t::vz,
+                .device_index = device_index,
+                .device_serial = devices[device_index].serial,
+                .display_name = std::format("vz device #{} (S/N {})", device_index, devices[device_index].serial),
+            });
+        }
+        return found;
+    }
+
     bool vz_frame_source::open(const vz_device_config_t& config) noexcept try
     {
         std::scoped_lock lk{ _mtx };
 
-        // An index names a position in the enumeration, so the cameras have to be listed
-        // before it means anything. The order is the SDK's and moves as cameras come and go.
-        std::string err_msg;
-        const std::vector<vz::device_info_t> found = vz::device::enumerate(kEnumerateTimeoutMs, &err_msg);
-        if (found.empty()) {
-            spdlog::error("vz: no camera found{}{}", err_msg.empty() ? "" : ": ", err_msg);
-            return false;
-        }
-        if (config.device_index >= found.size()) {
-            spdlog::error("vz: camera #{} was asked for, but {} camera(s) are attached"
-                , config.device_index
-                , found.size()
-            );
-            return false;
-        }
+        // SDK 는 open 시 디바이스를 항상 시리얼값 기반으로 구분하므로, 인덱스 모드에서는 해당하는 시리얼을 찾는다.
+        const std::optional<std::string> serial = std::visit(overloaded{
+            [](const device_serial_t& by_serial) -> std::optional<std::string> { return by_serial.value; },
+            [](const device_index_t& by_index) -> std::optional<std::string>
+            {
+                std::string err_msg;
+                const std::vector<vz::device_info_t> found = vz::device::enumerate(kEnumerateTimeoutMs, &err_msg);
+                if (found.empty()) {
+                    spdlog::error("vz: no camera found{}{}", err_msg.empty() ? "" : ": ", err_msg);
+                    return std::nullopt;
+                }
+                if (by_index.value >= found.size()) {
+                    spdlog::error("vz: camera #{} was asked for, but {} camera(s) are attached"
+                        , by_index.value
+                        , found.size()
+                    );
+                    return std::nullopt;
+                }
+                if (found.size() > 1) {
+                    spdlog::warn("vz: opening camera #{} by its position among {} cameras; give a serial to pin it"
+                        , by_index.value
+                        , found.size()
+                    );
+                }
+                return found[by_index.value].serial;
+            },
+        }, config.device_selector);
+        if (!serial.has_value()) { return false; }
 
-        const std::string& serial = found[config.device_index].serial;
-        if (!_device.open(serial)) { return false; }
+        if (!_device.open(*serial)) { return false; }
+        _device_serial = *serial;
 
         _frame_format = config.frame_format;
         _device.set_frame_format(to_vz_format(_frame_format));
@@ -208,6 +243,27 @@ namespace hw
             }
         }
 
+        // 프레임 레이트.
+        // NOTE:
+        //   이 노드는 전원이 켜져 있는 동안 지난 세션의 값을 들고 있으므로, 값이 없을 때도 제한을 명시적으로 풀어 카메라 상한으로 프리런하게 한다. 
+        //   GenICam 은 켜고 끄는 노드를 두 가지 철자로 두므로, 카메라가 가진 쪽을 쓴다.
+        if (config.frame_rate_fps.has_value()) {
+            pin_enum_node_if_present(_device, "AcquisitionFrameRateMode", "On");
+            pin_bool_node_if_present(_device, "AcquisitionFrameRateEnable", true);
+            if (!_device.write_float("AcquisitionFrameRate", *config.frame_rate_fps)) {
+                spdlog::warn("vz: could not set the frame rate: {}", _device.last_err_msg());
+            }
+        } else {
+            pin_enum_node_if_present(_device, "AcquisitionFrameRateMode", "Off");
+            pin_bool_node_if_present(_device, "AcquisitionFrameRateEnable", false);
+        }
+        if (const std::optional<vz::float_feature_t> rate = _device.read_float("AcquisitionFrameRate")) {
+            spdlog::info("vz: frame rate {:.2f} fps (settable {:.2f}..{:.2f})", rate->value, rate->min, rate->max);
+        }
+        if (const std::optional<vz::float_feature_t> resulting = _device.read_float("ResultingFrameRate")) {
+            spdlog::info("vz: resulting frame rate {:.2f} fps after exposure and bandwidth", resulting->value);
+        }
+
         _calib = calibration_t{};
         _calib.frame_resolution = Eigen::Vector2i{ width, height };
 
@@ -232,7 +288,7 @@ namespace hw
         }
 
         spdlog::info("vz: camera '{}' ready ({}x{}, {}, intrinsics {})"
-            , serial
+            , _device_serial
             , width
             , height
             , frame_format_to_str(_frame_format)
@@ -250,6 +306,16 @@ namespace hw
     {
         std::scoped_lock lk{ _mtx };
         return _device.is_open();
+    }
+
+    stream_descriptor_t vz_frame_source::get_stream_descriptor() const
+    {
+        std::scoped_lock lk{ _mtx };
+        return stream_descriptor_t{
+            .stream_name = default_stream_name(0),
+            .device_serial = _device_serial,
+            .source_backend = source_backend_t::vz,
+        };
     }
 
     void vz_frame_source::close()
@@ -309,20 +375,43 @@ namespace hw
             return std::nullopt;
         }
 
-        std::optional<vz::captured_frame_t> captured = _device.grab_frame(kGrabTimeoutMs);
-        if (!captured.has_value() || captured->image.empty()) { return std::nullopt; }
+        // 이 캡처의 Unix 시각. 앵커가 서기 전의 캡처는 warmup 표본으로 쓰이고 비어 있는 값이 돌아온다.
+        const auto resolve_capture_timestamp = [this](const vz::captured_frame_t& captured) -> std::optional<timestamp_t>
+        {
+            // 캡처 클럭이 없으면 도착 시각이 전부이고, 호스트 스케줄링이 거기 드러난다.
+            if (!captured.device_timestamp.has_value()) {
+                return std::chrono::time_point_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now());
+            }
 
-        // The camera's clock is smooth but has an epoch of its own; the anchor lifts it onto
-        // Unix time without touching the spacing between frames. Where the camera offers no
-        // clock, arrival time is all there is and the host's scheduling shows up in it.
-        const timestamp_t timestamp = captured->device_timestamp.has_value()
-            ? _clock_anchor.to_unix(*captured->device_timestamp)
-            : std::chrono::time_point_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now());
+            if (_clock_warmup_samples < kClockWarmupSamples)
+            {
+                // 표본 중 offset 이 가장 작은 앵커가 남는다.
+                const clock_anchor_t candidate{ *captured.device_timestamp };
+                if (!_clock_anchor.has_value() || candidate.offset() < _clock_anchor->offset()) { _clock_anchor = candidate; }
+                ++_clock_warmup_samples;
+                return std::nullopt;
+            }
+
+            // 카메라 클럭은 매끄럽지만 epoch 이 제 것이라, 앵커가 프레임 간격은 건드리지 않고 Unix 시각으로 올린다.
+            return _clock_anchor->to_unix(*captured.device_timestamp);
+        };
+
+        // 시각을 받은 캡처가 나올 때까지 받는다.
+        std::optional<vz::captured_frame_t> captured;
+        std::optional<timestamp_t> timestamp;
+        do
+        {
+            captured = _device.grab_frame(kGrabTimeoutMs);
+            if (!captured.has_value() || captured->image.empty()) { return std::nullopt; }
+
+            timestamp = resolve_capture_timestamp(*captured);
+        }
+        while (!timestamp.has_value());
 
         return sensor_frameset{ std::make_shared<sensor_frame>(
             std::move(captured->image),
             _frame_format,
-            timestamp
+            *timestamp
         ) };
     }
 

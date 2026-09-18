@@ -5,14 +5,19 @@
 
 #include "hw/calibration.hh"
 #include "hw/frame_format.hh"
+#include "hw/sensor_frame.hh"
 #include "hw/timestamp.hh"
 
 #include <opencv2/core.hpp>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace pose
@@ -270,6 +275,68 @@ namespace pose
             cv::Mat mask, score; // empty while `_publish_debug_images` is off
         };
         latest_value_latch<color_frame_t> _latch;
+    };
+
+    // ---------------------------------------------------------------------------
+    // Tracker thread: runs one tracker off the thread that delivers frames
+    // ---------------------------------------------------------------------------
+    //
+    // 프레임은 newest-wins 로 넘어온다: 트래커가 아직 못 본 프레임이 있는데 새 프레임이 오면 그것으로
+    // 대체된다. 그래서 프레임을 주는 쪽(provider 의 폴링 스레드)은 트래커가 얼마나 느리든 막히지 않고,
+    // 트래커는 언제나 가장 새로운 프레임을 본다. 검출이 프레임 주기보다 오래 걸리면 처리율이 그만큼
+    // 내려갈 뿐, 오래된 프레임을 쌓아 두고 뒤따라가는 일은 없다.
+    //
+    // `marker_tracker_base` 가 "프레임 스레드"라 부르는 쪽이 이 스레드다. 측정치 읽기는 그 계약대로
+    // 다른 한 스레드(추정기 스레드)가 `tracker()` 를 통해 한다.
+    class tracker_thread final
+    {
+    public:
+        struct stats_t
+        {
+            uint64_t frames_submitted{ 0 };
+            uint64_t frames_processed{ 0 };
+            uint64_t frames_dropped{ 0 };   // 처리되기 전에 더 새로운 프레임에 밀린 것
+            double last_process_ms{ 0.0 };
+            double process_ms_ema{ 0.0 };
+            float process_rate_fps{ 0.0f }; // EMA
+        };
+
+        // `annotate` 가 켜져 있으면 처리한 프레임마다 검출을 그린 BGR 사본을 남긴다.
+        tracker_thread(std::shared_ptr<marker_tracker_base> tracker, bool annotate);
+        ~tracker_thread();
+
+        tracker_thread(const tracker_thread&) = delete;
+        tracker_thread& operator=(const tracker_thread&) = delete;
+
+        marker_tracker_base& tracker() noexcept { return *_tracker; }
+        const marker_tracker_base& tracker() const noexcept { return *_tracker; }
+
+        // 다음 처리 대상. 아직 처리 못 한 것이 있으면 그것을 대체한다. 어느 스레드에서든 부를 수 있다.
+        void submit(std::shared_ptr<hw::sensor_frame> frame);
+
+        // 마지막으로 처리된 프레임의 어노테이트 사본과 원본. 지난 호출 뒤 새로 처리된 것이 있을 때만 true.
+        bool try_take_annotated(cv::Mat& annotated, cv::Mat& source, uint64_t& frame_id);
+
+        stats_t stats() const;
+
+    private:
+        void _run(std::stop_token stop);
+
+        std::shared_ptr<marker_tracker_base> _tracker;
+        const bool _annotate;
+
+        mutable std::mutex _mtx;
+        std::condition_variable_any _cv;
+        std::shared_ptr<hw::sensor_frame> _pending;
+        cv::Mat _annotated;
+        cv::Mat _source;
+        uint64_t _annotated_frame_id{ 0 };
+        bool _annotated_unread{ false };
+        stats_t _stats;
+        std::chrono::steady_clock::time_point _last_processed_at{};
+        bool _have_last_processed_at{ false };
+
+        std::jthread _thread; // 마지막에 선언: 위의 것들이 사라지기 전에 join 된다
     };
 
 } // namespace pose

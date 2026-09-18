@@ -5,11 +5,62 @@
 
 #include <spdlog/spdlog.h>
 
+#include <format>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace hw
 {
+    namespace
+    {
+        template <class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+
+        // SDK 가 붙이는 널 종단을 떼고 돌려준다. 읽지 못하면 비어 있다.
+        std::string read_serialnum(k4a_device_t device)
+        {
+            std::string serialnum;
+            size_t needed = 0;
+            if (::k4a_device_get_serialnum(device, nullptr, &needed) == K4A_BUFFER_RESULT_TOO_SMALL && needed > 1)
+            {
+                serialnum.resize(needed);
+                if (::k4a_device_get_serialnum(device, &serialnum[0], &needed) == K4A_BUFFER_RESULT_SUCCEEDED
+                    && !serialnum.empty() && serialnum.back() == '\0')
+                {
+                    serialnum.pop_back();
+                }
+                else
+                {
+                    serialnum.clear();
+                }
+            }
+            return serialnum;
+        }
+
+        ::k4a_wired_sync_mode_t to_sdk_wired_sync_mode(const k4a_sync_role_t role)
+        {
+            switch (role) {
+            case k4a_sync_role_t::master:      return K4A_WIRED_SYNC_MODE_MASTER;
+            case k4a_sync_role_t::subordinate: return K4A_WIRED_SYNC_MODE_SUBORDINATE;
+            case k4a_sync_role_t::standalone:  break;
+            }
+            return K4A_WIRED_SYNC_MODE_STANDALONE;
+        }
+
+        const char* sync_role_name(const k4a_sync_role_t role)
+        {
+            switch (role) {
+            case k4a_sync_role_t::master:      return "master";
+            case k4a_sync_role_t::subordinate: return "subordinate";
+            case k4a_sync_role_t::standalone:  break;
+            }
+            return "standalone";
+        }
+    } // namespace
+
     // Copy the color camera parameters into the SDK-agnostic calibration_t.
     calibration_t k4a_to_calibration(const k4a_calibration_t& k4a_calib)
     {
@@ -97,35 +148,86 @@ namespace hw
         this->close();
     }
 
-    bool k4a_device_capturer::open(
-        const uint32_t device_index,
-        const color_controls_t& controls,
-        const frame_format_t frame_format) noexcept try
+    std::vector<device_info_t> k4a_device_capturer::enumerate()
+    {
+        std::vector<device_info_t> found;
+        const uint32_t count = ::k4a_device_get_installed_count();
+        for (uint32_t device_index = 0; device_index < count; ++device_index)
+        {
+            device_info_t info{
+                .source_backend = source_backend_t::k4a,
+                .device_index = device_index,
+            };
+
+            // 시리얼은 열어야 읽힌다. 이미 열려 있는 장치는 열리지 않으므로 인덱스만 남는다.
+            k4a_device_t device = nullptr;
+            if (K4A_SUCCEEDED(::k4a_device_open(device_index, &device)))
+            {
+                info.device_serial = read_serialnum(device);
+                ::k4a_device_close(device);
+            }
+
+            info.display_name = info.device_serial.empty()
+                ? std::format("k4a device #{}", device_index)
+                : std::format("k4a device #{} (S/N {})", device_index, info.device_serial);
+            found.push_back(std::move(info));
+        }
+        return found;
+    }
+
+    bool k4a_device_capturer::open(const k4a_device_config_t& config) noexcept try
     {
         std::scoped_lock lk{ _mtx };
         if (_device) { throw std::runtime_error{ "k4a_device_capturer: already opened" }; }
 
-        k4a_device_configuration_t config = K4A_DEVICE_CONFIG_INIT_DISABLE_ALL;
-        config.camera_fps = K4A_FRAMES_PER_SECOND_30;
-        config.color_format = K4A_IMAGE_FORMAT_COLOR_BGRA32;
-        config.color_resolution = K4A_COLOR_RESOLUTION_1080P;
-        config.depth_mode = K4A_DEPTH_MODE_OFF; // RGB only
-        config.synchronized_images_only = false; // no depth to sync with
+        k4a_device_configuration_t device_config = K4A_DEVICE_CONFIG_INIT_DISABLE_ALL;
+        device_config.camera_fps = K4A_FRAMES_PER_SECOND_30;
+        device_config.color_format = K4A_IMAGE_FORMAT_COLOR_BGRA32;
+        device_config.color_resolution = K4A_COLOR_RESOLUTION_1080P;
+        device_config.depth_mode = K4A_DEPTH_MODE_OFF; // RGB only
+        device_config.synchronized_images_only = false; // no depth to sync with
 
-        k4a_device_t device = nullptr;
-        if (K4A_FAILED(::k4a_device_open(device_index, &device))) {
-            throw std::runtime_error{ "k4a_device_capturer: failed to open device" };
-        }
+        // 유선 싱크. subordinate 의 지연은 그 역할에서만 의미를 가지고, SDK 도 그때만 받는다.
+        device_config.wired_sync_mode = to_sdk_wired_sync_mode(config.wired_sync_mode);
+        device_config.subordinate_delay_off_master_usec =
+            (config.wired_sync_mode == k4a_sync_role_t::subordinate) ? config.subordinate_delay_off_master_usec : 0;
+
+        std::string serialnum;
+        const k4a_device_t device = std::visit(overloaded{
+            [&serialnum](const device_index_t& by_index)
+            {
+                k4a_device_t opened = nullptr;
+                if (K4A_FAILED(::k4a_device_open(by_index.value, &opened))) {
+                    throw std::runtime_error{ "k4a_device_capturer: failed to open device" };
+                }
+                serialnum = read_serialnum(opened);
+                return opened;
+            },
+            [&serialnum](const device_serial_t& by_serial)
+            {
+                // C API 는 인덱스로만 열리므로 하나씩 열어 시리얼을 맞춰 본다.
+                const uint32_t count = ::k4a_device_get_installed_count();
+                for (uint32_t device_index = 0; device_index < count; ++device_index)
+                {
+                    k4a_device_t candidate = nullptr;
+                    if (K4A_FAILED(::k4a_device_open(device_index, &candidate))) { continue; }
+                    serialnum = read_serialnum(candidate);
+                    if (serialnum == by_serial.value) { return candidate; }
+                    ::k4a_device_close(candidate);
+                }
+                throw std::runtime_error{ std::format("k4a_device_capturer: no device with serial '{}'", by_serial.value) };
+            },
+        }, config.device_selector);
 
         k4a_calibration_t k4a_calib{};
         if (K4A_FAILED(::k4a_device_get_calibration(
-            device, config.depth_mode, config.color_resolution, &k4a_calib)))
+            device, device_config.depth_mode, device_config.color_resolution, &k4a_calib)))
         {
             ::k4a_device_close(device);
             throw std::runtime_error{ "k4a_device_capturer: failed to get calibration" };
         }
 
-        if (K4A_FAILED(::k4a_device_start_cameras(device, &config))) {
+        if (K4A_FAILED(::k4a_device_start_cameras(device, &device_config))) {
             ::k4a_device_close(device);
             throw std::runtime_error{ "k4a_device_capturer: failed to start cameras" };
         }
@@ -145,35 +247,22 @@ namespace hw
                 spdlog::info("k4a: auto {}", name);
             }
         };
-        apply_color_control(K4A_COLOR_CONTROL_EXPOSURE_TIME_ABSOLUTE, controls.exposure_us, "exposure");
-        apply_color_control(K4A_COLOR_CONTROL_GAIN, controls.gain, "gain");
-
-        // serial number (for logging; non-fatal if it fails)
-        std::string serialnum;
-        {
-            size_t needed = 0;
-            if (::k4a_device_get_serialnum(device, nullptr, &needed) == K4A_BUFFER_RESULT_TOO_SMALL && needed > 1) {
-                serialnum.resize(needed);
-                if (::k4a_device_get_serialnum(device, &serialnum[0], &needed) == K4A_BUFFER_RESULT_SUCCEEDED
-                    && !serialnum.empty() && serialnum.back() == '\0') {
-                    // std::string expects there to not be as null terminator at the end of its data but
-                    // k4a_device_get_serialnum adds a null terminator, so we drop the last character of the string after we
-                    // get the result back.
-                    serialnum.pop_back();
-                }
-            }
-        }
+        apply_color_control(K4A_COLOR_CONTROL_EXPOSURE_TIME_ABSOLUTE, config.exposure_us, "exposure");
+        apply_color_control(K4A_COLOR_CONTROL_GAIN, config.gain, "gain");
 
         _device = device;
-        _config = config;
+        _config = device_config;
         _calib = k4a_to_calibration(k4a_calib);
         _serialnum = std::move(serialnum);
-        _frame_format = frame_format;
+        _frame_format = config.frame_format;
         _roi.reset();
+        _clock_anchor.reset();
+        _clock_warmup_samples = 0;
 
-        spdlog::info("k4a device opened (S/N: {}, {})"
+        spdlog::info("k4a device opened (S/N: {}, {}, sync {})"
             , _serialnum.empty() ? "<unknown>" : _serialnum
             , frame_format_to_str(_frame_format)
+            , sync_role_name(config.wired_sync_mode)
         );
         return true;
     }
@@ -187,6 +276,16 @@ namespace hw
     {
         std::scoped_lock lk{ _mtx };
         return _device != nullptr;
+    }
+
+    stream_descriptor_t k4a_device_capturer::get_stream_descriptor() const
+    {
+        std::scoped_lock lk{ _mtx };
+        return stream_descriptor_t{
+            .stream_name = default_stream_name(0),
+            .device_serial = _serialnum,
+            .source_backend = source_backend_t::k4a,
+        };
     }
 
     void k4a_device_capturer::close()
@@ -219,33 +318,69 @@ namespace hw
         std::scoped_lock lk{ _mtx };
         if (!_device) { return std::nullopt; }
 
-        k4a_capture_t capture_handle = nullptr;
-        const k4a_wait_result_t wait_result = ::k4a_device_get_capture(
-            _device,
-            &capture_handle,
-            1000 /* ms; finite so the polling thread can wake for join */
-        );
+        // 다음 컬러 이미지를 기다린다. 타임아웃이면 비어 있다.
+        const auto wait_color_image = [this]() -> std::optional<k4a::image>
+        {
+            k4a::image color;
+            do
+            {
+                k4a_capture_t capture_handle = nullptr;
+                const k4a_wait_result_t wait_result = ::k4a_device_get_capture(
+                    _device,
+                    &capture_handle,
+                    1000 /* ms; finite so the polling thread can wake for join */
+                );
 
-        if (wait_result == K4A_WAIT_RESULT_FAILED) {
-            throw std::runtime_error{ "k4a_device_capturer: failed to get capture" };
-        }
-        if (wait_result == K4A_WAIT_RESULT_TIMEOUT) {
-            return std::nullopt; // provider retries
-        }
+                if (wait_result == K4A_WAIT_RESULT_FAILED) {
+                    throw std::runtime_error{ "k4a_device_capturer: failed to get capture" };
+                }
+                if (wait_result == K4A_WAIT_RESULT_TIMEOUT) {
+                    return std::nullopt; // provider retries
+                }
 
-        const k4a::capture capture{ capture_handle };
-        if (!capture.is_valid()) { return std::nullopt; }
+                const k4a::capture capture{ capture_handle };
+                if (!capture.is_valid()) { return std::nullopt; }
 
-        const k4a::image color = capture.get_color_image();
-        if (!color.is_valid() || color.get_size() == 0) {
-            return sensor_frameset{ nullptr }; // a capture without colour; the provider drops it
+                color = capture.get_color_image();
+            }
+            while (!color.is_valid() || color.get_size() == 0); // 컬러 없는 캡처(depth 만 온 것)는 넘긴다
+
+            return color;
+        };
+
+        // 이 캡처의 Unix 시각. 앵커가 서기 전의 캡처는 warmup 표본으로 쓰이고 비어 있는 값이 돌아온다.
+        const auto resolve_capture_timestamp = [this](const k4a::image& color) -> std::optional<timestamp_t>
+        {
+            const std::chrono::nanoseconds device_ts = color.get_device_timestamp();
+            if (_clock_warmup_samples < kClockWarmupSamples)
+            {
+                // 표본 중 offset 이 가장 작은 앵커가 남는다.
+                const clock_anchor_t candidate{ device_ts };
+                if (!_clock_anchor.has_value() || candidate.offset() < _clock_anchor->offset()) { _clock_anchor = candidate; }
+                ++_clock_warmup_samples;
+                return std::nullopt;
+            }
+
+            return _clock_anchor->to_unix(device_ts);
+        };
+
+        // 시각을 받은 캡처가 나올 때까지 받는다.
+        std::optional<k4a::image> color;
+        std::optional<timestamp_t> timestamp;
+        do
+        {
+            color = wait_color_image();
+            if (!color.has_value()) { return std::nullopt; }
+
+            timestamp = resolve_capture_timestamp(*color);
         }
+        while (!timestamp.has_value());
 
         // Make a new sensor frameset and return it. (deep copied)
         return sensor_frameset{ std::make_shared<sensor_frame>(
-            k4a_color_to_mat(color, _frame_format, _roi),
+            k4a_color_to_mat(*color, _frame_format, _roi),
             _frame_format,
-            _clock_anchor.to_unix(color.get_device_timestamp())
+            *timestamp
         ) };
     }
 

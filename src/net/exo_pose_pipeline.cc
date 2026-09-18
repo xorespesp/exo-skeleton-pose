@@ -1,12 +1,13 @@
 ﻿#include "exo_pose_pipeline.hh"
 
-#include "hw/sensor_frame_observer.hh"
+#include "hw/frameset_observer.hh"
 #include "io/calibration_io.hh"
 
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <cstddef>
 #include <filesystem>
 #include <format>
 #include <mutex>
@@ -19,6 +20,9 @@ namespace net
     {
         // How often poll() summarizes throughput while a source streams.
         constexpr auto kStatsInterval = std::chrono::seconds{ 5 };
+
+        // 파이프라인은 열린 소스의 스트림 하나만 읽는다.
+        constexpr std::size_t kPoseStreamIdx = 0;
 
         // The camera controls arrive as integers;
         // the VZ camera states its exposure and gain in fractional units.
@@ -48,13 +52,14 @@ namespace net
     // Runs the tracker over each arriving frame and latches the annotated image for a monitor GUI.
     // What detection means and what it produces are the tracker's business, which the tracker
     // publishes to the loop thread itself; this class holds no knowledge of any marker technology.
-    class pose_frame_observer final : public hw::sensor_frame_observer
+    class pose_frame_observer final : public hw::single_stream_frameset_observer
     {
     public:
         pose_frame_observer(
             std::shared_ptr<pose::marker_tracker_base> tracker, 
             bool annotate)
-            : _tracker{ std::move(tracker) }
+            : hw::single_stream_frameset_observer{ kPoseStreamIdx }
+            , _tracker{ std::move(tracker) }
             , _annotate{ annotate }
         { }
 
@@ -96,8 +101,10 @@ namespace net
         }
 
     public:
-        void on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& frame) override
+        void on_sensor_frameset_update(const hw::sensor_frameset& new_frameset) override
         {
+            const std::shared_ptr<hw::sensor_frame>& frame = new_frameset.frame();
+
             // The canvas is technology-independent, so it is prepared here and handed over to be
             // drawn on. Detection publishes itself; nothing comes back to be latched.
             cv::Mat annotated;
@@ -215,7 +222,7 @@ namespace net
         if (source_addr.is_k4a_device())
         {
             source_config = hw::k4a_device_config_t{
-                .device_index = source_addr.k4a_device_index(),
+                .device_selector = hw::device_index_t{ source_addr.k4a_device_index() },
                 .exposure_us = exposure_us,
                 .gain = gain,
                 .frame_format = kCameraFrameFormat,
@@ -225,7 +232,7 @@ namespace net
         else if (source_addr.is_vz_device())
         {
             hw::vz_device_config_t vz{
-                .device_index = source_addr.vz_device_index(),
+                .device_selector = hw::device_index_t{ source_addr.vz_device_index() },
                 .exposure_us = to_optional_double(exposure_us),
                 .gain = to_optional_double(gain),
                 .frame_format = kCameraFrameFormat,
@@ -284,7 +291,7 @@ namespace net
 
         // Read now because only an opened source reports them.
         std::optional<hw::intrinsic_t> intrinsics = pose_solve_intrinsics(
-            view_plane, new_provider->get_calibration()
+            view_plane, new_provider->get_calibration(kPoseStreamIdx)
         );
 
         if (view_plane == pose::view_plane_t::frontal && !intrinsics.has_value())
@@ -310,7 +317,7 @@ namespace net
 
             // The blob gates are counted in pixels, so they only mean what they meant if a marker
             // still covers as many of them. A different frame size moves every one of them at once.
-            if (const Eigen::Vector2i frame_resolution = new_provider->get_frame_resolution();
+            if (const Eigen::Vector2i frame_resolution = new_provider->get_frame_resolution(kPoseStreamIdx);
                 calibration.has_value() && calibration->frame_resolution != frame_resolution)
             {
                 spdlog::warn("pipeline: the color was measured on {}x{} frames but this source "
@@ -358,7 +365,7 @@ namespace net
         _active->reset_tracking();  // and its position filters/held points must not carry over
         _frame_log.reset();
 
-        const auto res = _provider->get_frame_resolution();
+        const auto res = _provider->get_frame_resolution(kPoseStreamIdx);
         spdlog::info("pipeline: {} '{}' opened ({}x{} color, {} estimator); rest pose cleared, awaiting first frame",
             kind, _provider->get_source_name(), res.x(), res.y(), pose::view_plane_name(_view_plane));
         return true;
@@ -371,7 +378,7 @@ namespace net
         _status_changed = true;
         spdlog::info("pipeline: closing source '{}' after {} frames"
             , _provider->get_source_name()
-            , _provider->get_current_frame_seq()
+            , _provider->get_current_frameset_seq()
         );
 
         this->stop_recording();
@@ -409,8 +416,8 @@ namespace net
 
         const io::camera_stream_info_t color_stream_info{
             .stream_name = "color0", // first color stream
-            .calibration = _provider->get_calibration(),
-            .color_format = _provider->get_frame_format(),
+            .calibration = _provider->get_calibration(kPoseStreamIdx),
+            .color_format = _provider->get_frame_format(kPoseStreamIdx),
             .source_backend = _provider->get_source_backend(),
             .source_name = _provider->get_source_name(),
             .exposure_us = _exposure_us,
@@ -587,7 +594,7 @@ namespace net
                 // it was in before, which is why an estimator working in metres loses nothing.
                 if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(_tracker.get())) {
                     tag_tracker->set_intrinsics(
-                        _provider ? pose_solve_intrinsics(_view_plane, _provider->get_calibration())
+                        _provider ? pose_solve_intrinsics(_view_plane, _provider->get_calibration(kPoseStreamIdx))
                                   : std::nullopt);
                 }
 
@@ -741,17 +748,17 @@ namespace net
 
     Eigen::Vector2i exo_pose_pipeline::source_resolution() const
     {
-        return _provider ? _provider->get_frame_resolution() : Eigen::Vector2i::Zero();
+        return _provider ? _provider->get_frame_resolution(kPoseStreamIdx) : Eigen::Vector2i::Zero();
     }
 
     Eigen::Vector2i exo_pose_pipeline::source_full_resolution() const
     {
-        return _provider ? _provider->get_full_frame_resolution() : Eigen::Vector2i::Zero();
+        return _provider ? _provider->get_full_frame_resolution(kPoseStreamIdx) : Eigen::Vector2i::Zero();
     }
 
     std::optional<hw::roi_t> exo_pose_pipeline::effective_roi() const
     {
-        return _provider ? _provider->get_effective_roi() : std::nullopt;
+        return _provider ? _provider->get_effective_roi(kPoseStreamIdx) : std::nullopt;
     }
 
     void exo_pose_pipeline::set_roi(const std::optional<hw::roi_t>& roi)
@@ -764,12 +771,12 @@ namespace net
             spdlog::error("pipeline: cannot move the ROI while a recording is being written");
             return;
         }
-        _provider->set_roi(roi);
+        _provider->set_roi(kPoseStreamIdx, roi);
     }
 
     float exo_pose_pipeline::source_fps() const
     {
-        return _provider ? _provider->get_current_update_rate() : 0.0f;
+        return _provider ? _provider->get_current_update_rate(kPoseStreamIdx) : 0.0f;
     }
 
     std::optional<hw::intrinsic_t> exo_pose_pipeline::intrinsics() const
@@ -777,12 +784,12 @@ namespace net
         // Color intrinsics of the open source; lets a diagnostic dump reproject
         // corners independently of whatever the pipeline computed.
         if (!_provider || !_provider->is_opened()) { return std::nullopt; }
-        return _provider->get_calibration().intrinsic;
+        return _provider->get_calibration(kPoseStreamIdx).intrinsic;
     }
 
     uint32_t exo_pose_pipeline::current_frame_seq() const
     {
-        return _provider ? _provider->get_current_frame_seq() : 0;
+        return _provider ? _provider->get_current_frameset_seq() : 0;
     }
 
     bool exo_pose_pipeline::is_source_paused() const

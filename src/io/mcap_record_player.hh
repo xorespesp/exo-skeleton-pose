@@ -1,35 +1,39 @@
-#pragma once
+﻿#pragma once
 #include "recording_reader.hh"
 
 #include "hw/sensor_frame_source.hh"
 
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <mutex>
+#include <span>
+#include <vector>
 
 namespace io
 {
     // Playback source for our own recordings. (SDK-agnostic)
-    class mcap_record_player final : public hw::record_player_source {
+    class mcap_record_player final
+        : public hw::record_player_source
+        , public std::enable_shared_from_this<mcap_record_player>
+    {
+    private:
+        class recording_stream_impl;
+
     public:
-        mcap_record_player() = default;
+        [[nodiscard]] static std::shared_ptr<mcap_record_player> create();
         ~mcap_record_player() override;
+
+        mcap_record_player(const mcap_record_player&) = delete;
+        mcap_record_player& operator=(const mcap_record_player&) = delete;
 
         // Fails if the file is not one of our recordings, or carries no camera stream.
         [[nodiscard]] bool open(const std::filesystem::path& recording_file) noexcept;
 
-        bool is_valid() const override;
-        void close() override;
+        bool is_opened() const;
+        void close();
 
-        const hw::calibration_t& get_calibration() const override { return _calib; }
-
-        hw::frame_format_t get_frame_format() const override { return _frame_format; }
-
-        // A recording holds whole frames, so this is a software crop.
-        std::optional<hw::roi_t> try_set_roi(const hw::roi_t& roi) override;
-
-        [[nodiscard]] std::optional<hw::sensor_frameset> fetch_next_sensor_frameset() override;
-
+        std::span<const std::shared_ptr<hw::sensor_frame_source>> get_recording_streams() const override { return _recording_streams; }
         std::chrono::nanoseconds get_recording_length() const override { return _last_timestamp - _first_timestamp; }
         hw::timestamp_t get_first_record_timestamp() const override { return _first_timestamp; }
         hw::timestamp_t get_last_record_timestamp() const override { return _last_timestamp; }
@@ -39,13 +43,13 @@ namespace io
         void seek_timestamp(hw::timestamp_t timestamp) override;
 
     private:
+        mcap_record_player() = default;
+
+    private:
         mutable std::mutex _mtx;
         recording_reader _reader;
         bool _opened{ false };
-        stream_id_t _stream_id{ 0 }; // the camera stream being played back
-        hw::calibration_t _calib{};
-        hw::frame_format_t _frame_format{};
-        std::optional<hw::roi_t> _roi; // nullopt: whole frames
+        std::vector<std::shared_ptr<hw::sensor_frame_source>> _recording_streams; // 파일의 순서대로
         hw::timestamp_t _first_timestamp{};
         hw::timestamp_t _last_timestamp{};
     };

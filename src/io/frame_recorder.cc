@@ -1,4 +1,4 @@
-#include "frame_recorder.hh"
+﻿#include "frame_recorder.hh"
 
 #include <spdlog/spdlog.h>
 
@@ -8,10 +8,16 @@
 
 namespace io
 {
+    namespace
+    {
+        constexpr std::size_t kRecordStreamIdx = 0; // 녹화하는 스트림
+    }
+
     frame_recorder::frame_recorder(
         const recording_options_t& options, 
         const size_t queue_depth)
-        : _queue_depth{ std::max<size_t>(1, queue_depth) }
+        : hw::single_stream_frameset_observer{ kRecordStreamIdx }
+        , _queue_depth{ std::max<size_t>(1, queue_depth) }
         , _writer{ options }
     { }
 
@@ -91,10 +97,12 @@ namespace io
         }
     }
 
-    void frame_recorder::on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& new_sensor_frame)
+    void frame_recorder::on_sensor_frameset_update(const hw::sensor_frameset& new_frameset)
     {
         if (!_is_started.load(std::memory_order_relaxed)) { return; }
-        if (!new_sensor_frame || new_sensor_frame->image().empty()) { return; }
+
+        const std::shared_ptr<hw::sensor_frame>& new_sensor_frame = new_frameset.frame();
+        if (new_sensor_frame->image().empty()) { return; }
 
         {
             std::scoped_lock lk{ _mtx };

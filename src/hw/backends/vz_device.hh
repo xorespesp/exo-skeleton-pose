@@ -188,8 +188,8 @@ namespace vz
         std::string last_err_msg() const;
 
     private:
-        struct impl_t;
-        std::unique_ptr<impl_t> _impl;
+        struct impl;
+        std::unique_ptr<impl> _imp;
     };
 
 } // namespace vz

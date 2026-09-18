@@ -1,7 +1,10 @@
 ﻿#include "marker_tracker.hh"
 
+#include <opencv2/imgproc.hpp>
+
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <format>
 #include <utility>
 
@@ -9,6 +12,8 @@ namespace pose
 {
     namespace
     {
+        constexpr double kEmaAlpha = 0.1; // `tracker_thread` 통계에서 최신 표본의 가중치
+
         // Tag ids beyond this are still detected and bound; they just fall out of the
         // appeared/disappeared bookkeeping, which tracks visibility in a 64-bit mask.
         constexpr int kMaxLoggedTagId = 63;
@@ -336,6 +341,113 @@ namespace pose
         // A marker carries no identity of its own, so the assigner names it from where its
         // neighbours were last frame. Across a jump they were somewhere else entirely.
         _assigner.reset();
+    }
+
+    // ---------------------------------------------------------------------------
+    // tracker_thread
+    // ---------------------------------------------------------------------------
+
+    tracker_thread::tracker_thread(std::shared_ptr<marker_tracker_base> tracker, const bool annotate)
+        : _tracker{ std::move(tracker) }
+        , _annotate{ annotate }
+        , _thread{ [this](std::stop_token stop) { this->_run(stop); } }
+    { }
+
+    tracker_thread::~tracker_thread()
+    {
+        _thread.request_stop(); // 대기 중이면 stop_token 이 깨운다
+    }
+
+    void tracker_thread::submit(std::shared_ptr<hw::sensor_frame> frame)
+    {
+        if (!frame) { return; }
+        {
+            std::scoped_lock lk{ _mtx };
+            ++_stats.frames_submitted;
+            if (_pending) { ++_stats.frames_dropped; }
+            _pending = std::move(frame);
+        }
+        _cv.notify_one();
+    }
+
+    bool tracker_thread::try_take_annotated(cv::Mat& annotated, cv::Mat& source, uint64_t& frame_id)
+    {
+        std::scoped_lock lk{ _mtx };
+        if (!_annotated_unread) { return false; }
+        _annotated_unread = false;
+        annotated = _annotated; // 워커는 다음 프레임을 새 Mat 으로 옮겨 넣으므로 얕은 공유가 안전하다
+        source = _source;
+        frame_id = _annotated_frame_id;
+        return true;
+    }
+
+    tracker_thread::stats_t tracker_thread::stats() const
+    {
+        std::scoped_lock lk{ _mtx };
+        return _stats;
+    }
+
+    void tracker_thread::_run(const std::stop_token stop)
+    {
+        while (true)
+        {
+            std::shared_ptr<hw::sensor_frame> frame;
+            {
+                std::unique_lock lk{ _mtx };
+                _cv.wait(lk, stop, [&] { return _pending != nullptr; });
+                if (stop.stop_requested()) { return; }
+                frame = std::move(_pending);
+            }
+
+            // 캔버스는 기술과 무관하므로 여기서 준비해 넘긴다. 검출이 그 위에 그린다.
+            cv::Mat annotated;
+            if (_annotate)
+            {
+                if (frame->format() == hw::frame_format_t::gray8) {
+                    cv::cvtColor(frame->image(), annotated, cv::COLOR_GRAY2BGR);
+                } else {
+                    annotated = frame->image().clone();
+                }
+            }
+
+            const auto started = std::chrono::steady_clock::now();
+            _tracker->process_frame(
+                frame->image(),
+                frame->format(),
+                frame->timestamp(),
+                _annotate ? &annotated : nullptr
+            );
+            const auto finished = std::chrono::steady_clock::now();
+            const double process_ms = std::chrono::duration<double, std::milli>{ finished - started }.count();
+
+            std::scoped_lock lk{ _mtx };
+            ++_stats.frames_processed;
+            _stats.last_process_ms = process_ms;
+            _stats.process_ms_ema = (_stats.process_ms_ema <= 0.0)
+                ? process_ms
+                : (kEmaAlpha * process_ms + (1.0 - kEmaAlpha) * _stats.process_ms_ema);
+            if (_have_last_processed_at)
+            {
+                const double dt_sec = std::chrono::duration<double>{ finished - _last_processed_at }.count();
+                if (dt_sec > 1e-9)
+                {
+                    const float inst = static_cast<float>(1.0 / dt_sec);
+                    _stats.process_rate_fps = (_stats.process_rate_fps <= 0.0f)
+                        ? inst
+                        : static_cast<float>(kEmaAlpha * inst + (1.0 - kEmaAlpha) * _stats.process_rate_fps);
+                }
+            }
+            _last_processed_at = finished;
+            _have_last_processed_at = true;
+
+            if (_annotate)
+            {
+                _annotated = std::move(annotated);
+                _source = frame->image();
+                _annotated_frame_id = frame->id();
+                _annotated_unread = true;
+            }
+        }
     }
 
 } // namespace pose

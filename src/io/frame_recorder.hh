@@ -1,7 +1,7 @@
 #pragma once
 #include "recording_writer.hh"
 
-#include "hw/sensor_frame_observer.hh"
+#include "hw/frameset_observer.hh"
 
 #include <atomic>
 #include <condition_variable>
@@ -20,7 +20,7 @@ namespace io
     //
     // The queue is bounded: when encoding falls behind, 
     // frames are dropped and counted in stats() rather than buffered until memory runs out.
-    class frame_recorder final : public hw::sensor_frame_observer
+    class frame_recorder final : public hw::single_stream_frameset_observer
     {
     public:
         static constexpr size_t kDefaultQueueDepth = 8;
@@ -39,7 +39,7 @@ namespace io
         recording_stats_t stats() const noexcept;
         const std::filesystem::path& path() const noexcept { return _writer.path(); }
 
-        void on_sensor_frame_update(const std::shared_ptr<hw::sensor_frame>& new_sensor_frame) override;
+        void on_sensor_frameset_update(const hw::sensor_frameset& new_frameset) override;
         void on_sensor_stream_reset() override;
         void on_sensor_frame_geometry_changed() override;
         void on_sensor_stream_end(hw::stream_end_reason_t reason) override;

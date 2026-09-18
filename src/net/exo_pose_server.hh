@@ -76,8 +76,8 @@ namespace net
         ) const;
 
     private:
-        struct impl_t;
-        std::unique_ptr<impl_t> _imp;
+        struct impl;
+        std::unique_ptr<impl> _imp;
     };
 
 } // namespace net

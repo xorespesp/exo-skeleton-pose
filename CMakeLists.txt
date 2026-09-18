@@ -37,9 +37,12 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/hw/source_config.hh"
     "src/hw/source_config.cc"
     "src/hw/sensor_frameset.hh"
+    "src/hw/synced_frameset.hh"
+    "src/hw/frameset_synchronizer.hh"
+    "src/hw/frameset_synchronizer.cc"
     "src/hw/sensor_frame.hh"
     "src/hw/sensor_frame_source.hh"
-    "src/hw/sensor_frame_observer.hh"
+    "src/hw/frameset_observer.hh"
     "src/hw/sensor_frame_provider.hh"
     "src/hw/sensor_frame_provider.cc"
 

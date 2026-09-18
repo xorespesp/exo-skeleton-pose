@@ -1,31 +1,30 @@
 ﻿#pragma once
 #include "calibration.hh"
+#include "frameset_synchronizer.hh"
+#include "frameset_observer.hh"
 #include "sensor_frame_source.hh"
-#include "sensor_frame_observer.hh"
 #include "source_config.hh"
 
 #include <Eigen/Core>
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
-#include <string_view>
-#include <thread>
-#include <vector>
 
 namespace hw
 {
-    // Owns a camera backend and runs a background polling thread 
-    // that pulls framesets from it and pushes their frames to observers.
-    // SDK-agnostic: the concrete backend is created only in the .cc.
+    // 소스 하나를 열어 그 스트림들을 소유하고, 폴링 스레드가 `frameset_synchronizer` 에서 `synced_frameset`
+    // 을 당겨 관찰자들에게 밀어준다. 어떤 백엔드를 만드는지는 .cc 에만 있다.
+    //
+    // 세션에 속한 것(재생 위치, 일시정지, 속도)은 하나이고, 스트림 하나에 속한 것(캘리브레이션, ROI,
+    // 전달 수)은 스트림 인덱스로 묻는다. 관찰자 콜백은 전부 폴링 스레드에서 나간다.
     class sensor_frame_provider final {
     public:
-        sensor_frame_provider() = default;
+        sensor_frame_provider();
         ~sensor_frame_provider();
 
         sensor_frame_provider(const sensor_frame_provider&) = delete;
@@ -33,146 +32,90 @@ namespace hw
         sensor_frame_provider(sensor_frame_provider&&) = delete;
         sensor_frame_provider& operator=(sensor_frame_provider&&) = delete;
 
-        void add_observer(std::shared_ptr<sensor_frame_observer> observer);
-        void remove_observer(const std::shared_ptr<sensor_frame_observer>& observer);
+        void add_observer(std::shared_ptr<synced_frameset_observer> observer);
+        void remove_observer(const std::shared_ptr<synced_frameset_observer>& observer);
 
         bool is_opened() const;
+
+        // 소스 하나를 연다: 카메라 한 대, 또는 파일이 담은 스트림 수만큼의 스트림을 가진 녹화.
+        // 스트림 수는 `stream_count()` 로 되읽는다.
         [[nodiscard]] bool open(const source_config_t& config) noexcept;
+
+        // 라이브 카메라 여럿을 한 시각 축으로 묶어 연다. 스트림 인덱스는 `member_configs` 의 순서이고,
+        // 각 멤버의 `roi` 는 그 스트림에 걸린다. 녹화 멤버와 2개 미만은 거절한다.
+        // K4A 유선 싱크의 subordinate 는 master 보다 먼저 열린다. 열기가 곧 시작이기 때문이다.
+        // 하나라도 실패하면 이미 연 것들을 닫고 실패한다.
+        [[nodiscard]] bool open_synced(
+            std::span<const source_config_t> member_configs,
+            const sync_options_t& sync_options
+        ) noexcept;
+
         void close();
 
-        source_backend_t get_source_backend() const { return _source_backend; }
-        const std::string& get_source_name() const { return _source_name; }
+        source_backend_t get_source_backend() const;
+        const std::string& get_source_name() const;
 
-        // Describes the images observers actually receive, not the raw sensor: 
-        // an ROI shifts the principal point and shrinks the resolution these report.
-        calibration_t get_calibration() const;
-        
-        frame_format_t get_frame_format() const { return _frame_format; }
-        Eigen::Vector2i get_frame_resolution() const;
-        Eigen::Vector2i get_full_frame_resolution() const;
+        // 열린 소스가 내는 스트림 수. 아무것도 안 열려 있으면 0.
+        std::size_t stream_count() const;
 
-        std::optional<roi_t> get_effective_roi() const; // nullopt: whole frames
+        // 관찰자가 `stream_idx` 에서 받는 이미지 기준이다. ROI 가 걸려 있으면 주점과 해상도가 그 윈도우에
+        // 맞춰져 있다.
+        calibration_t get_calibration(std::size_t stream_idx) const;
 
-        // Narrows delivered images to `roi`, whole frames when empty. Applied between frames, and a
-        // camera may snap it to its own increments, so `get_effective_roi()` can differ.
-        void set_roi(const std::optional<roi_t>& roi);
+        frame_format_t get_frame_format(std::size_t stream_idx) const;
+        stream_descriptor_t get_stream_descriptor(std::size_t stream_idx) const;
 
-        float get_current_update_rate() const { return _update_rate.load(); } // EMA-smoothed fps
+        Eigen::Vector2i get_frame_resolution(std::size_t stream_idx) const;
+        Eigen::Vector2i get_full_frame_resolution(std::size_t stream_idx) const;
 
-        // Position of the newest frame in this source's stream, restarting at zero on every open.
-        // NOTE: This value is NOT an identity; for that, see `sensor_frame::id()`.
-        uint32_t get_current_frame_seq() const { return _frame_seq.load(); }
+        std::optional<roi_t> get_effective_roi(std::size_t stream_idx) const; // nullopt: 전체 프레임
 
-        bool is_paused() const { return _paused.load(); }
+        // `stream_idx` 의 전달 이미지를 이 윈도우로 좁힌다. 비어 있으면 전체 프레임.
+        // frameset 사이에 적용되고 카메라가 자기 증분에 스냅할 수 있으므로, 실제 값은 `get_effective_roi()` 로
+        // 본다. 요청은 스트림마다 따로 들고 있다.
+        void set_roi(std::size_t stream_idx, const std::optional<roi_t>& roi);
+
+        // `stream_idx` 가 캡처를 기여한 frameset 의 초당 수. EMA 로 평활.
+        float get_current_update_rate(std::size_t stream_idx) const;
+
+        // 소스를 연 뒤 `stream_idx` 가 기여한 캡처 수.
+        uint64_t get_frames_delivered(std::size_t stream_idx) const;
+
+        float get_current_frameset_rate() const; // EMA 로 평활
+
+        // 가장 새로운 frameset 의 순번. 열 때마다 0 부터 다시 센다. 프레임을 가리키는 식별자는
+        // `sensor_frame::id()` 다.
+        uint32_t get_current_frameset_seq() const;
+
+        // 스트림들의 프레임 싱크 상태. 아무것도 안 열려 있으면 비어 있다.
+        sync_stats_t get_sync_stats() const;
+
+        bool is_paused() const;
         void play();
         void pause();
 
-        // Recording sources only (no-op / 0 otherwise). Posted for the polling thread to carry
-        // out, so a seek never lands between a frame being read and delivered, and each serves one
-        // frame of the position it lands on even while playback is paused. The newest post wins.
+        // 녹화 소스 전용. 그 외에는 아무 일도 하지 않는다. 폴링 스레드가 frameset 사이에서 수행하며,
+        // 일시정지 중이어도 도착한 위치의 frameset 을 하나 내준다. 여러 번 올리면 가장 새것만 남는다.
         void seek_recording_to_begin();
         void seek_recording_to_end();
         void seek_recording_timeline(timestamp_t timestamp);
 
+        // 녹화 소스 전용. 그 외에는 0.
         std::chrono::nanoseconds get_recording_length() const;
         timestamp_t get_first_record_timestamp() const;
         timestamp_t get_last_record_timestamp() const;
 
-        float get_update_speed() const { return _speed.load(); }
+        // 녹화 재생 속도 배율. 라이브 소스에는 걸리지 않는다.
+        float get_update_speed() const;
         void  set_update_speed(float factor);
 
-        // A recording reaching its end starts over instead of ending the stream. Playback policy,
-        // like pausing and speed, so it is answered here rather than by the file being played.
-        bool is_auto_repeat_enabled() const { return _auto_repeat.load(); }
-        void set_auto_repeat(bool enable) { _auto_repeat.store(enable); }
+        // 녹화가 끝에 닿으면 처음부터 다시 돈다. 일시정지, 속도와 같은 재생 정책이다.
+        bool is_auto_repeat_enabled() const;
+        void set_auto_repeat(bool enable);
 
     private:
-        // What a posted seek asks for; the polling thread is what carries it out.
-        struct seek_request_t
-        {
-            enum class kind_t { begin, end, timeline };
-            kind_t kind{ kind_t::begin };
-            timestamp_t at{}; // `timeline` only
-        };
-
-        // What a posted ROI asks for. Wrapped so that "nothing posted" stays distinct from a
-        // request to restore whole frames.
-        struct roi_request_t
-        {
-            std::optional<roi_t> window; // empty: whole frames
-        };
-
-        void _install_source(
-            std::unique_ptr<sensor_frame_source> source,
-            source_backend_t source_backend,
-            std::string source_name,
-            const std::optional<roi_t>& requested_roi
-        );
-
-        // The only writer of the frame geometry, so it cannot change behind a caller's back.
-        // Announcing the change is the caller's, since an open already says it.
-        void _install_frame_geometry(
-            sensor_frame_source& source, 
-            const std::optional<roi_t>& requested_roi
-        );
-
-        // Carries out a posted ROI, if one is waiting. True when the pixel frame actually changed,
-        // which a request the source refused or snapped onto the ROI already in force does not.
-        bool _apply_pending_roi();
-
-        void _start_thread();
-        void _stop_thread();
-        void _polling_thread_proc();
-        void _end_stream_on_error(std::string_view reason); // the polling thread's last act
-
-        // Leaves a seek for the polling thread, which is what carries it out. 
-        // Callable from anywhere, including that thread. 
-        // (a repeating recording posts one at its end, taking the same path an outside seek does)
-        void _post_seek_request(const seek_request_t& request);
-
-        std::vector<std::shared_ptr<sensor_frame_observer>> _snapshot_observers() const;
-        void _notify_sensor_frame_update(const std::shared_ptr<sensor_frame>& frame);
-        void _notify_sensor_stream_reset();
-        void _notify_sensor_frame_geometry_changed();
-        void _notify_sensor_stream_end(stream_end_reason_t reason);
-
-    private:
-        std::unique_ptr<sensor_frame_source> _source;
-        record_player_source* _player{ nullptr }; // non-owning; set only for recording sources
-        mutable std::mutex _source_mtx;
-
-        std::thread _thread;
-        std::atomic<bool> _running{ false };
-        std::atomic<bool> _paused{ false };
-        std::atomic<bool> _auto_repeat{ true }; // a recording starts over at its end
-        std::atomic<bool> _need_repace{ false }; // request playback pacing anchor reset
-
-        // A seek or an ROI waiting to be carried out, and the wakeup that gets the polling thread
-        // to them without waiting out a sleep. The newest post of each wins.
-        std::optional<seek_request_t> _pending_seek_req;
-        std::optional<roi_request_t> _pending_roi_req;
-        std::condition_variable _wake_cv;
-        mutable std::mutex _wake_cv_mtx;
-
-        std::vector<std::shared_ptr<sensor_frame_observer>> _observers;
-        mutable std::mutex _observers_mtx;
-
-        // Written by `_install_frame_geometry()` alone: at open, and again on a posted ROI. The
-        // polling thread is one of those writers, so they are published and read under a lock.
-        mutable std::mutex _geometry_mtx;
-        calibration_t _calib{};
-        Eigen::Vector2i _frame_resolution{ Eigen::Vector2i::Zero() };
-        Eigen::Vector2i _full_frame_resolution{ Eigen::Vector2i::Zero() };
-        std::optional<roi_t> _roi; // ROI in force
-
-        // Cached at open(); immutable while streaming.
-        source_backend_t _source_backend{};
-        std::string _source_name;
-        frame_format_t _frame_format{};
-
-        std::atomic<uint32_t> _frame_seq{ 0 };
-        std::atomic<float> _update_rate{ 0.0f };
-        std::atomic<float> _speed{ 1.0f };
+        struct impl;
+        std::unique_ptr<impl> _imp;
     }; // class
 
 } // namespace hw

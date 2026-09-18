@@ -5,7 +5,7 @@
 #include "hw/calibration.hh"
 #include "hw/frame_format.hh"
 #include "hw/roi.hh"
-#include "hw/sensor_frame_observer.hh"
+#include "hw/frameset_observer.hh"
 #include "hw/sensor_frame_provider.hh"
 #include "hw/source_backend.hh"
 #include "io/frame_recorder.hh"

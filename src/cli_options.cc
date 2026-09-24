@@ -16,7 +16,8 @@ namespace app
         app.add_option_function<uint16_t>(
             "-p,--port",
             [&o](const uint16_t v) { o.port = v; },
-            "WebSocket listen port, overriding what the config profile says");
+            "WebSocket listen port, overriding what the config profile says")
+            ->check(CLI::Range(1, 65535));
 
         app.add_flag("--dump-config", o.dump_config,
             "Print the resolved config as JSON and exit");

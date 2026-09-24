@@ -56,15 +56,6 @@ namespace pose
         return "midline";
     }
 
-    // nullopt if `name` is none of them. The names round-trip through `joint_side_name()`,
-    // which is what a config file spells.
-    constexpr std::optional<joint_side_t> joint_side_from_name(std::string_view name) {
-        if (name == joint_side_name(joint_side_t::right))   { return joint_side_t::right; }
-        if (name == joint_side_name(joint_side_t::left))    { return joint_side_t::left; }
-        if (name == joint_side_name(joint_side_t::midline)) { return joint_side_t::midline; }
-        return std::nullopt;
-    }
-
     // Static per-joint definition
     struct joint_definition_t
     {

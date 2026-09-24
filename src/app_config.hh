@@ -13,33 +13,58 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace app
 {
     // An installation's own settings, persisted as JSON. Fixed for one physical setup, hence off
     // the wire; what an operator adjusts during a run (the rest pose) is session state and stays out.
 
-    // The sensor: which one to open, and what gets programmed into it.
+    // The sensor: which one to open, where it views the exo from, and what gets programmed into it.
+    // `cameras[i]` is stream i; a playback names the same file in every entry, entry i being its stream i.
     struct camera_config_t
     {
-        std::optional<source_address> source; // nullopt: nothing to auto-open
+        source_address source;
+        pose::camera_view_t view{ pose::camera_view_t::frontal }; // 이 카메라가 장비를 보는 자리
 
         std::optional<int32_t> exposure_us; // nullopt: auto
         std::optional<int32_t> gain;        // nullopt: auto
         std::optional<hw::roi_t> roi;       // nullopt: whole frames
 
         // Calibration measured off-line, for a camera reporting none of its own.
-        // Empty leaves tag poses unsolvable, which the 2D estimators do not mind. Ignored for a K4A.
+        // Empty leaves tag poses unsolvable, which the 2D estimators do not mind. Only a VZ camera
+        // takes one: a K4A reports its own and a recording carries the one it was shot with.
         std::string intrinsics_file;
+
+        // 카메라가 찍는 속도. 같은 순간으로 묶이는 카메라들은 같은 값으로 고정한다. nullopt: 제한 없음
+        // (VZ 는 자기 상한으로 프리런). K4A 는 SDK 가 30 으로 정하므로 비었거나 30 이어야 한다.
+        std::optional<double> frame_rate_fps;
 
         DECLARE_SERIALIZABLE_FIELDS(
             v("source",          o.source);
+            v("view",            o.view);
             v("exposure_us",     o.exposure_us);
             v("gain",            o.gain);
             v("roi",             o.roi);
             v("intrinsics_file", o.intrinsics_file);
+            v("frame_rate_fps",  o.frame_rate_fps);
+        )
+    };
+
+    // 캡처를 한 순간으로 묶을 때의 기준과 허용 오차.
+    struct sync_config_t
+    {
+        uint32_t reference_stream_idx{ 0 }; // 다른 스트림들이 시각을 맞추는 기준
+
+        // 기준 캡처와 같은 순간으로 칠 최대 간격. nullopt: 기준 스트림 간격의 절반
+        std::optional<pose::millis_f64> max_pair_skew;
+
+        DECLARE_SERIALIZABLE_FIELDS(
+            v("reference_stream_idx", o.reference_stream_idx);
+            v("max_pair_skew_ms",     o.max_pair_skew);
         )
     };
 
@@ -79,14 +104,16 @@ namespace app
     struct color_marker_calibration_t
     {
         pose::color_marker_detector::options_t detector; // blob filters, and the colour model inside
+        pose::color_marker_assigner::options_t assigner; // 이 카메라의 원반을 관절로 이름 붙이는 법
 
-        // What the camera delivered while this was measured, which the `camera` block above does
-        // not state: a ROI, a binned mode or another sensor all change how many pixels a marker
-        // covers, and the blob gates are counted in pixels. Compared at open.
+        // What the camera delivered while this was measured, which its `cameras` entry does not
+        // state: a ROI, a binned mode or another sensor all change how many pixels a marker
+        // covers, and the blob gates and the search radius are counted in pixels. Compared at open.
         Eigen::Vector2i frame_resolution{ 0, 0 };
 
         DECLARE_SERIALIZABLE_FIELDS(
             v("detector",         o.detector);
+            v("assigner",         o.assigner);
             v("frame_resolution", o.frame_resolution);
         )
     };
@@ -94,15 +121,12 @@ namespace app
     // The colour-marker path.
     struct color_marker_config_t
     {
-        // Empty until someone has measured this installation, which is the state a profile is
+        // Per camera; null until someone has measured that one, which is the state a profile is
         // authored in. Nothing is detected without it, and the colour panel is where it comes from.
-        std::optional<color_marker_calibration_t> calibration;
-
-        pose::color_marker_assigner::options_t assigner; // which blob is which joint
+        std::vector<std::optional<color_marker_calibration_t>> calibration;
 
         DECLARE_SERIALIZABLE_FIELDS(
             v("calibration", o.calibration);
-            v("assigner",    o.assigner);
         )
     };
 
@@ -137,16 +161,13 @@ namespace app
     };
 
     // Measurements -> joint angles. Both planes are kept, so switching loses neither's tuning.
+    // Which one runs follows from the cameras' `view`.
     struct estimator_config_t
     {
-        // Where the camera stands relative to the exo, which picks the estimator that runs.
-        pose::view_plane_t view_plane{ pose::view_plane_t::frontal };
-
         pose::frontal_pose_estimator::options_t frontal;
         pose::sagittal_pose_estimator::options_t sagittal;
 
         DECLARE_SERIALIZABLE_FIELDS(
-            v("view_plane", o.view_plane);
             v("frontal",    o.frontal);
             v("sagittal",   o.sagittal);
         )
@@ -175,12 +196,18 @@ namespace app
 
     struct app_config_t
     {
-        // The current config schema version. (YYMMDDRR) 
+        // The current config schema version. (YYMMDDRR)
         // It has to be updated whenever any field list nested below this one changes.
-        static constexpr int config_version = 26081100;
+        static constexpr int config_version = 26091800;
 
         server_config_t server;
-        camera_config_t camera;
+
+        // 스트림 순서대로. 비어 있으면 자동으로 열 것이 없다. frontal 은 하나, sagittal 은 왼쪽·오른쪽 하나씩.
+        std::vector<camera_config_t> cameras;
+
+        // 라이브 카메라가 둘 이상일 때만 있다. 하나뿐이면 묶을 것이 없고 녹화는 파일이 이미 한 시간축이다.
+        std::optional<sync_config_t> sync;
+
         pose_config_t pose;
 
         DECLARE_SERIALIZABLE_FIELDS(
@@ -188,10 +215,15 @@ namespace app
             //       schema says so before any key of that schema's shape is read.
             v("config_version", o.config_version);
             v("server",         o.server);
-            v("camera",         o.camera);
+            v("cameras",        o.cameras);
+            v("sync",           o.sync);
             v("pose",           o.pose);
         )
     };
+
+    // 엔트리들이 합의한 추정 평면. 모든 엔트리의 `view` 가 같은 평면일 때 그 값이고, 엔트리가 없거나
+    // 어긋나면 nullopt. `validate_config()` 를 통과한 config 에서는 엔트리가 있는 한 값이다.
+    [[nodiscard]] std::optional<pose::view_plane_t> view_plane_of(std::span<const camera_config_t> cameras);
 
     // Where the app keeps its own output (`recordings`, `dumps`, `configs`):
     // the nearest such folder at or above the executable, else the executable's own directory.

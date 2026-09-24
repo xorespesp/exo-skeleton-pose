@@ -1,6 +1,5 @@
 #include "source_address.hh"
 
-#include <charconv>
 #include <format>
 #include <utility>
 
@@ -8,35 +7,17 @@ namespace app
 {
     namespace
     {
-        // What names a backend in the text form. A drive letter cannot be mistaken for one of
-        // these, so a Windows path still reads as a path.
-        constexpr std::string_view kK4aPrefix{ "k4a:" };
-        constexpr std::string_view kVzPrefix{ "vz:" };
+        // 백엔드 이름 뒤에 이것이 오고, 그 뒤가 시리얼이다. 드라이브 문자는 백엔드 이름이 아니므로
+        // 윈도 경로는 그대로 경로로 읽힌다.
+        constexpr std::string_view kSerialPrefix{ "sn:" };
 
         template <class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
-
-        // Whole unsigned integers only, so "0.mcap" and "1 " are not indices.
-        std::optional<uint32_t> try_parse_index(const std::string_view text)
-        {
-            uint32_t index{};
-            const auto* const last = text.data() + text.size();
-            const auto [ptr, ec] = std::from_chars(text.data(), last, index);
-            if (ec != std::errc{} || ptr != last) { return std::nullopt; }
-            return index;
-        }
     } // namespace
 
-    source_address source_address::k4a_device(const uint32_t index)
+    source_address source_address::device(const hw::sensor_backend_t backend, hw::device_serial_t serial)
     {
         source_address out;
-        out._value = k4a_device_t{ index };
-        return out;
-    }
-
-    source_address source_address::vz_device(const uint32_t index)
-    {
-        source_address out;
-        out._value = vz_device_t{ index };
+        out._value = device_t{ backend, std::move(serial) };
         return out;
     }
 
@@ -51,31 +32,26 @@ namespace app
     {
         if (text.empty()) { return std::nullopt; }
 
-        if (text.starts_with(kK4aPrefix)) {
-            const std::optional<uint32_t> index = try_parse_index(text.substr(kK4aPrefix.size()));
-            if (!index.has_value()) { return std::nullopt; }
-            return source_address::k4a_device(*index);
-        }
-        if (text.starts_with(kVzPrefix)) {
-            const std::optional<uint32_t> index = try_parse_index(text.substr(kVzPrefix.size()));
-            if (!index.has_value()) { return std::nullopt; }
-            return source_address::vz_device(*index);
-        }
+        if (const std::size_t colon = text.find(':'); colon != std::string_view::npos)
+        {
+            if (const std::optional<hw::sensor_backend_t> backend =
+                    hw::sensor_backend_from_str(text.substr(0, colon)))
+            {
+                const std::string_view rest = text.substr(colon + 1);
+                if (!rest.starts_with(kSerialPrefix)) { return std::nullopt; }
 
-        // Refused rather than taken as a path, so the failure names the missing prefix.
-        if (try_parse_index(text).has_value()) { return std::nullopt; }
+                const std::string_view serial = rest.substr(kSerialPrefix.size());
+                if (serial.empty()) { return std::nullopt; }
+                return source_address::device(*backend, hw::device_serial_t{ std::string{ serial } });
+            }
+        }
 
         return source_address::recording(std::filesystem::path{ text });
     }
 
-    bool source_address::is_k4a_device() const noexcept
+    bool source_address::is_device() const noexcept
     {
-        return std::holds_alternative<k4a_device_t>(_value);
-    }
-
-    bool source_address::is_vz_device() const noexcept
-    {
-        return std::holds_alternative<vz_device_t>(_value);
+        return std::holds_alternative<device_t>(_value);
     }
 
     bool source_address::is_recording() const noexcept
@@ -83,14 +59,14 @@ namespace app
         return std::holds_alternative<std::filesystem::path>(_value);
     }
 
-    uint32_t source_address::k4a_device_index() const
+    hw::sensor_backend_t source_address::device_backend() const
     {
-        return std::get<k4a_device_t>(_value).index;
+        return std::get<device_t>(_value).backend;
     }
 
-    uint32_t source_address::vz_device_index() const
+    const hw::device_serial_t& source_address::device_serial() const
     {
-        return std::get<vz_device_t>(_value).index;
+        return std::get<device_t>(_value).serial;
     }
 
     const std::filesystem::path& source_address::recording_path() const
@@ -101,18 +77,22 @@ namespace app
     std::string source_address::to_string() const
     {
         return std::visit(overloaded{
-            [](const k4a_device_t& d) { return std::format("{}{}", kK4aPrefix, d.index); },
-            [](const vz_device_t& d)  { return std::format("{}{}", kVzPrefix, d.index); },
+            [](const device_t& d) {
+                return std::format("{}:{}{}", hw::sensor_backend_to_str(d.backend), kSerialPrefix, d.serial.value);
+            },
             [](const std::filesystem::path& p) { return p.string(); },
         }, _value);
     }
 
-    std::string source_address::display_name() const
+    bool source_address::operator==(const source_address& other) const noexcept
     {
+        if (_value.index() != other._value.index()) { return false; }
         return std::visit(overloaded{
-            [](const k4a_device_t& d) { return std::format("k4a device #{}", d.index); },
-            [](const vz_device_t& d)  { return std::format("vz device #{}", d.index); },
-            [](const std::filesystem::path& p) { return p.filename().string(); },
+            [&](const device_t& d) {
+                const device_t& rhs = std::get<device_t>(other._value);
+                return d.backend == rhs.backend && d.serial == rhs.serial;
+            },
+            [&](const std::filesystem::path& p) { return p == std::get<std::filesystem::path>(other._value); },
         }, _value);
     }
 

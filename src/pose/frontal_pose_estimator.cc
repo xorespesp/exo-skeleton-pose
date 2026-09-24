@@ -2,8 +2,11 @@
 #include "hinge_angle.hh"
 #include "leg_ik.hh"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <array>
+#include <string>
 
 namespace pose
 {
@@ -302,21 +305,34 @@ namespace pose
 
     bool frontal_pose_estimator::calibrate_rest_pose()
     {
-        context_t::rest_pose_info_t new_rest{};
+        // 표의 관절이 모두 이번 프레임에 새로 잡혀야 한다. 빠진 것은 거부한다.
+        const auto is_missing_for_rest = [this](const joint_definition_t& def) {
+            const size_t i = index_of(def.joint_id);
+            return !_ctx->last_frame_detection_flags[i] || !_ctx->last_frame_joint_states[i].raw_position.has_value();
+        };
+        if (std::ranges::any_of(get_joint_defs(), is_missing_for_rest))
+        {
+            std::string missing_names;
+            for (const auto& def : get_joint_defs()) {
+                if (!is_missing_for_rest(def)) { continue; }
+                if (!missing_names.empty()) { missing_names += ", "; }
+                missing_names += def.name;
+            }
+            spdlog::warn("estimator: rest pose not captured; [{}] not detected in this frame{}"
+                , missing_names
+                , this->has_rest_pose() ? ", the previous rest pose stays" : "");
+            return false; // the previous reference stays
+        }
 
-        bool any = false;
+        context_t::rest_pose_info_t new_rest{};
         for (size_t i = 0; i < kNumJoints; ++i) {
             // Only latch freshly detected joints; a held position is a stale reference.
             if (_ctx->last_frame_detection_flags[i]) {
                 new_rest.joint_position[i] = _ctx->last_frame_joint_states[i].raw_position;
             }
-            any = any || new_rest.joint_position[i].has_value();
         }
-
-        if (any) { _ctx->rest_pose = new_rest; }
-        else { _ctx->rest_pose.reset(); }
-
-        return any;
+        _ctx->rest_pose = new_rest;
+        return true;
     }
 
     void frontal_pose_estimator::clear_rest_pose()

@@ -97,16 +97,16 @@ namespace gui
     bool pose_trace_recorder::write_json(
         const std::filesystem::path& path,
         const std::string& source_name,
-        const Eigen::Vector2i& source_resolution,
-        float source_fps,
-        const std::optional<hw::intrinsic_t>& intrinsics,
+        const std::span<const stream_info_t> streams,
+        const std::size_t detections_stream_idx,
         pose::view_plane_t view_plane) const
     {
         json root;
-        root["schema"] = "exo-pose-trace/v9";
+        root["schema"] = "exo-pose-trace/v10";
         root["notes"] = "Joint positions are [x,y,z] in meters, rig frame (X to the exo's left, Y down, "
                         "Z behind it; the frame of a camera facing it head-on). A sagittal run "
-                        "approximates them from the image plane, so they lie on x = 0. "
+                        "approximates them from the image plane, each leg from the pelvis marker its "
+                        "own camera sees, so they lie on x = 0 with the pelvis at the origin. "
                         "Detection positions are tag->camera translations and exist only when the "
                         "detector solved a tag pose. Quaternions are [w,x,y,z]. A joint's rotation "
                         "and angles describe the articulation at it, turning the bone toward its "
@@ -121,22 +121,34 @@ namespace gui
                         "*_delta fields are those angles' changes since the captured rest.";
         root["view_plane"] = std::string{ pose::view_plane_name(view_plane) };
 
+        // 스트림마다 한 칸. 검출은 그중 한 스트림에서 읽히므로 어느 것인지 함께 적는다.
+        json stream_array = json::array();
+        for (const stream_info_t& stream : streams)
+        {
+            json entry = {
+                { "camera_view", std::string{ pose::camera_view_name(stream.camera_view) } },
+                { "frame_width", stream.resolution.x() },
+                { "frame_height", stream.resolution.y() },
+                { "fps", stream.fps },
+            };
+            if (stream.intrinsics.has_value()) {
+                const auto& k = stream.intrinsics.value();
+                entry["intrinsics"] = {
+                    { "fx", k.fx }, { "fy", k.fy }, { "cx", k.cx }, { "cy", k.cy },
+                    { "calib_width", k.calib_resolution.x() },
+                    { "calib_height", k.calib_resolution.y() },
+                };
+            } else {
+                entry["intrinsics"] = nullptr;
+            }
+            stream_array.push_back(std::move(entry));
+        }
+
         root["source"] = {
             { "name", source_name },
-            { "frame_width", source_resolution.x() },
-            { "frame_height", source_resolution.y() },
-            { "fps", source_fps },
+            { "streams", std::move(stream_array) },
+            { "detections_stream", detections_stream_idx },
         };
-        if (intrinsics.has_value()) {
-            const auto& k = intrinsics.value();
-            root["intrinsics"] = {
-                { "fx", k.fx }, { "fy", k.fy }, { "cx", k.cx }, { "cy", k.cy },
-                { "calib_width", k.calib_resolution.x() },
-                { "calib_height", k.calib_resolution.y() },
-            };
-        } else {
-            root["intrinsics"] = nullptr;
-        }
 
         // rig table (data-driven; mirrors `get_joint_defs()`)
         json rig = json::array();

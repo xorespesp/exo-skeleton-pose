@@ -25,8 +25,9 @@ namespace pose
     // points alone: no marker->camera pose, no depth, no camera intrinsics. That makes this the cheap
     // path and immune to depth noise.
     //
-    // Only the marked leg carries a position, an angle or a rotation.
-    // Which leg that is follows from the joints this frame measured, and with it which side the camera stands on.
+    // Each leg is measured by the camera on its side, so every point of one leg lies in that
+    // camera's image plane, measured from the pelvis marker that camera sees. The two cameras are
+    // assumed level and aligned with each other.
     //
     // Angles follow the model laid out at the top of the implementation file: geometry is
     // measured in the rig's hinge sign, and `joint_state_t` receives it in the biomechanics
@@ -38,13 +39,13 @@ namespace pose
     // Positions and rotations are expressed in the rig frame, not the camera's. A side view looks
     // along the rig's lateral axis, so the image plane holds the rig's sagittal plane: flexion
     // becomes a rotation about the rig's lateral axis and measured points land on the
-    // mid-sagittal plane (X = 0). Which side the camera views from decides the sign of both, and
-    // the tagged leg gives it away.
+    // mid-sagittal plane (X = 0). Which side a camera views from decides the sign of both, and
+    // the leg it measures gives it away.
     //
     // `joint_state_t::position` is reported in approximate meters: the scales the measurements
-    // supply are averaged into one meters-per-pixel factor for the whole rig. This keeps one unit
+    // supply are averaged into one meters-per-pixel factor per leg. This keeps one unit
     // convention across estimators for the plots and the diagnostic trace, and being a single factor
-    // it sets the skeleton's size without touching its shape.
+    // it sets the leg's size without touching its shape.
     //
     // TODO: lens distortion is not corrected. Undistort the joint points before the angle math once
     // markers sit near the image border or the lens gets wider.
@@ -81,26 +82,23 @@ namespace pose
         options_t& options() noexcept { return _opt; }
         const options_t& options() const noexcept { return _opt; }
 
-        // Ingest one frame's measurements and recompute every joint state.
+        // Ingest one frameset's measurements and recompute every joint state.
         // NOTE: the metric scale rides on the measurements and reaches the reported positions only.
         //       The angles this estimator produces do not depend on it.
-        void update(
-            std::span<const joint_2d_measurement_t> measurements,
-            hw::timestamp_t sensor_timestamp // when the source captured the frame
-        );
+        void update(const synced_2d_measurements_t& frameset);
 
         // Latch the current per-joint image-plane points as the rest (bind) reference. The
         // rest-relative motion is measured against it, so no rotation is produced until it is
         // captured; the measured angles flow regardless.
-        // Returns false if no joint had a point this frame.
+        // Returns false if any leg joint had no point this frame, keeping the previous reference.
         bool calibrate_rest_pose() override;
         void clear_rest_pose() override;
         bool has_rest_pose() const override;
 
-        // Drop the position track: per-joint filters, occlusion timers, held points, and the tracked
-        // near-leg side. The next frame starts cold (the filter reseeds to its raw sample) and the
-        // side is read again. Call when the input stream changes so a new source is not smoothed or
-        // held against the previous one's stale state.
+        // Drop the position track: per-joint filters, occlusion timers, held points, each camera's
+        // pelvis point and the metric scales. The next frame starts cold (the filter reseeds to its
+        // raw sample). Call when the input stream changes so a new source is not smoothed or held
+        // against the previous one's stale state.
         void reset_tracking() override;
 
         void on_frame_geometry_changed() override;
@@ -115,17 +113,7 @@ namespace pose
 
         bool uses_smoothed_positions() const override { return _opt.enable_position_smoothing; }
 
-        // --- sagittal specifics -----------------------------------------------------------
-
-        // Knee joint of the leg the measurements came from; 
-        // empty until a leg joint has been measured. 
-        // Its `get_joint_name()` identifies the side for an operator.
-        std::optional<joint_id_t> tracked_leg_knee() const;
-
     private:
-        // +1 or -1, applied wherever the image plane is carried into rig space.
-        double _side() const noexcept;
-
         struct context_t;
 
         options_t _opt;

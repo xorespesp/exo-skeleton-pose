@@ -8,11 +8,12 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace hw
 {
     // 무엇을 열고 어떻게 스트리밍할지.
-    // 모든 config 가 `roi` 를 갖고, provider 는 그것을 종류와 무관하게 읽는다.
+    // 카메라 config 는 자기 스트림 하나의 `roi` 를, 녹화 config 는 파일이 가진 스트림마다의 ROI 를 든다.
 
     // K4A 유선 싱크 잭의 역할.
     enum class k4a_sync_role_t : uint8_t
@@ -22,8 +23,8 @@ namespace hw
         subordinate, // Sync In 의 트리거에 맞춰 찍는다
     };
 
-    struct device_index_t  { uint32_t value{ 0 }; };
-    struct device_serial_t { std::string value; };
+    struct device_index_t  { uint32_t value{ 0 }; bool operator==(const device_index_t&) const = default; };
+    struct device_serial_t { std::string value;   bool operator==(const device_serial_t&) const = default; };
     using device_selector_t = std::variant<device_index_t, device_serial_t>;
 
     // Orbbec K4A Wrapper 카메라.
@@ -62,13 +63,15 @@ namespace hw
     struct recording_config_t
     {
         std::filesystem::path file;
-        std::optional<roi_t> roi; // nullopt: 전체 프레임
+
+        // 스트림 i 의 ROI. 파일의 스트림 수보다 짧으면 나머지는 전체 프레임이고, 길면 열기 실패다.
+        std::vector<std::optional<roi_t>> stream_rois;
     };
 
     using source_config_t = std::variant<k4a_device_config_t, vz_device_config_t, recording_config_t>;
 
     // 사람이 읽는 짧은 라벨.
-    // 예: "k4a device #0", "vz device 'VZ12345'", "recording 'walk.mcap'".
+    // 예: "k4a device 'S12345'", "vz device 'VZ12345'", "recording 'walk.mcap'".
     std::string describe(const source_config_t& config);
 
 } // namespace hw

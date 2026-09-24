@@ -21,6 +21,17 @@ namespace gui
 {
     namespace
     {
+        // 화면에서 카메라를 부르는 이름. 스트림 인덱스는 내부 순서라 드러내지 않는다.
+        const char* camera_label(const pose::camera_view_t view)
+        {
+            switch (view) {
+            case pose::camera_view_t::sagittal_left:  return "Left camera";
+            case pose::camera_view_t::sagittal_right: return "Right camera";
+            case pose::camera_view_t::frontal:        break;
+            }
+            return "Camera";
+        }
+
         // Codec picker entries, one per `io::kImageCodecs` row and in the same order.
         constexpr std::array<const char*, io::kImageCodecs.size()> kCodecLabels{
             "JPEG (compressed)",
@@ -116,11 +127,18 @@ namespace gui
 
     void debugger_app::render_ui()
     {
-        if (!_frame_texture.has_value()) { _frame_texture.emplace(this->renderer().sdl_renderer()); }
-
         // Advance the server one tick: services the listener when up, and always pumps the
         // pipeline so device/algorithm testing works whether or not it's running.
         _server->poll();
+
+        // 소스는 이 창을 거치지 않고도 닫힌다: 클라이언트의 STOP, 마지막 클라이언트의 이탈, 장치 실패.
+        // 그 프레임들을 설명하던 세션 상태가 다음 소스의 것과 한 버퍼에 섞이지 않게 한다.
+        if (const bool source_open = _server->pipeline().is_source_open(); source_open != _source_open)
+        {
+            _source_open = source_open;
+            if (!source_open) { this->_clear_session_state(); }
+        }
+
         this->_update_pose_frame();
 
         if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) { _ui.camera_fullscreen = !_ui.camera_fullscreen; }
@@ -160,19 +178,8 @@ namespace gui
         }
         else if (_ui.camera_fullscreen)
         {
-            // Fullscreen: sensor frame scaled to fit, centered (log panel is hidden here).
-            if (!_frame_texture.value().valid()) { ImGui::TextUnformatted("Waiting for frames...  (F11 to exit)"); }
-            else
-            {
-                const ImVec2 avail = ImGui::GetContentRegionAvail();
-                const float tw = static_cast<float>(_frame_texture.value().width());
-                const float th = static_cast<float>(_frame_texture.value().height());
-                const float scale = std::min(avail.x / tw, avail.y / th);
-                const ImVec2 sz{ tw * scale, th * scale };
-                const ImVec2 cur = ImGui::GetCursorPos();
-                ImGui::SetCursorPos(ImVec2{ cur.x + (avail.x - sz.x) * 0.5f, cur.y + (avail.y - sz.y) * 0.5f });
-                ImGui::Image(_frame_texture.value().id(), sz);
-            }
+            // Fullscreen: every stream's frame scaled to fit, side by side (log panel is hidden here).
+            this->_render_stream_views(ImGui::GetContentRegionAvail());
         }
         else
         {
@@ -205,7 +212,8 @@ namespace gui
         ImGui::End();
 
         // The form edits the config in place, so an Open streams exactly what it shows.
-        const open_source_dialog::result_t req = _open_dialog.render(_server->config());
+        const open_source_dialog::result_t req = _open_dialog.render(
+            _server->config(), _server->pipeline().is_source_open());
         if (req.load_config) { this->_do_load_config(*req.load_config); }
         if (req.open_source) { this->_open_source(); }
 
@@ -234,23 +242,23 @@ namespace gui
         // Samples taken against the previous source describe a camera that is no longer open.
         _color_sampler.clear();
 
-        // A recording already carries the settings it was shot with; only a live camera takes them.
-        if (config.camera.source.has_value() && config.camera.source->is_recording()) {
-            config.camera.exposure_us.reset();
-            config.camera.gain.reset();
+        // 이 config 로 열지 못하면 열려 있던 소스도 닫는다. 남겨 두면 파이프라인이 config 와 어긋난 채로
+        // 돌고, 저장이 그 값을 새 프로파일에 긁어 담는다.
+        if (!_server->pipeline().open_source(config)) {
+            spdlog::error("gui: the configured source failed to open; the pipeline is left closed");
+            _server->pipeline().close_source();
         }
 
-        _server->pipeline().open_source(config);
+        // 새 소스는 스트림 0 부터 본다.
+        _ui.selected_stream_idx = 0;
 
         // The slider that will decide the next fit starts on the value already in force, so what
         // the panel shows and what the running detector accepts do not disagree until asked to.
-        if (const auto* color_tracker = dynamic_cast<const pose::color_marker_tracker*>(
-                _server->pipeline().tracker()))
-        {
-            _ui.color_max_distance = color_tracker->detector_options().model.max_distance;
-        }
+        this->_on_selected_stream_changed();
 
-        _last_seq = 0;
+        _source_open = _server->pipeline().is_source_open();
+        _stream_views.clear();
+        _last_plotted_ts = {};
         _ui.view_tool = view_tool_t::none; // a live tool describes the source being replaced
         _plot_panel.reset();
         _trace.clear();
@@ -277,8 +285,8 @@ namespace gui
             return;
         }
 
-        if (!_server->config().camera.source.has_value()) {
-            spdlog::info("config: this file names no source, so the open one is closed");
+        if (_server->config().cameras.empty()) {
+            spdlog::info("config: this file names no camera, so the open source is closed");
             this->_do_close_source();
             return;
         }
@@ -289,7 +297,7 @@ namespace gui
     void debugger_app::_do_save_config(const std::filesystem::path& path)
     {
         // A save gathers the config from two places. `server` stands as loaded, and the open
-        // dialog already wrote `camera` and the viewing plane into it. The tuning below did not go
+        // dialog already wrote `cameras` into it. The tuning below did not go
         // there: the control panel edits it on the pipeline, so the live values are read back.
         //
         // Reading back is right only while the pipeline is never older than the config, which
@@ -297,31 +305,47 @@ namespace gui
         net::exo_pose_pipeline& pipe = _server->pipeline();
         app::app_config_t& config = _server->config();
 
-        // The ROI the source took, not the one that was asked for: a camera snaps a request to its
+        // The ROI each stream took, not the one that was asked for: a camera snaps a request to its
         // own increments and can refuse it, and the file should say what actually ran. With nothing
-        // open there is no such answer, so the loaded value stands.
-        if (pipe.is_source_open()) { config.camera.roi = pipe.effective_roi(); }
+        // open there is no such answer, so the loaded values stand.
+        if (pipe.is_source_open())
+        {
+            for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count() && stream_idx < config.cameras.size(); ++stream_idx) {
+                config.cameras[stream_idx].roi = pipe.effective_roi(stream_idx);
+            }
+        }
+        else {
+            spdlog::info("config: no source is open, so the file keeps the tuning it was loaded with");
+        }
 
-        // Only the running tracker has live values to read back; the other kind's block keeps
+        // Only the running trackers have live values to read back; the other kind's block keeps
         // whatever the config profile was loaded with.
-        if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(pipe.tracker())) {
+        if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(pipe.tracker(_ui.selected_stream_idx))) {
             config.pose.detector.apriltag.detector = tag_tracker->options();
             config.pose.detector.apriltag.tag_size_m = tag_tracker->tag_size_m();
         }
-        if (auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker()))
+        for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx)
         {
-            config.pose.detector.color_marker.assigner = color_tracker->assigner_options();
+            auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker(stream_idx));
+            if (!color_tracker) { continue; }
 
-            // The colour and the blob filters are read back the same way, and the frame size they
-            // were measured on comes from the source that is delivering it. A colour that was never
-            // fitted leaves the block absent, which is what an unmeasured installation writes.
+            // The colour, the blob filters and the assignment settings are read back the same way, and
+            // the frame size they were measured on comes from the stream that is delivering it. A colour that was never
+            // fitted leaves the entry null, which is what an unmeasured camera writes.
+            std::vector<std::optional<app::color_marker_calibration_t>>& calibration = config.pose.detector.color_marker.calibration;
+            if (calibration.size() < pipe.stream_count()) { calibration.resize(pipe.stream_count()); }
             if (const pose::color_marker_detector::options_t detector = color_tracker->detector_options();
                 detector.model.valid)
             {
-                config.pose.detector.color_marker.calibration = app::color_marker_calibration_t{
+                calibration[stream_idx] = app::color_marker_calibration_t{
                     .detector = detector,
-                    .frame_resolution = pipe.source_resolution(),
+                    .assigner = color_tracker->assigner_options(),
+                    .frame_resolution = pipe.source_resolution(stream_idx),
                 };
+            }
+            else {
+                spdlog::warn("config: the {} has no fitted color, so its blob and assignment settings are not saved"
+                    , camera_label(pipe.camera_view(stream_idx)));
             }
         }
         if (const auto o = pipe.frontal_options())  { config.pose.estimator.frontal = *o; }
@@ -339,10 +363,20 @@ namespace gui
     void debugger_app::_do_close_source()
     {
         _server->pipeline().close_source();
-        _last_seq = 0;
+        _source_open = false;
+        this->_clear_session_state();
+    }
+
+    void debugger_app::_clear_session_state()
+    {
+        _stream_views.clear();
+        _last_plotted_ts = {};
         _ui.view_tool = view_tool_t::none;
         _plot_panel.reset();
         _trace.clear();
+        _color_sampler.clear();
+        _history_rois.clear();
+        _ui.selected_stream_idx = 0;
     }
 
     void debugger_app::_update_pose_frame()
@@ -355,31 +389,54 @@ namespace gui
         // picks it, so it holds for exactly as long as that tool is up.
         const int backdrop = (_ui.view_tool == view_tool_t::color_sample) ? _ui.color_backdrop : 0;
 
-        // The classifier's per-pixel images are copied on the frame thread, so the tracker is told
-        // each step whether anything is looking at them.
-        auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker());
-        if (color_tracker != nullptr) { color_tracker->set_publish_debug_images(backdrop != 0); }
-
-        if (!pipe.try_get_annotated_frame(_last_frame, _last_source_frame, _last_seq)) { return; }
-
-        // What the camera view shows. The classifier's own two images answer "is this colour being
-        // accepted, and how surely"; the drawn frame answers "is the marker being found", which is
-        // what everything else wants.
-        cv::Mat view = _last_frame;
-        if (color_tracker != nullptr && backdrop != 0)
-        {
-            const cv::Mat decisions = (backdrop == 1) ? color_tracker->mask()
-                                                      : color_tracker->score_image();
-            if (!decisions.empty()) { cv::cvtColor(decisions, view, cv::COLOR_GRAY2BGR); }
+        // 선택은 스트림 수 안으로 묶는다.
+        if (const std::size_t count = pipe.stream_count(); count > 0 && _ui.selected_stream_idx >= count) {
+            _ui.selected_stream_idx = count - 1;
+            this->_on_selected_stream_changed();
         }
-        _frame_texture.value().update(view);
+
+        // The classifier's per-pixel images are copied on the frame thread, so the trackers are told
+        // each step whether anything is looking at them.
+        for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx)
+        {
+            if (auto* t = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker(stream_idx))) {
+                t->set_publish_debug_images(backdrop != 0 && stream_idx == _ui.selected_stream_idx);
+            }
+        }
+        auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker(_ui.selected_stream_idx));
+
+        // 스트림마다 자기 그림을 올린다. 소스가 바뀌면 자리부터 다시 잡는다.
+        if (_stream_views.size() != pipe.stream_count())
+        {
+            _stream_views.clear();
+            _stream_views.resize(pipe.stream_count());
+        }
+        for (std::size_t stream_idx = 0; stream_idx < _stream_views.size(); ++stream_idx)
+        {
+            stream_view_t& stream_view = _stream_views[stream_idx];
+            if (!pipe.try_get_annotated_frame(stream_idx, stream_view.annotated, stream_view.source, stream_view.last_frame_id)) { continue; }
+
+            // What the camera view shows. The classifier's own two images answer "is this colour being
+            // accepted, and how surely"; the drawn frame answers "is the marker being found", which is
+            // what everything else wants.
+            cv::Mat view = stream_view.annotated;
+            if (color_tracker != nullptr && backdrop != 0 && stream_idx == _ui.selected_stream_idx)
+            {
+                const cv::Mat decisions = (backdrop == 1) ? color_tracker->mask()
+                                                          : color_tracker->score_image();
+                if (!decisions.empty()) { cv::cvtColor(decisions, view, cv::COLOR_GRAY2BGR); }
+            }
+
+            if (!stream_view.texture) { stream_view.texture = std::make_unique<frame_texture>(this->renderer().sdl_renderer()); }
+            stream_view.texture->update(view);
+        }
 
         // Everything below places joint state on a timeline, so it is timed by the frame the
         // estimator stepped on rather than the one just drawn. A run whose markers are never
         // detected keeps showing that image, which is what an operator needs to see to fix it,
         // while there is still nothing to plot.
         const pose::pose_estimator_base* est = pipe.estimator();
-        if (!est || !pipe.has_pose()) { return; }
+        if (!est || !pipe.has_pose() || !pipe.is_source_open()) { return; }
 
         // The plot buffers rebase against their first sample, so an absolute value is fine here.
         const hw::timestamp_t ts = pipe.last_timestamp();
@@ -389,12 +446,20 @@ namespace gui
         // are image coordinates under a header that names one geometry, and a sagittal run's
         // positions are image points scaled into metres. A moved origin steps every one of them
         // without the exo having moved, so what described the old frame goes.
-        if (const std::optional<hw::roi_t> roi = pipe.effective_roi(); roi != _history_roi)
+        std::vector<std::optional<hw::roi_t>> rois;
+        for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx) {
+            rois.push_back(pipe.effective_roi(stream_idx));
+        }
+        if (rois != _history_rois)
         {
             _trace.clear();
             _plot_panel.reset();
-            _history_roi = roi;
+            _history_rois = std::move(rois);
         }
+
+        // 추정기가 밟은 순간마다 한 번 넣는다.
+        if (ts == _last_plotted_ts) { return; }
+        _last_plotted_ts = ts;
 
         // Capture the full per-frame trace into the rolling ring so a glitch can be dumped with its
         // lead-up right after it is seen on screen.
@@ -416,7 +481,7 @@ namespace gui
             // The trace records tag geometry, which only the tag tracker has; a colour run leaves
             // that section empty and keeps the joint state the rest of the trace is about.
             std::vector<pose::tag_detection_t> tags;
-            if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(pipe.tracker())) {
+            if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(pipe.tracker(_ui.selected_stream_idx))) {
                 tags = tag_tracker->last_detections();
             }
             _trace.capture(ts, tags, *est, gates);
@@ -456,8 +521,9 @@ namespace gui
             if (ImGui::MenuItem("Start Recording...", nullptr, false, can_record))
             {
                 if (_ui.record_dlg_path.empty()) {
+                    // 파일 이름의 백엔드는 스트림 0 의 것(묶이는 카메라들은 같은 기종이다).
                     _ui.record_dlg_path = (
-                        app::project_dir("recordings") / default_recording_name(pipe.sensor_backend(), pipe.view_plane())
+                        app::project_dir("recordings") / default_recording_name(pipe.sensor_backend(0), pipe.view_plane())
                     ).string();
                 }
                 _ui.record_dlg_show = true;
@@ -484,21 +550,19 @@ namespace gui
         {
             if (pipe.is_source_open())
             {
-                // annotated sensor frame (texture) at the top of the section
-                if (_frame_texture.value().valid())
-                {
-                    const float scale = ImGui::GetContentRegionAvail().x / _frame_texture.value().width();
-                    ImGui::Image(_frame_texture.value().id(), ImVec2{ _frame_texture.value().width() * scale, _frame_texture.value().height() * scale });
-                }
-                else
-                {
-                    ImGui::TextUnformatted("Waiting for sensor frames...");
-                }
+                // annotated sensor frames (textures) at the top of the section, one per stream
+                this->_render_stream_views(ImVec2{ ImGui::GetContentRegionAvail().x, 0.0f });
+
+                this->_render_stream_selector("sensor_info");
 
                 ImGui::TextUnformatted(std::format("Source : {}", pipe.source_name()).c_str());
-                const auto res = pipe.source_resolution();
-                ImGui::TextUnformatted(std::format("Resolution : {}x{}", res.x(), res.y()).c_str());
-                ImGui::TextUnformatted(std::format("FPS : {:.1f}", pipe.source_fps()).c_str());
+                for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx)
+                {
+                    const Eigen::Vector2i res = pipe.source_resolution(stream_idx);
+                    ImGui::TextUnformatted(std::format("{} : {}x{} @ {:.1f} fps",
+                        camera_label(pipe.camera_view(stream_idx)),
+                        res.x(), res.y(), pipe.source_fps(stream_idx)).c_str());
+                }
 
                 if (pipe.is_playback_source())
                 {
@@ -565,9 +629,16 @@ namespace gui
         {
             this->_render_roi_control();
 
+            // 스트림마다 같은 값인 튜닝은 모든 트래커에 같이 놓는다. 읽는 것은 보이는 스트림에서.
+            const auto for_each_tag_tracker = [&pipe](auto&& fn) {
+                for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx) {
+                    if (auto* t = dynamic_cast<pose::apriltag_tracker*>(pipe.tracker(stream_idx))) { fn(*t); }
+                }
+            };
+
             // ----- Tag detection tuning (live; the worker rebuilds the detector on change) -----
             // Shown only while the tag tracker is the one running, since these knobs describe it.
-            if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(pipe.tracker()))
+            if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(pipe.tracker(_ui.selected_stream_idx)))
             {
                 ImGui::SeparatorText("Tag Detection");
 
@@ -576,7 +647,7 @@ namespace gui
                 if (ImGui::DragScalar("Tag size [m]", ImGuiDataType_Double, &tag_size_m,
                         0.001f, &tag_min, &tag_max, "%.3f", ImGuiSliderFlags_AlwaysClamp))
                 {
-                    tag_tracker->set_tag_size_m(tag_size_m);
+                    for_each_tag_tracker([tag_size_m](pose::apriltag_tracker& t) { t.set_tag_size_m(tag_size_m); });
                 }
                 ImGui::SetItemTooltip("Real black-square edge length of the printed tag [m].\n"
                                       "Fixes the metric scale of every estimated 3D position; must match the tag.\n"
@@ -634,14 +705,14 @@ namespace gui
                                       "Lower: fewer cores used.");
 
                 if (changed) {
-                    tag_tracker->set_options(opt); // worker rebuilds the detector next frame
+                    for_each_tag_tracker([&opt](pose::apriltag_tracker& t) { t.set_options(opt); }); // workers rebuild the detector next frame
                 }
 
                 ImGui::TextDisabled("Applies live to an open source; rebuilds the detector.");
             }
 
             // ----- Color marker tuning, shown while that tracker is the one running -----
-            if (auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker()))
+            if (auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker(_ui.selected_stream_idx)))
             {
                 this->_render_color_marker_control(*color_tracker);
             }
@@ -657,8 +728,6 @@ namespace gui
                 pipe.set_sagittal_options(*sagittal);
             }
 
-            // The panel renders only with a source open, so what is written is the tuning that is
-            // actually running.
             ImGui::SeparatorText("Config");
             {
                 if (ImGui::Button("Save Config..."))
@@ -680,31 +749,34 @@ namespace gui
 
         ImGui::SeparatorText("ROI");
 
-        const Eigen::Vector2i full = pipe.source_full_resolution();
+        const Eigen::Vector2i full = pipe.source_full_resolution(_ui.selected_stream_idx);
         if (full.x() <= 0 || full.y() <= 0)
         {
             ImGui::TextDisabled("Open a source to place an ROI.");
             return;
         }
 
-        const std::optional<hw::roi_t> effective = pipe.effective_roi();
-        ImGui::Text("In force: %dx%d+%d+%d"
-            , effective ? effective->width : full.x()
-            , effective ? effective->height : full.y()
-            , effective ? effective->x : 0
-            , effective ? effective->y : 0
-        );
+        // 스트림마다 하나씩 보여 주고, 편집은 보이는 스트림의 것이다.
+        for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx)
+        {
+            const Eigen::Vector2i stream_full = pipe.source_full_resolution(stream_idx);
+            const std::optional<hw::roi_t> in_force = pipe.effective_roi(stream_idx);
+            ImGui::Text("%s: %dx%d+%d+%d%s"
+                , camera_label(pipe.camera_view(stream_idx))
+                , in_force ? in_force->width : stream_full.x()
+                , in_force ? in_force->height : stream_full.y()
+                , in_force ? in_force->x : 0
+                , in_force ? in_force->y : 0
+                , stream_idx == _ui.selected_stream_idx ? " (shown)" : ""
+            );
+        }
 
         // Placing one takes seeing the frame, so the rect and its numbers live over the camera
-        // window. A recording declares one frame size for the file, so there is nothing to compose.
-        ImGui::SameLine();
+        // window. A recording declares each stream's frame size once, so there is nothing to compose.
         ImGui::BeginDisabled(pipe.is_recording());
         if (ImGui::Button("Edit..."))
         {
-            _ui.roi_size[0] = effective ? effective->width : full.x();
-            _ui.roi_size[1] = effective ? effective->height : full.y();
-            _ui.roi_offset[0] = effective ? effective->x : 0;
-            _ui.roi_offset[1] = effective ? effective->y : 0;
+            this->_seed_roi_edit_rect();
             _ui.view_tool = view_tool_t::roi_edit;
         }
         ImGui::EndDisabled();
@@ -769,7 +841,9 @@ namespace gui
     // from the undrawn frame: the overlay sits on the markers and would contribute its own pixels.
     void debugger_app::_handle_color_sample_click(const ImVec2& img_min, const ImVec2& img_max)
     {
-        if (_last_source_frame.empty()) { return; }
+        if (_ui.selected_stream_idx >= _stream_views.size()) { return; }
+        const cv::Mat& source = _stream_views[_ui.selected_stream_idx].source;
+        if (source.empty()) { return; }
         if (!ImGui::IsItemHovered() || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) { return; }
 
         const float span_x = img_max.x - img_min.x;
@@ -777,16 +851,16 @@ namespace gui
         if (!(span_x > 0.0f) || !(span_y > 0.0f)) { return; }
 
         const ImVec2 m = ImGui::GetIO().MousePos;
-        const int px = static_cast<int>((m.x - img_min.x) / span_x * static_cast<float>(_last_source_frame.cols));
-        const int py = static_cast<int>((m.y - img_min.y) / span_y * static_cast<float>(_last_source_frame.rows));
-        if (px < 0 || py < 0 || px >= _last_source_frame.cols || py >= _last_source_frame.rows) { return; }
+        const int px = static_cast<int>((m.x - img_min.x) / span_x * static_cast<float>(source.cols));
+        const int py = static_cast<int>((m.y - img_min.y) / span_y * static_cast<float>(source.rows));
+        if (px < 0 || py < 0 || px >= source.cols || py >= source.rows) { return; }
 
-        _color_sampler.add(_last_source_frame, cv::Point{ px, py }, _ui.color_sample_radius);
+        _color_sampler.add(source, cv::Point{ px, py }, _ui.color_sample_radius);
 
         // Mark where the sample was taken, so a drag leaves a visible trail.
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float r = static_cast<float>(_ui.color_sample_radius) * span_x
-                      / static_cast<float>(_last_source_frame.cols);
+                      / static_cast<float>(source.cols);
         dl->AddCircle(m, std::max(3.0f, r), IM_COL32(255, 255, 0, 220), 0, 2.0f);
     }
 
@@ -851,7 +925,7 @@ namespace gui
     {
         net::exo_pose_pipeline& pipe = _server->pipeline();
 
-        const Eigen::Vector2i full = pipe.source_full_resolution();
+        const Eigen::Vector2i full = pipe.source_full_resolution(_ui.selected_stream_idx);
         if (full.x() <= 0 || full.y() <= 0) { return false; } // nothing left to place an ROI in
 
         const int extent = std::max(full.x(), full.y());
@@ -868,16 +942,16 @@ namespace gui
         ImGui::BeginDisabled(recording);
         if (ImGui::Button("Apply"))
         {
-            pipe.set_roi(hw::roi_t{ _ui.roi_offset[0], _ui.roi_offset[1], _ui.roi_size[0], _ui.roi_size[1] });
+            pipe.set_roi(_ui.selected_stream_idx, hw::roi_t{ _ui.roi_offset[0], _ui.roi_offset[1], _ui.roi_size[0], _ui.roi_size[1] });
             _ui.view_tool = view_tool_t::none;
         }
-        ImGui::SetItemTooltip("Narrow delivered frames to this region. A camera reads out and sends\n"
-                              "less of the sensor, and detection has less to search.\n"
+        ImGui::SetItemTooltip("Narrow the shown camera's frames to this region. A camera reads out and\n"
+                              "sends less of the sensor, and detection has less to search.\n"
                               "A sagittal run loses its captured rest pose with it.");
         ImGui::SameLine();
         if (ImGui::Button("Full Frame"))
         {
-            pipe.set_roi(std::nullopt);
+            pipe.set_roi(_ui.selected_stream_idx, std::nullopt);
             _ui.view_tool = view_tool_t::none;
         }
         ImGui::EndDisabled();
@@ -893,7 +967,7 @@ namespace gui
         else
         {
             // The reference the rect above is being composed against.
-            const std::optional<hw::roi_t> effective = pipe.effective_roi();
+            const std::optional<hw::roi_t> effective = pipe.effective_roi(_ui.selected_stream_idx);
             ImGui::TextDisabled("in force: %dx%d+%d+%d"
                 , effective ? effective->width : full.x()
                 , effective ? effective->height : full.y()
@@ -923,11 +997,14 @@ namespace gui
             return;
         }
 
+        // 도구가 작용하는 스트림. 바꾸면 그 스트림의 프레임과 트래커로 넘어간다.
+        this->_render_stream_selector("camera_window");
+
         bool tool_alive = true;
         switch (_ui.view_tool)
         {
         case view_tool_t::color_sample:
-            if (auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker())) {
+            if (auto* color_tracker = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker(_ui.selected_stream_idx))) {
                 this->_render_color_sample_tools(*color_tracker);
             } else {
                 tool_alive = false; // the tracker it measures for is not the one running
@@ -942,21 +1019,24 @@ namespace gui
         }
         ImGui::Separator();
 
-        if (!pipe.is_source_open() || !_frame_texture.value().valid())
+        // 도구는 고른 스트림 하나 위에서만 산다. 마우스도 캔버스도 하나다.
+        const frame_texture* texture = (_ui.selected_stream_idx < _stream_views.size())
+            ? _stream_views[_ui.selected_stream_idx].texture.get() : nullptr;
+        if (!pipe.is_source_open() || texture == nullptr || !texture->valid())
         {
             ImGui::TextDisabled("Waiting for sensor frames...");
             ImGui::End();
-            if (!open) { _ui.view_tool = view_tool_t::none; }
+            if (!open || !tool_alive) { _ui.view_tool = view_tool_t::none; }
             return;
         }
 
         const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const float tw = static_cast<float>(_frame_texture.value().width());
-        const float th = static_cast<float>(_frame_texture.value().height());
+        const float tw = static_cast<float>(texture->width());
+        const float th = static_cast<float>(texture->height());
         const float scale = std::min(avail.x / tw, avail.y / th);
         if (scale > 0.0f)
         {
-            ImGui::Image(_frame_texture.value().id(), ImVec2{ tw * scale, th * scale });
+            ImGui::Image(texture->id(), ImVec2{ tw * scale, th * scale });
             const ImVec2 img_min = ImGui::GetItemRectMin();
             const ImVec2 img_max = ImGui::GetItemRectMax();
 
@@ -985,10 +1065,134 @@ namespace gui
     hw::roi_t debugger_app::_shown_window() const
     {
         const net::exo_pose_pipeline& pipe = _server->pipeline();
-        if (const std::optional<hw::roi_t> roi = pipe.effective_roi()) { return *roi; }
+        if (const std::optional<hw::roi_t> roi = pipe.effective_roi(_ui.selected_stream_idx)) { return *roi; }
 
-        const Eigen::Vector2i full = pipe.source_full_resolution();
+        const Eigen::Vector2i full = pipe.source_full_resolution(_ui.selected_stream_idx);
         return hw::roi_t{ 0, 0, full.x(), full.y() };
+    }
+
+    void debugger_app::_render_stream_views(const ImVec2& area)
+    {
+        const net::exo_pose_pipeline& pipe = _server->pipeline();
+        const std::size_t count = std::max<std::size_t>(1, _stream_views.size());
+        if (area.x <= 0.0f) { return; }
+
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float pane_w = std::max(1.0f,
+            (area.x - spacing * static_cast<float>(count - 1)) / static_cast<float>(count));
+
+        // 칸마다 자기 비율로 그리고 높이만 공유한다. 높이가 0 이면 첫 유효 텍스처의 비율로 잡는다.
+        float pane_h = area.y;
+        if (pane_h <= 0.0f)
+        {
+            for (const stream_view_t& stream_view : _stream_views)
+            {
+                if (!stream_view.texture || !stream_view.texture->valid()) { continue; }
+                pane_h = pane_w * static_cast<float>(stream_view.texture->height())
+                                / static_cast<float>(stream_view.texture->width());
+                break;
+            }
+        }
+        if (pane_h <= 0.0f)
+        {
+            ImGui::TextUnformatted("Waiting for sensor frames...");
+            return;
+        }
+
+        for (std::size_t stream_idx = 0; stream_idx < _stream_views.size(); ++stream_idx)
+        {
+            if (stream_idx > 0) { ImGui::SameLine(); }
+            ImGui::PushID(static_cast<int>(stream_idx));
+            ImGui::BeginChild("stream_view", ImVec2{ pane_w, pane_h }, ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+            // 칸마다 그 카메라가 찍는 다리를 붙인다.
+            if (_stream_views.size() > 1)
+            {
+                ImGui::TextDisabled("%s", std::format("{}{}",
+                    camera_label(pipe.camera_view(stream_idx)),
+                    stream_idx == _ui.selected_stream_idx ? " (shown)" : "").c_str());
+            }
+
+            const frame_texture* texture = _stream_views[stream_idx].texture.get();
+            if (texture != nullptr && texture->valid())
+            {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                const float tw = static_cast<float>(texture->width());
+                const float th = static_cast<float>(texture->height());
+                const float scale = std::min(avail.x / tw, avail.y / th);
+                if (scale > 0.0f)
+                {
+                    const ImVec2 sz{ tw * scale, th * scale };
+                    const ImVec2 cur = ImGui::GetCursorPos();
+                    ImGui::SetCursorPos(ImVec2{ cur.x + (avail.x - sz.x) * 0.5f, cur.y + (avail.y - sz.y) * 0.5f });
+                    ImGui::Image(texture->id(), sz);
+                }
+            }
+            else
+            {
+                ImGui::TextUnformatted("Waiting for frames...");
+            }
+
+            ImGui::EndChild();
+            ImGui::PopID();
+        }
+    }
+
+    void debugger_app::_render_stream_selector(const char* id)
+    {
+        const net::exo_pose_pipeline& pipe = _server->pipeline();
+        const std::size_t count = pipe.stream_count();
+        if (count < 2) { return; }
+
+        ImGui::PushID(id);
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::BeginCombo("Shown camera", camera_label(pipe.camera_view(_ui.selected_stream_idx))))
+        {
+            for (std::size_t stream_idx = 0; stream_idx < count; ++stream_idx)
+            {
+                if (ImGui::Selectable(camera_label(pipe.camera_view(stream_idx)), stream_idx == _ui.selected_stream_idx)
+                    && stream_idx != _ui.selected_stream_idx)
+                {
+                    _ui.selected_stream_idx = stream_idx;
+                    this->_on_selected_stream_changed();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip("The camera the frame view, the colour panel and the frame tools act on.\n"
+                              "Both cameras are detected regardless.");
+        ImGui::PopID();
+    }
+
+    void debugger_app::_on_selected_stream_changed()
+    {
+        net::exo_pose_pipeline& pipe = _server->pipeline();
+
+        _color_sampler.clear();
+        _trace.clear();
+
+        // 문턱은 이 스트림의 검출기가 받아들이고 있는 값에서 다시 시작한다.
+        if (const auto* color_tracker = dynamic_cast<const pose::color_marker_tracker*>(
+                pipe.tracker(_ui.selected_stream_idx)))
+        {
+            _ui.color_max_distance = color_tracker->detector_options().model.max_distance;
+        }
+
+        if (_ui.view_tool == view_tool_t::roi_edit) { this->_seed_roi_edit_rect(); }
+    }
+
+    void debugger_app::_seed_roi_edit_rect()
+    {
+        const net::exo_pose_pipeline& pipe = _server->pipeline();
+
+        const Eigen::Vector2i full = pipe.source_full_resolution(_ui.selected_stream_idx);
+        const std::optional<hw::roi_t> effective = pipe.effective_roi(_ui.selected_stream_idx);
+
+        _ui.roi_size[0] = effective ? effective->width : full.x();
+        _ui.roi_size[1] = effective ? effective->height : full.y();
+        _ui.roi_offset[0] = effective ? effective->x : 0;
+        _ui.roi_offset[1] = effective ? effective->y : 0;
     }
 
     void debugger_app::_handle_roi_interaction(const ImVec2& img_min, const ImVec2& img_max)
@@ -1067,7 +1271,7 @@ namespace gui
 
         if (!changed) { return; }
 
-        const Eigen::Vector2i full = _server->pipeline().source_full_resolution();
+        const Eigen::Vector2i full = _server->pipeline().source_full_resolution(_ui.selected_stream_idx);
         const float max_w = static_cast<float>(full.x());
         const float max_h = static_cast<float>(full.y());
 
@@ -1166,6 +1370,9 @@ namespace gui
     {
         ImGui::SeparatorText("Color Model");
 
+        // 색과 블롭 게이트는 카메라마다 잰 값이다. 고른 스트림의 것을 편집한다.
+        this->_render_stream_selector("color_model");
+
         const pose::color_model_t model = tracker.detector_options().model;
         if (model.valid) {
             ImGui::Text("model       a*%+.1f b*%+.1f  sd %.1f/%.1f  d<%.1f",
@@ -1188,15 +1395,41 @@ namespace gui
         }
         ImGui::SetItemTooltip("Opens the camera window with the sampler live: drag over a marker\n"
                               "to collect the pixels under the cursor, then fit them into a model.");
+
+        // 고른 스트림의 색, 블롭 게이트, 배정 설정을 다른 스트림들의 시작점으로 복사한다.
+        net::exo_pose_pipeline& pipe = _server->pipeline();
+        if (pipe.stream_count() < 2) { return; }
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!model.valid);
+        if (ImGui::Button("Copy to the other camera"))
+        {
+            const pose::color_marker_detector::options_t measured = tracker.detector_options();
+            const pose::color_marker_assigner::options_t assignment = tracker.assigner_options();
+            for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx)
+            {
+                if (stream_idx == _ui.selected_stream_idx) { continue; }
+                if (auto* t = dynamic_cast<pose::color_marker_tracker*>(pipe.tracker(stream_idx))) {
+                    t->set_detector_options(measured);
+                    t->set_assigner_options(assignment);
+                }
+            }
+            spdlog::info("color: the {}'s model, blob filters and assignment settings copied to the other one",
+                camera_label(pipe.camera_view(_ui.selected_stream_idx)));
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Installs this camera's colour, blob filters and joint assignment settings on the\n"
+                              "other one as a starting point. Each camera sees its own light and stands at its\n"
+                              "own distance, so tune them separately when one leg's markers are missed.");
     }
 
     void debugger_app::_render_color_marker_control(pose::color_marker_tracker& tracker)
     {
         this->_render_color_model_section(tracker);
 
-        // ----- Readout: has the leg been identified, and what did the last frame find -----
+        // ----- Readout: what the last frame found, and whether it named the joints -----
         // These two together localize a stall. Nothing detected is a colour, exposure or lighting
-        // problem; detected but not identified is an ordering, radius or geometry problem.
+        // problem; detected but unnamed is an ordering, radius or geometry problem.
         ImGui::SeparatorText("Color Markers");
 
         const pose::color_marker_assigner::stats_t& assignment = tracker.assigner_stats();
@@ -1289,20 +1522,6 @@ namespace gui
         const double kTolMin = 0.05, kTolMax = 0.95;
         const double kDiaMin = 0.001, kDiaMax = 0.2;
 
-        // The chain of joint names is built from this, so a change drops the lock and the captured
-        // spacing with it, and the next frames name the markers from their vertical order again.
-        // `midline` is left out: the config refuses it for this field, so offering it here would
-        // make a state that cannot be saved and reopened.
-        const auto leg_radio = [&assigner](const char* label, pose::joint_side_t side) {
-            if (ImGui::RadioButton(label, assigner.leg == side)) { assigner.leg = side; }
-        };
-        ImGui::TextUnformatted("Marked leg");
-        ImGui::SameLine(); leg_radio("Left", pose::joint_side_t::left);
-        ImGui::SameLine(); leg_radio("Right", pose::joint_side_t::right);
-        ImGui::SetItemTooltip("Which leg carries the markers. A plain disc does not state one, so this does.\n"
-                              "Changing it renames every slot: the assignment unlocks and the bone length\n"
-                              "reference is dropped until the next rest-pose capture.");
-
         // The geometry check is the first thing to switch off when the assignment will not settle,
         // since it tells apart a broken rigid-body assumption from a broken order or radius.
         ImGui::Checkbox("Bone length check", &assigner.enable_bone_length_check);
@@ -1336,33 +1555,41 @@ namespace gui
         ImGui::SetItemTooltip("Printed disc diameter. Sets the metric scale of the reported\n"
                               "positions only; the joint angles do not depend on it.");
 
-        // Handed back every frame: six numbers, so no change detection.
+        // Handed back every frame: five numbers, so no change detection.
         tracker.set_assigner_options(assigner);
     }
 
     void debugger_app::_render_sagittal_estimator_control(pose::sagittal_pose_estimator::options_t& opt)
     {
-        // ----- Readout: which leg is being tracked -----
-        // The side is inferred from the detected tag ids, so showing it is the only way to catch a
-        // camera placed on the wrong side (or a leg whose tags are not being seen at all).
-        // What that leg measures is the plot pane's Sagittal Angles view.
-        ImGui::SeparatorText("Tracked Leg");
+        // ----- Readout: which leg each camera measures -----
+        // Each camera measures the leg on its side, so showing which it is and whether that leg is
+        // solving is the way to catch a camera placed on the wrong side (or a leg whose tags are not
+        // being seen at all). What each leg measures is the plot pane's Sagittal Angles view.
+        ImGui::SeparatorText("Legs");
         {
-            const pose::sagittal_pose_estimator* est = _server->pipeline().sagittal_estimator();
-            const auto knee = est ? est->tracked_leg_knee() : std::nullopt;
+            const net::exo_pose_pipeline& pipe = _server->pipeline();
+            const pose::sagittal_pose_estimator* est = pipe.sagittal_estimator();
 
-            const auto def = knee.has_value()
-                ? pose::get_joint_def(knee.value())
-                : std::optional<pose::joint_definition_t>{};
+            for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx)
+            {
+                const std::optional<pose::joint_side_t> leg = pose::viewed_leg_of(pipe.camera_view(stream_idx));
+                if (!leg.has_value()) { continue; }
 
-            if (def.has_value()) {
-                ImGui::TextUnformatted(std::format("Near leg: {} (tag {})", def->name, def->tag_id).c_str());
-            } else {
-                ImGui::TextDisabled("Near leg: undecided (waiting for tags)");
+                // The knee names the leg: the hip sits on the shared pelvis tag, so the knee's tag is
+                // the first one that identifies it.
+                const std::optional<pose::joint_id_t> hip = pose::get_leg_root_joint(leg.value());
+                const std::optional<pose::joint_id_t> knee =
+                    hip.has_value() ? pose::get_child_joint(hip.value()) : std::nullopt;
+                const bool solving = est && knee.has_value()
+                    && est->get_joint_state(knee.value()).sagittal_clinical_angle.has_value();
+
+                ImGui::TextUnformatted(std::format("{} : {}"
+                    , camera_label(pipe.camera_view(stream_idx))
+                    , solving ? "angles flowing" : "no angles").c_str());
             }
-            ImGui::SetItemTooltip("Read off the detected tag ids: only one leg carries tags.\n"
-                                  "It also tells which side the camera stands on, hence which way\n"
-                                  "the legs swing.");
+            ImGui::SetItemTooltip("Whether each camera's leg chain is solving. A camera standing on the\n"
+                                  "wrong side reads its own leg's markers as the other one's and shows\n"
+                                  "no angles here.");
         }
 
         // ----- Position track (image-plane points; angles are read off them) -----
@@ -1476,12 +1703,23 @@ namespace gui
         std::filesystem::create_directories(dir, ec); // best-effort; write_json reports a real failure
         const std::filesystem::path path = dir / default_trace_name();
 
+        // 메타데이터는 스트림마다 적는다. 검출(태그 기하)은 고른 스트림의 것이라 그 인덱스를 함께 적는다.
+        std::vector<pose_trace_recorder::stream_info_t> streams;
+        for (std::size_t stream_idx = 0; stream_idx < pipe.stream_count(); ++stream_idx)
+        {
+            streams.push_back(pose_trace_recorder::stream_info_t{
+                .camera_view = pipe.camera_view(stream_idx),
+                .resolution = pipe.source_resolution(stream_idx),
+                .fps = pipe.source_fps(stream_idx),
+                .intrinsics = pipe.intrinsics(stream_idx),
+            });
+        }
+
         _trace.write_json(
             path,
             pipe.source_name(),
-            pipe.source_resolution(),
-            pipe.source_fps(),
-            pipe.intrinsics(),
+            streams,
+            _ui.selected_stream_idx,
             pipe.view_plane()
         );
     }
@@ -1545,7 +1783,7 @@ namespace gui
 
             // JPEG subsamples chroma, which is the very thing a colour model is measured on. A
             // recording meant for tuning it has to keep the colour the sensor saw.
-            if (is_jpeg && dynamic_cast<const pose::color_marker_tracker*>(_server->pipeline().tracker()))
+            if (is_jpeg && dynamic_cast<const pose::color_marker_tracker*>(_server->pipeline().tracker(_ui.selected_stream_idx)))
             {
                 ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s",
                     "JPEG halves the colour resolution again on top of the sensor's Bayer\n"

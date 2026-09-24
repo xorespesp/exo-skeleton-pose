@@ -511,7 +511,7 @@ namespace gui
 
         const char* hint = nullptr;
         if (!est || !est->has_rest_pose()) { hint = "calibrate a rest pose to animate"; }
-        else if (any_driven && any_still) { hint = "only the measured leg is driven"; }
+        else if (any_driven && any_still) { hint = "a partly seen leg is not driven"; }
 
         const ImVec4 bone_col(_rig_skel.bone_color[0], _rig_skel.bone_color[1], _rig_skel.bone_color[2], _rig_skel.bone_color[3]);
         const ImVec4 point_col(_rig_skel.point_color[0], _rig_skel.point_color[1], _rig_skel.point_color[2], _rig_skel.point_color[3]);

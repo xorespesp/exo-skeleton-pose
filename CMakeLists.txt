@@ -34,6 +34,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/hw/frame_format.hh"
     "src/hw/calibration.hh"
     "src/hw/sensor_backend.hh"
+    "src/hw/device_enumeration.hh"
+    "src/hw/device_enumeration.cc"
     "src/hw/source_config.hh"
     "src/hw/source_config.cc"
     "src/hw/sensor_frameset.hh"
@@ -79,6 +81,8 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/pose/joint_measurement.hh"
     "src/pose/marker_tracker.hh"
     "src/pose/marker_tracker.cc"
+    "src/pose/synced_tracker.hh"
+    "src/pose/synced_tracker.cc"
     "src/pose/view_plane.hh"
     "src/pose/pose_estimator_base.hh"
     "src/pose/frontal_pose_estimator.hh"
@@ -113,6 +117,7 @@ target_sources(${TARGET_NAME} PRIVATE
     "src/net/exo_pose_server.cc"
 
     # misc
+    "src/utils/latest_value_latch.hh"
     "src/utils/serializable.hh"
 )
 
@@ -138,6 +143,7 @@ include(FetchSDL3)
 include(FetchFlatBuffers)
 include(FetchUWebSockets)
 include(FetchNlohmannJson)
+include(FetchBSThreadPool)
 
 add_subdirectory(deps)
 
@@ -229,6 +235,7 @@ target_link_libraries(${TARGET_NAME} PRIVATE
     uwebsockets::uwebsockets
     flatbuffers::flatbuffers
     nlohmann_json::nlohmann_json
+    BS::thread_pool
 )
 
 setup_orbbec_k4a_binaries(${TARGET_NAME} INSTALL_PATH ${CMAKE_INSTALL_BINDIR})

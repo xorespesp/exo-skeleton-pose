@@ -3,17 +3,14 @@
 #include "frame_texture.hh"
 #include "log_console.hh"
 #include "app_config.hh"
+#include "hw/device_enumeration.hh"
 #include "hw/sensor_frame_provider.hh"
 #include "io/frame_recorder.hh"
 #include "pose/marker_tracker.hh"
+#include "pose/synced_tracker.hh"
 #include "pose/tag_detector.hh"
-#ifdef EXO_HAS_VZ_BACKEND
-#include "hw/backends/vz_device.hh"
-#endif
-
 #include <imfilebrowser.h>
 #include <implot.h>
-#include <k4a/k4a.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -33,11 +30,8 @@
 #include <utility>
 #include <vector>
 
-// 동기화 검증용 임시 하네스. 핵심 모듈(provider, synchronizer, tracker_thread)을 그대로 쓰기만 하고,
-// 여기에만 있는 로직은 UI 와 장치 열거뿐이다. 검증이 끝나면 통째로 걷어 낸다.
-//
-// 장치 열거는 카메라 SDK 에 직접 닿는다(K4A C API, `vz::device`). 소비자가 이 파일뿐이라 핵심에 seam 을
-// 두지 않고, 파일이 지워질 때 함께 사라지게 한 것이다.
+// 동기화 검증용 임시 하네스. 핵심 모듈(provider, synchronizer, synced_tracker, frame_recorder, 장치
+// 열거)을 그대로 쓰기만 하고, 여기에만 있는 로직은 UI 뿐이다. 검증이 끝나면 통째로 걷어 낸다.
 namespace gui
 {
     namespace
@@ -45,77 +39,6 @@ namespace gui
         constexpr std::size_t kMaxCameraRows = 4;
         constexpr std::size_t kSkewHistoryLength = 256;
         constexpr double kTagSizeM = 0.05; // 검출 수와 시간만 보므로 포즈 스케일은 아무 값이어도 된다
-        constexpr uint32_t kVzEnumerateTimeoutMs = 500; // 인터페이스 스캔 한도. 넘기면 그 위의 카메라는 없는 것으로 친다
-
-        // 꽂혀 있는 카메라 하나. 기종은 열거한 목록이 말한다.
-        struct device_info_t
-        {
-            uint32_t device_index{ 0 };
-            std::string device_serial; // SDK 가 주지 않으면 비어 있다
-            std::string display_name;
-        };
-
-        // SDK 가 붙이는 널 종단을 떼고 돌려준다. 읽지 못하면 비어 있다.
-        std::string read_k4a_serialnum(k4a_device_t device)
-        {
-            std::string serialnum;
-            size_t needed = 0;
-            if (::k4a_device_get_serialnum(device, nullptr, &needed) == K4A_BUFFER_RESULT_TOO_SMALL && needed > 1)
-            {
-                serialnum.resize(needed);
-                if (::k4a_device_get_serialnum(device, &serialnum[0], &needed) == K4A_BUFFER_RESULT_SUCCEEDED
-                    && !serialnum.empty() && serialnum.back() == '\0')
-                {
-                    serialnum.pop_back();
-                }
-                else
-                {
-                    serialnum.clear();
-                }
-            }
-            return serialnum;
-        }
-
-        // 시리얼은 열어야 읽힌다. 이미 열려 있는 장치는 열리지 않으므로 인덱스만 남는다.
-        std::vector<device_info_t> enumerate_k4a_devices()
-        {
-            std::vector<device_info_t> found;
-            const uint32_t count = ::k4a_device_get_installed_count();
-            for (uint32_t device_index = 0; device_index < count; ++device_index)
-            {
-                device_info_t info{ .device_index = device_index };
-                k4a_device_t device = nullptr;
-                if (K4A_SUCCEEDED(::k4a_device_open(device_index, &device)))
-                {
-                    info.device_serial = read_k4a_serialnum(device);
-                    ::k4a_device_close(device);
-                }
-                info.display_name = info.device_serial.empty()
-                    ? std::format("k4a device #{}", device_index)
-                    : std::format("k4a device #{} (S/N {})", device_index, info.device_serial);
-                found.push_back(std::move(info));
-            }
-            return found;
-        }
-
-        std::vector<device_info_t> enumerate_vz_devices()
-        {
-            std::vector<device_info_t> found;
-#ifdef EXO_HAS_VZ_BACKEND
-            std::string err_msg;
-            const std::vector<vz::device_info_t> devices = vz::device::enumerate(kVzEnumerateTimeoutMs, &err_msg);
-            if (!err_msg.empty()) { spdlog::warn("camera-test: vz enumeration: {}", err_msg); }
-            for (uint32_t device_index = 0; device_index < devices.size(); ++device_index)
-            {
-                found.push_back(device_info_t{
-                    .device_index = device_index,
-                    .device_serial = devices[device_index].serial,
-                    .display_name = std::format("vz device #{} (S/N {})", device_index, devices[device_index].serial),
-                });
-            }
-#endif
-            return found;
-        }
 
         // 코덱 콤보 항목. `io::kImageCodecs` 와 같은 순서.
         constexpr std::array<const char*, io::kImageCodecs.size()> kCodecLabels{
@@ -141,7 +64,7 @@ namespace gui
         }
 
         // 워커가 슬롯별 스냅샷 하나와 최근 Δt 이력을 발행하고, GUI 가 텍스처 작업을 전부 소유한다.
-        // 검출 테스트가 켜져 있으면 슬롯별 프레임을 그 스트림의 tracker_thread 에도 넘긴다.
+        // 검출 테스트가 켜져 있으면 frameset 을 통째로 `synced_tracker` 에도 넘긴다.
         class preview_observer final : public hw::synced_frameset_observer
         {
         public:
@@ -162,15 +85,15 @@ namespace gui
                 return copy;
             }
 
-            void set_tracker_threads(std::vector<std::shared_ptr<pose::tracker_thread>> tracker_threads)
+            void set_synced_tracker(std::shared_ptr<pose::synced_tracker_base> synced_tracker)
             {
                 std::scoped_lock lock{ _mutex };
-                _tracker_threads = std::move(tracker_threads);
+                _synced_tracker = std::move(synced_tracker);
             }
 
             void on_synced_frameset_update(const hw::synced_frameset& frameset) override
             {
-                std::vector<std::shared_ptr<pose::tracker_thread>> tracker_threads;
+                std::shared_ptr<pose::synced_tracker_base> synced_tracker;
                 {
                     std::scoped_lock lock{ _mutex };
                     _frames.assign(frameset.stream_count(), nullptr);
@@ -188,15 +111,11 @@ namespace gui
                         _pair_skew_ms.push_back(to_ms(frameset.max_pair_skew()));
                         if (_pair_skew_ms.size() > kSkewHistoryLength) { _pair_skew_ms.pop_front(); }
                     }
-                    tracker_threads = _tracker_threads;
+                    synced_tracker = _synced_tracker;
                 }
 
-                // 워커에 넘기는 것은 락 밖에서. submit 은 막히지 않는다.
-                for (std::size_t stream_idx = 0; stream_idx < tracker_threads.size() && stream_idx < frameset.stream_count(); ++stream_idx)
-                {
-                    const hw::sensor_frameset* capture = frameset.stream_frameset(stream_idx);
-                    if (capture && tracker_threads[stream_idx]) { tracker_threads[stream_idx]->submit(capture->frame()); }
-                }
+                // `synced_tracker` 에 넘기는 것은 락 밖에서. submit 은 막히지 않는다.
+                if (synced_tracker) { synced_tracker->submit(frameset); }
             }
 
             void on_sensor_stream_reset() override
@@ -218,13 +137,12 @@ namespace gui
             std::vector<std::shared_ptr<hw::sensor_frame>> _frames;
             std::deque<float> _pair_skew_ms;
             std::optional<hw::stream_end_reason_t> _end;
-            std::vector<std::shared_ptr<pose::tracker_thread>> _tracker_threads;
+            std::shared_ptr<pose::synced_tracker_base> _synced_tracker;
         };
 
         // 카메라 한 대를 어떻게 열지. 하네스 UI 의 행 하나.
         struct camera_row_t
         {
-            int backend_kind{ 0 };   // 0 = K4A, 1 = VZ
             int device_choice{ -1 }; // 열거 목록의 인덱스. -1: 인덱스로 직접
             int device_index{ 0 };
             int format_index{ 0 };   // 0 = BGR8, 1 = GRAY8
@@ -256,10 +174,10 @@ namespace gui
         std::vector<hw::timestamp_t> displayed_timestamps;
         std::vector<roi_editor_t> roi_editors;
 
-        // AprilTag 검출 테스트. 스트림마다 트래커 하나를 자기 스레드에서 돌린다.
+        // AprilTag 검출 테스트. 스트림마다 트래커 하나를 `synced_tracker` 가 frameset 단위로 돌린다.
         bool apriltag_test{ false };
         float tag_quad_decimate{ 2.0f };
-        std::vector<std::shared_ptr<pose::tracker_thread>> tracker_threads;
+        std::shared_ptr<pose::synced_tracker_base> synced_tracker;
 
         // 녹화. 열린 스트림 전부를 파일 하나에 담는다.
         std::shared_ptr<io::frame_recorder> recorder; // 녹화 중에만 non-null
@@ -270,8 +188,10 @@ namespace gui
         std::filesystem::path recording;
         int source_mode{ 0 }; // 0 = 카메라, 1 = MCAP 녹화
         std::vector<camera_row_t> camera_rows{ camera_row_t{} };
-        std::vector<device_info_t> k4a_devices;
-        std::vector<device_info_t> vz_devices;
+
+        // 한 번에 여는 카메라들은 같은 백엔드다. 목록도 그 백엔드의 것 하나다.
+        int backend_kind{ 0 }; // 0 = K4A, 1 = VZ
+        std::vector<hw::device_info_t> devices;
         bool devices_enumerated{ false };
         int reference_stream_idx{ 0 };
         float max_pair_skew_ms{ 0.0f }; // 0: 기준 스트림 간격의 절반으로 자동
@@ -294,8 +214,8 @@ namespace gui
 
         void stop_apriltag_test()
         {
-            if (observer) { observer->set_tracker_threads({}); }
-            tracker_threads.clear(); // 각 스레드가 join 된다
+            if (observer) { observer->set_synced_tracker(nullptr); }
+            synced_tracker.reset(); // 그 스레드와 풀이 join 된다
             apriltag_test = false;
         }
 
@@ -305,14 +225,17 @@ namespace gui
             pose::tag_detector::options_t options;
             options.quad_decimate = std::max(1.0f, tag_quad_decimate);
 
-            std::vector<std::shared_ptr<pose::tracker_thread>> threads;
-            for (std::size_t stream_idx = 0; stream_idx < provider->stream_count(); ++stream_idx)
-            {
-                auto tracker = std::make_shared<pose::apriltag_tracker>(options, kTagSizeM, std::nullopt);
-                threads.push_back(std::make_shared<pose::tracker_thread>(std::move(tracker), true));
+            std::vector<pose::synced_tracker_base::stream_entry_t> stream_entries;
+            for (std::size_t stream_idx = 0; stream_idx < provider->stream_count(); ++stream_idx) {
+                stream_entries.push_back({
+                    .tracker = std::make_shared<pose::apriltag_tracker>(options, kTagSizeM, std::nullopt),
+                    .view = pose::camera_view_t::frontal,
+                });
             }
-            tracker_threads = threads;
-            observer->set_tracker_threads(std::move(threads));
+            // 검출 수와 시간만 보므로 측정치의 타입도 뷰도 아무 쪽이어도 된다.
+            synced_tracker = std::make_shared<pose::synced_tracker<pose::joint_2d_measurement_t>>(
+                std::move(stream_entries), true);
+            observer->set_synced_tracker(synced_tracker);
             apriltag_test = true;
         }
 
@@ -403,44 +326,32 @@ namespace gui
 
         void refresh_devices()
         {
-            k4a_devices = enumerate_k4a_devices();
-            vz_devices = enumerate_vz_devices();
+            const auto backend = (backend_kind == 1) ? hw::sensor_backend_t::vz : hw::sensor_backend_t::k4a;
+            devices = hw::enumerate_devices(backend);
             devices_enumerated = true;
-            spdlog::info("camera-test: found {} K4A, {} VZ", k4a_devices.size(), vz_devices.size());
+            spdlog::info("camera-test: found {} {} device(s)", devices.size(), hw::sensor_backend_to_str(backend));
 
-            // 아직 고르지 않은 행에는 같은 백엔드의 열거 순서대로 하나씩 배정한다. 행 둘이 같은 장치를
-            // 가리키는 기본 상태를 피하기 위한 것이고, 이미 고른 행은 건드리지 않는다.
-            std::size_t next_k4a = 0;
-            std::size_t next_vz = 0;
+            // 아직 고르지 않은 행에는 열거 순서대로 하나씩 배정한다. 행 둘이 같은 장치를 가리키는 기본
+            // 상태를 피하기 위한 것이고, 이미 고른 행은 건드리지 않는다.
+            std::size_t next = 0;
             for (camera_row_t& row : camera_rows)
             {
-                std::size_t& next = row.backend_kind == 1 ? next_vz : next_k4a;
-                const std::vector<device_info_t>& devices = devices_for(row);
                 if (row.device_choice < 0 && next < devices.size()) { row.device_choice = static_cast<int>(next); }
                 ++next;
             }
-        }
-
-        const std::vector<device_info_t>& devices_for(const camera_row_t& row) const
-        {
-            return row.backend_kind == 1 ? vz_devices : k4a_devices;
         }
 
         hw::source_config_t make_camera_config(const camera_row_t& row) const
         {
             const auto format = row.format_index == 0 ? hw::frame_format_t::bgr8 : hw::frame_format_t::gray8;
 
-            // 열거 목록에서 고른 장치에 시리얼이 있으면 시리얼로 고정하고, 그 외에는 인덱스로 연다.
-            const std::vector<device_info_t>& devices = devices_for(row);
+            // 열거 목록에서 고른 장치는 시리얼로 고정한다. 고르지 않은 행은 손으로 적은 인덱스로 연다.
             hw::device_selector_t device_selector = hw::device_index_t{ static_cast<uint32_t>(std::max(0, row.device_index)) };
-            if (row.device_choice >= 0 && row.device_choice < static_cast<int>(devices.size()))
-            {
-                const device_info_t& chosen = devices[row.device_choice];
-                if (chosen.device_serial.empty()) { device_selector = hw::device_index_t{ chosen.device_index }; }
-                else { device_selector = hw::device_serial_t{ chosen.device_serial }; }
+            if (row.device_choice >= 0 && row.device_choice < static_cast<int>(devices.size())) {
+                device_selector = hw::device_serial_t{ devices[row.device_choice].device_serial };
             }
 
-            if (row.backend_kind == 1)
+            if (backend_kind == 1)
             {
                 hw::vz_device_config_t camera;
                 camera.device_selector = device_selector;
@@ -552,9 +463,6 @@ namespace gui
             const std::string header = std::format("Camera {}", row_idx);
             if (ImGui::CollapsingHeader(header.c_str(), ImGuiTreeNodeFlags_DefaultOpen))
             {
-                if (ImGui::Combo("Backend", &row.backend_kind, "K4A\0VZ\0")) { row.device_choice = -1; }
-
-                const std::vector<device_info_t>& devices = devices_for(row);
                 const bool chosen = row.device_choice >= 0 && row.device_choice < static_cast<int>(devices.size());
                 const std::string preview = chosen ? devices[row.device_choice].display_name : std::string{ "(by index)" };
                 if (ImGui::BeginCombo("Device", preview.c_str()))
@@ -584,7 +492,7 @@ namespace gui
                 ImGui::BeginDisabled(!row.manual_gain);
                 ImGui::InputInt("Gain", &row.gain);
                 ImGui::EndDisabled();
-                if (row.backend_kind == 1)
+                if (backend_kind == 1)
                 {
                     ImGui::Checkbox("Manual frame rate", &row.manual_frame_rate);
                     ImGui::BeginDisabled(!row.manual_frame_rate);
@@ -666,10 +574,18 @@ namespace gui
             }
             else
             {
+                // 한 번에 여는 카메라들은 같은 백엔드다. 바꾸면 목록도 고른 것도 그 백엔드의 것이 아니다.
+                if (ImGui::Combo("Backend", &backend_kind, "K4A\0VZ\0"))
+                {
+                    devices.clear();
+                    devices_enumerated = false;
+                    for (camera_row_t& row : camera_rows) { row.device_choice = -1; }
+                }
+
                 if (ImGui::Button("Refresh devices")) { refresh_devices(); }
                 ImGui::SameLine();
                 if (devices_enumerated) {
-                    ImGui::Text("%zu K4A, %zu VZ", k4a_devices.size(), vz_devices.size());
+                    ImGui::Text("%zu found", devices.size());
                 } else {
                     ImGui::TextUnformatted("not enumerated");
                 }
@@ -684,7 +600,6 @@ namespace gui
                 if (camera_rows.size() < kMaxCameraRows && ImGui::Button("Add camera")) {
                     // 새 행은 다음 인덱스를 가리킨다. 열거 목록이 있으면 그 순서로 배정한다.
                     camera_row_t row;
-                    row.backend_kind = camera_rows.back().backend_kind;
                     row.device_index = static_cast<int>(camera_rows.size());
                     camera_rows.push_back(row);
                     if (devices_enumerated) { refresh_devices(); }
@@ -699,7 +614,7 @@ namespace gui
                     max_pair_skew_ms = std::max(0.0f, max_pair_skew_ms);
                 }
 
-                for (const camera_row_t& row : camera_rows) { wants_vz = wants_vz || row.backend_kind == 1; }
+                wants_vz = (backend_kind == 1);
             }
 
 #ifndef EXO_HAS_VZ_BACKEND
@@ -843,11 +758,11 @@ namespace gui
                 // 검출 테스트 중에는 트래커가 그린 사본을, 아니면 원본을 올린다.
                 cv::Mat image_to_show;
                 std::optional<uint64_t> image_id;
-                if (apriltag_test && stream_idx < tracker_threads.size() && tracker_threads[stream_idx])
+                if (apriltag_test && synced_tracker)
                 {
                     cv::Mat annotated, source;
-                    uint64_t annotated_id = 0;
-                    if (tracker_threads[stream_idx]->try_take_annotated(annotated, source, annotated_id)) {
+                    uint64_t annotated_id = displayed_frame_ids[stream_idx].value_or(0);
+                    if (synced_tracker->try_get_annotated(stream_idx, annotated, source, annotated_id)) {
                         image_to_show = annotated;
                         image_id = annotated_id;
                     }
@@ -920,20 +835,26 @@ namespace gui
                     , to_ms(per_stream.last_pair_skew));
             }
 
-            if (apriltag_test)
+            if (apriltag_test && synced_tracker)
             {
-                for (std::size_t stream_idx = 0; stream_idx < tracker_threads.size(); ++stream_idx)
+                // frameset 단위: 슬롯 전부가 끝나기까지의 시간이라 30fps 예산과 바로 견줄 수 있다.
+                const pose::synced_tracker_base::stats_t tracker_stats = synced_tracker->stats();
+                ImGui::Text("AprilTag framesets: %.1f ms (last %.1f) | %.1f fps | dropped %llu of %llu | failed %llu"
+                    , tracker_stats.process_ms_ema
+                    , tracker_stats.last_process_ms
+                    , tracker_stats.process_rate_fps
+                    , static_cast<unsigned long long>(tracker_stats.framesets_dropped)
+                    , static_cast<unsigned long long>(tracker_stats.framesets_submitted)
+                    , static_cast<unsigned long long>(tracker_stats.framesets_failed));
+
+                for (std::size_t stream_idx = 0; stream_idx < synced_tracker->stream_count(); ++stream_idx)
                 {
-                    if (!tracker_threads[stream_idx]) { continue; }
-                    const pose::tracker_thread::stats_t tracker_stats = tracker_threads[stream_idx]->stats();
-                    ImGui::Text("AprilTag %zu: %zu tags | %.1f ms (last %.1f) | %.1f fps | dropped %llu of %llu"
+                    const pose::synced_tracker_base::stream_stats_t stream_stats = synced_tracker->stream_stats(stream_idx);
+                    ImGui::Text("AprilTag %zu: %zu tags | %.1f ms (last %.1f)"
                         , stream_idx
-                        , tracker_threads[stream_idx]->tracker().last_detection_count()
-                        , tracker_stats.process_ms_ema
-                        , tracker_stats.last_process_ms
-                        , tracker_stats.process_rate_fps
-                        , static_cast<unsigned long long>(tracker_stats.frames_dropped)
-                        , static_cast<unsigned long long>(tracker_stats.frames_submitted));
+                        , synced_tracker->tracker(stream_idx).last_detection_count()
+                        , stream_stats.process_ms_ema
+                        , stream_stats.last_process_ms);
                 }
             }
 

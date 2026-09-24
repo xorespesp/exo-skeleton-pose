@@ -61,6 +61,37 @@ namespace hw
         }
     } // namespace
 
+    std::vector<device_info_t> k4a_enumerate_devices()
+    {
+        std::vector<device_info_t> found;
+
+        const uint32_t count = ::k4a_device_get_installed_count();
+        for (uint32_t device_index = 0; device_index < count; ++device_index)
+        {
+            k4a_device_t device = nullptr;
+            if (K4A_FAILED(::k4a_device_open(device_index, &device))) {
+                spdlog::warn("k4a: device #{} could not be opened to read its serial and is left out "
+                             "(something else may hold it)", device_index);
+                continue;
+            }
+
+            const std::string serialnum = read_serialnum(device);
+            ::k4a_device_close(device);
+
+            if (serialnum.empty()) {
+                spdlog::warn("k4a: device #{} reported no serial and is left out", device_index);
+                continue;
+            }
+
+            found.push_back(device_info_t{
+                .backend = sensor_backend_t::k4a,
+                .device_serial = serialnum,
+                .display_name = std::format("k4a device #{} (S/N {})", device_index, serialnum),
+            });
+        }
+        return found;
+    }
+
     // Copy the color camera parameters into the SDK-agnostic calibration_t.
     calibration_t k4a_to_calibration(const k4a_calibration_t& k4a_calib)
     {

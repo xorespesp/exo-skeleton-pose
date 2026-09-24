@@ -340,9 +340,6 @@ namespace pose
     public:
         struct options_t
         {
-            // 마커를 붙인 다리. 색은 어느 다리인지 말해 주지 않으므로 설치가 정해 준다.
-            joint_side_t leg{ joint_side_t::left };
-
             // 인쇄한 원반의 지름 [m]. 겉보기 지름과 함께 미터 스케일이 된다.
             double marker_diameter_m{ 0.018 };
 
@@ -364,7 +361,6 @@ namespace pose
             int lost_frames_before_full_search{ 10 };
 
             DECLARE_SERIALIZABLE_FIELDS(
-                v("leg",                            o.leg);
                 v("marker_diameter_m",              o.marker_diameter_m);
                 v("search_radius_px",               o.search_radius_px);
                 v("enable_bone_length_check",       o.enable_bone_length_check);
@@ -387,10 +383,14 @@ namespace pose
             bool has_reference{ false }; // 기준 거리가 잡혀 있는지
         };
 
-        explicit color_marker_assigner(const options_t& opt = {});
+        explicit color_marker_assigner(
+            joint_side_t leg_side, // 어느쪽 다리인지 (color marker는 sagittal만 지원)
+            const options_t& opt = {}
+        );
 
-        options_t& options() noexcept { return _opt; }
+        joint_side_t leg_side() const noexcept { return _leg_side; }
         const options_t& options() const noexcept { return _opt; }
+        options_t& options() noexcept { return _opt; }
 
         // 한 프레임의 덩어리들을 관절에 배정한다. 배정된 것만 돌려주므로,
         // 가려진 관절은 결과에서 빠지고 그 처리는 추정기의 홀드가 맡는다.
@@ -417,10 +417,10 @@ namespace pose
         void _rebuild_chain();
         void _unlock(); // 다음 프레임이 늘어선 순서부터 다시 찾도록 되돌린다
 
+        const joint_side_t _leg_side; // 사슬이 따라가는 다리
         options_t _opt;
 
         std::vector<joint_id_t> _chain;
-        joint_side_t _chain_side{ joint_side_t::midline }; // _chain 을 만들 때 쓴 다리
 
         // 슬롯별 직전 배정 위치. 다음 프레임의 예측 중심이 된다.
         std::vector<std::optional<Eigen::Vector2d>> _last_px;

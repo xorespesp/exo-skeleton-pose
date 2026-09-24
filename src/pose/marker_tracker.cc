@@ -1,19 +1,16 @@
 #include "marker_tracker.hh"
 
-#include <opencv2/imgproc.hpp>
-
 #include <spdlog/spdlog.h>
 
-#include <chrono>
 #include <format>
+#include <mutex>
+#include <stdexcept>
 #include <utility>
 
 namespace pose
 {
     namespace
     {
-        constexpr double kEmaAlpha = 0.1; // `tracker_thread` 통계에서 최신 표본의 가중치
-
         // Tag ids beyond this are still detected and bound; they just fall out of the
         // appeared/disappeared bookkeeping, which tracks visibility in a 64-bit mask.
         constexpr int kMaxLoggedTagId = 63;
@@ -103,7 +100,6 @@ namespace pose
     void apriltag_tracker::process_frame(
         const cv::Mat& image,
         hw::frame_format_t /*format*/,
-        const hw::timestamp_t timestamp,
         cv::Mat* annotated)
     {
         // The detector reads luminance, which every layout a source delivers carries, so no frame
@@ -157,27 +153,23 @@ namespace pose
             _seen_tag_mask = mask;
         }
 
-        _latch.publish(std::move(found), timestamp);
+        _latch.publish(std::move(found));
     }
 
-    bool apriltag_tracker::try_get_2d_measurements(
-        std::vector<joint_2d_measurement_t>& out,
-        hw::timestamp_t& timestamp)
+    bool apriltag_tracker::try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out)
     {
         // Bound outside the latch: a table lookup per tag is no reason to hold up the frame thread.
         std::vector<tag_detection_t> tags;
-        if (!_latch.try_take(tags, timestamp)) { return false; }
+        if (!_latch.try_take(tags)) { return false; }
 
         out = bind_2d_measurements(tags, this->tag_size_m());
         return true;
     }
 
-    bool apriltag_tracker::try_get_3d_measurements(
-        std::vector<joint_3d_measurement_t>& out,
-        hw::timestamp_t& timestamp)
+    bool apriltag_tracker::try_get_3d_measurements(std::vector<joint_3d_measurement_t>& out)
     {
         std::vector<tag_detection_t> tags;
-        if (!_latch.try_take(tags, timestamp)) { return false; }
+        if (!_latch.try_take(tags)) { return false; }
 
         out = bind_3d_measurements(tags);
         return true;
@@ -187,10 +179,27 @@ namespace pose
     // color_marker_tracker
     // ---------------------------------------------------------------------------
 
+    namespace
+    {
+        // color marker는 sagittal만 지원
+        joint_side_t marked_leg_of(const camera_view_t view)
+        {
+            const std::optional<joint_side_t> leg = viewed_leg_of(view);
+            if (!leg.has_value()) {
+                throw std::invalid_argument(std::format(
+                    "color_marker_tracker: a '{}' view names no leg to follow"
+                    , camera_view_name(view)
+                ));
+            }
+            return leg.value();
+        }
+    } // namespace
+
     color_marker_tracker::color_marker_tracker(
+        const camera_view_t view,
         const color_marker_detector::options_t& detector_opt,
         const color_marker_assigner::options_t& assigner_opt)
-        : _assigner{ assigner_opt }
+        : _assigner{ marked_leg_of(view), assigner_opt }
         , _opt{ detector_opt }
     { }
 
@@ -207,6 +216,30 @@ namespace pose
     {
         std::scoped_lock lk{ _mtx };
         return _opt;
+    }
+
+    color_marker_assigner::options_t color_marker_tracker::assigner_options() const
+    {
+        std::scoped_lock lk{ _assigner_mtx };
+        return _assigner.options();
+    }
+
+    void color_marker_tracker::set_assigner_options(const color_marker_assigner::options_t& opt)
+    {
+        std::scoped_lock lk{ _assigner_mtx };
+        _assigner.options() = opt;
+    }
+
+    color_marker_assigner::stats_t color_marker_tracker::assigner_stats() const
+    {
+        std::scoped_lock lk{ _assigner_mtx };
+        return _assigner.stats();
+    }
+
+    bool color_marker_tracker::is_tracking() const
+    {
+        std::scoped_lock lk{ _assigner_mtx };
+        return _assigner.stats().locked;
     }
 
     std::vector<marker_detection_t> color_marker_tracker::last_detections() const
@@ -243,7 +276,6 @@ namespace pose
     void color_marker_tracker::process_frame(
         const cv::Mat& image,
         const hw::frame_format_t format,
-        const hw::timestamp_t timestamp,
         cv::Mat* annotated)
     {
         // Colour classification needs the colour. A gray source cannot supply it, and a recording
@@ -303,18 +335,17 @@ namespace pose
             frame.score = _detector.value().score_image().clone();
         }
 
-        _latch.publish(std::move(frame), timestamp);
+        _latch.publish(std::move(frame));
     }
 
-    bool color_marker_tracker::try_get_2d_measurements(
-        std::vector<joint_2d_measurement_t>& out,
-        hw::timestamp_t& timestamp)
+    bool color_marker_tracker::try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out)
     {
-        // The assigner runs on this thread and names outside the latch: naming walks the whole leg
-        // and would hold up the detection thread.
+        // The assigner names outside the latch: naming walks the whole leg and would hold up the
+        // readouts of the latch.
         color_frame_t frame;
-        if (!_latch.try_take(frame, timestamp)) { return false; }
+        if (!_latch.try_take(frame)) { return false; }
 
+        std::scoped_lock lk{ _assigner_mtx };
         out = _assigner.assign(frame.blobs);
         return true;
     }
@@ -323,7 +354,12 @@ namespace pose
     {
         // The reference is measured through the same camera as everything checked against it, so
         // however the camera was mounted cancels out and only the leg's own motion is left to vary.
-        if (_assigner.capture_reference()) {
+        bool captured;
+        {
+            std::scoped_lock lk{ _assigner_mtx };
+            captured = _assigner.capture_reference();
+        }
+        if (captured) {
             spdlog::info("tracker: marker geometry reference captured");
         } else {
             spdlog::warn("tracker: the whole leg is not assigned, so no marker geometry reference "
@@ -333,6 +369,7 @@ namespace pose
 
     void color_marker_tracker::on_rest_pose_cleared()
     {
+        std::scoped_lock lk{ _assigner_mtx };
         _assigner.clear_reference(); // captured together, so dropped together
     }
 
@@ -340,114 +377,8 @@ namespace pose
     {
         // A marker carries no identity of its own, so the assigner names it from where its
         // neighbours were last frame. Across a jump they were somewhere else entirely.
+        std::scoped_lock lk{ _assigner_mtx };
         _assigner.reset();
-    }
-
-    // ---------------------------------------------------------------------------
-    // tracker_thread
-    // ---------------------------------------------------------------------------
-
-    tracker_thread::tracker_thread(std::shared_ptr<marker_tracker_base> tracker, const bool annotate)
-        : _tracker{ std::move(tracker) }
-        , _annotate{ annotate }
-        , _thread{ [this](std::stop_token stop) { this->_run(stop); } }
-    { }
-
-    tracker_thread::~tracker_thread()
-    {
-        _thread.request_stop(); // 대기 중이면 stop_token 이 깨운다
-    }
-
-    void tracker_thread::submit(std::shared_ptr<hw::sensor_frame> frame)
-    {
-        if (!frame) { return; }
-        {
-            std::scoped_lock lk{ _mtx };
-            ++_stats.frames_submitted;
-            if (_pending) { ++_stats.frames_dropped; }
-            _pending = std::move(frame);
-        }
-        _cv.notify_one();
-    }
-
-    bool tracker_thread::try_take_annotated(cv::Mat& annotated, cv::Mat& source, uint64_t& frame_id)
-    {
-        std::scoped_lock lk{ _mtx };
-        if (!_annotated_unread) { return false; }
-        _annotated_unread = false;
-        annotated = _annotated; // 워커는 다음 프레임을 새 Mat 으로 옮겨 넣으므로 얕은 공유가 안전하다
-        source = _source;
-        frame_id = _annotated_frame_id;
-        return true;
-    }
-
-    tracker_thread::stats_t tracker_thread::stats() const
-    {
-        std::scoped_lock lk{ _mtx };
-        return _stats;
-    }
-
-    void tracker_thread::_run(const std::stop_token stop)
-    {
-        while (true)
-        {
-            std::shared_ptr<hw::sensor_frame> frame;
-            {
-                std::unique_lock lk{ _mtx };
-                _cv.wait(lk, stop, [&] { return _pending != nullptr; });
-                if (stop.stop_requested()) { return; }
-                frame = std::move(_pending);
-            }
-
-            // 캔버스는 기술과 무관하므로 여기서 준비해 넘긴다. 검출이 그 위에 그린다.
-            cv::Mat annotated;
-            if (_annotate)
-            {
-                if (frame->format() == hw::frame_format_t::gray8) {
-                    cv::cvtColor(frame->image(), annotated, cv::COLOR_GRAY2BGR);
-                } else {
-                    annotated = frame->image().clone();
-                }
-            }
-
-            const auto started = std::chrono::steady_clock::now();
-            _tracker->process_frame(
-                frame->image(),
-                frame->format(),
-                frame->timestamp(),
-                _annotate ? &annotated : nullptr
-            );
-            const auto finished = std::chrono::steady_clock::now();
-            const double process_ms = std::chrono::duration<double, std::milli>{ finished - started }.count();
-
-            std::scoped_lock lk{ _mtx };
-            ++_stats.frames_processed;
-            _stats.last_process_ms = process_ms;
-            _stats.process_ms_ema = (_stats.process_ms_ema <= 0.0)
-                ? process_ms
-                : (kEmaAlpha * process_ms + (1.0 - kEmaAlpha) * _stats.process_ms_ema);
-            if (_have_last_processed_at)
-            {
-                const double dt_sec = std::chrono::duration<double>{ finished - _last_processed_at }.count();
-                if (dt_sec > 1e-9)
-                {
-                    const float inst = static_cast<float>(1.0 / dt_sec);
-                    _stats.process_rate_fps = (_stats.process_rate_fps <= 0.0f)
-                        ? inst
-                        : static_cast<float>(kEmaAlpha * inst + (1.0 - kEmaAlpha) * _stats.process_rate_fps);
-                }
-            }
-            _last_processed_at = finished;
-            _have_last_processed_at = true;
-
-            if (_annotate)
-            {
-                _annotated = std::move(annotated);
-                _source = frame->image();
-                _annotated_frame_id = frame->id();
-                _annotated_unread = true;
-            }
-        }
     }
 
 } // namespace pose

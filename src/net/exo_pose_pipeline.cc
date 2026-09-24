@@ -3,16 +3,16 @@
 #include "hw/frameset_observer.hh"
 #include "io/calibration_io.hh"
 
-#include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <format>
-#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -23,9 +23,6 @@ namespace net
         // How often poll() summarizes throughput while a source streams.
         constexpr auto kStatsInterval = std::chrono::seconds{ 5 };
 
-        // 파이프라인은 열린 소스의 스트림 하나만 읽는다.
-        constexpr std::size_t kPoseStreamIdx = 0;
-
         // The camera controls arrive as integers;
         // the VZ camera states its exposure and gain in fractional units.
         // NOTE: a VZ gain therefore lands on whole dB where the camera steps in 0.1. Widening the
@@ -34,6 +31,56 @@ namespace net
         {
             if (!value.has_value()) { return std::nullopt; }
             return static_cast<double>(*value);
+        }
+
+        // 카메라 엔트리 하나의 hw 소스 설정.
+        hw::source_config_t make_camera_source_config(
+            const app::camera_config_t& cam,
+            const hw::frame_format_t frame_format)
+        {
+            if (cam.source.device_backend() == hw::sensor_backend_t::k4a)
+            {
+                return hw::k4a_device_config_t{
+                    .device_selector = cam.source.device_serial(),
+                    .exposure_us = cam.exposure_us,
+                    .gain = cam.gain,
+                    .frame_format = frame_format,
+                    .roi = cam.roi,
+                };
+            }
+
+            hw::vz_device_config_t vz{
+                .device_selector = cam.source.device_serial(),
+                .exposure_us = to_optional_double(cam.exposure_us),
+                .gain = to_optional_double(cam.gain),
+                .frame_format = frame_format,
+                .roi = cam.roi,
+                .frame_rate_fps = cam.frame_rate_fps,
+            };
+
+            if (!cam.intrinsics_file.empty())
+            {
+                const std::filesystem::path path{ cam.intrinsics_file };
+                hw::intrinsic_t intr{};
+                hw::distortion_t dist{};
+                if (std::string err; io::load_camera_calibration(path, intr, dist, err)) {
+                    vz.intrinsic = intr;
+                    vz.distortion = dist;
+                    spdlog::info("pipeline: read intrinsics from '{}' ({}x{})"
+                        , path.string()
+                        , intr.calib_resolution.x(), intr.calib_resolution.y()
+                    );
+                } else {
+                    // frontal estimator will not solve tag poses, but the sagittal estimator still works off 2D tag centers
+                    spdlog::warn("pipeline: '{}': {}; opening without intrinsics", path.string(), err);
+                }
+            }
+            return vz;
+        }
+
+        std::string describe_setting(const std::optional<int32_t> value, const char* unit)
+        {
+            return value.has_value() ? std::format("{}{}", *value, unit) : std::string{ "auto" };
         }
 
         // The intrinsics a tag pose solve may run on. Only a frontal run consumes the poses, and a
@@ -51,39 +98,15 @@ namespace net
     } // namespace
 
     // --- observer (worker thread) ------------------------------------------------
-    // Runs the tracker over each arriving frame and latches the annotated image for a monitor GUI.
-    // What detection means and what it produces are the tracker's business, which the tracker
-    // publishes to the loop thread itself; this class holds no knowledge of any marker technology.
-    class pose_frame_observer final : public hw::single_stream_frameset_observer
+    // Hands each arriving frameset to the frameset tracker and latches the stream events for poll().
+    // What detection means and what it produces are the tracker's business, which the frameset
+    // tracker publishes to the loop thread; this class holds no knowledge of any marker technology.
+    class pose_frame_observer final : public hw::synced_frameset_observer
     {
     public:
-        pose_frame_observer(
-            std::shared_ptr<pose::marker_tracker_base> tracker, 
-            bool annotate)
-            : hw::single_stream_frameset_observer{ kPoseStreamIdx }
-            , _tracker{ std::move(tracker) }
-            , _annotate{ annotate }
+        explicit pose_frame_observer(std::shared_ptr<pose::synced_tracker_base> synced_tracker)
+            : _synced_tracker{ std::move(synced_tracker) }
         { }
-
-        // Newest annotated frame and the source frame it was drawn over; false if nothing new
-        // since `last_seq`. The annotated image is empty if annotation is off.
-        //
-        // Both come out of one turn of the lock, so they describe the same capture. That is what
-        // lets a caller read original pixels at a point it picked off the drawn one. Neither is
-        // copied: `cv::Mat` shares its buffer, and the next frame assigns a new one rather than
-        // writing over these.
-        bool try_get_frame(
-            cv::Mat& out_img, 
-            cv::Mat& out_source, 
-            uint64_t& last_seq)
-        {
-            std::scoped_lock lk{ _mtx };
-            if (_seq == last_seq) { return false; }
-            out_img = _annotated;
-            out_source = _source;
-            last_seq = _seq;
-            return true;
-        }
 
         // Why the stream ended, once per stream-end signal (consumes the latched flag).
         // Empty when none has been raised since the last call.
@@ -103,32 +126,9 @@ namespace net
         }
 
     public:
-        void on_sensor_frameset_update(const hw::sensor_frameset& new_frameset) override
+        void on_synced_frameset_update(const hw::synced_frameset& new_frameset) override
         {
-            const std::shared_ptr<hw::sensor_frame>& frame = new_frameset.frame();
-
-            // The canvas is technology-independent, so it is prepared here and handed over to be
-            // drawn on. Detection publishes itself; nothing comes back to be latched.
-            cv::Mat annotated;
-            if (_annotate) {
-                if (frame->format() == hw::frame_format_t::gray8) {
-                    cv::cvtColor(frame->image(), annotated, cv::COLOR_GRAY2BGR);
-                } else {
-                    annotated = frame->image().clone();
-                }
-            }
-
-            _tracker->process_frame(
-                frame->image(), 
-                frame->format(), 
-                frame->timestamp(),
-                _annotate ? &annotated : nullptr
-            );
-
-            std::scoped_lock lk{ _mtx };
-            _annotated = std::move(annotated);
-            _source = frame->image();
-            ++_seq;
+            _synced_tracker->submit(new_frameset);
         }
 
         void on_sensor_stream_reset() override {
@@ -137,7 +137,8 @@ namespace net
             _stream_reset = true;
         }
 
-        void on_sensor_frame_geometry_changed() override {
+        void on_sensor_frame_geometry_changed(std::size_t /*stream_idx*/) override {
+            // 스트림을 가리지 않는다: rest 는 모든 스트림을 한 번에 캡처한 것이다.
             _frame_geometry_changed = true;
         }
 
@@ -148,13 +149,8 @@ namespace net
         }
 
     private:
-        const std::shared_ptr<pose::marker_tracker_base> _tracker;
-        const bool _annotate; // keep an annotated frame copy for a monitor GUI
+        const std::shared_ptr<pose::synced_tracker_base> _synced_tracker;
 
-        std::mutex _mtx;
-        cv::Mat _annotated;
-        cv::Mat _source; // the same capture undrawn, for anything reading original pixels
-        uint64_t _seq{ 0 };
         std::atomic<bool> _stream_ended{ false }; // set by the worker thread on stream end
         std::atomic<hw::stream_end_reason_t> _stream_end_reason{ hw::stream_end_reason_t::completed };
         std::atomic<bool> _stream_reset{ false }; // set by the worker thread when the position jumps
@@ -168,10 +164,8 @@ namespace net
 
     exo_pose_pipeline::~exo_pose_pipeline() = default;
 
-    void exo_pose_pipeline::_select_estimator(pose::view_plane_t view_plane)
+    void exo_pose_pipeline::_build_estimator(pose::view_plane_t view_plane)
     {
-        if (_active && _view_plane == view_plane) { return; } // unchanged: the estimator stands
-
         _frontal.reset();
         _sagittal.reset();
 
@@ -190,6 +184,30 @@ namespace net
         _view_plane = view_plane;
     }
 
+    bool exo_pose_pipeline::_holds_any_camera_of(const std::span<const app::camera_config_t> cameras) const
+    {
+        if (!_provider) { return false; }
+
+        for (std::size_t stream_idx = 0; stream_idx < _provider->stream_count(); ++stream_idx)
+        {
+            const hw::stream_descriptor_t open_stream = _provider->get_stream_descriptor(stream_idx);
+            if (open_stream.device_serial.empty()) { continue; } // 대조할 이름이 없는 장치
+
+            for (const app::camera_config_t& cam : cameras)
+            {
+                if (cam.source.is_recording()) { continue; }
+
+                // 같은 장치라는 말은 백엔드와 시리얼이 함께 같다는 뜻이다(`source_address::operator==`).
+                if (cam.source.device_backend() == open_stream.sensor_backend
+                    && cam.source.device_serial().value == open_stream.device_serial)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     bool exo_pose_pipeline::open_source(const app::app_config_t& config)
     {
         _status_changed = true; // opening a source changes the reported status (even on failure)
@@ -201,160 +219,203 @@ namespace net
             return false;
         }
 
-        if (!config.camera.source.has_value()) {
-            spdlog::error("pipeline: the config names no source to open");
+        const std::vector<app::camera_config_t>& cameras = config.cameras;
+        if (cameras.empty()) {
+            spdlog::error("pipeline: the config names no camera to open");
             return false;
         }
 
-        const app::source_address& source_addr = *config.camera.source;
-        const pose::view_plane_t view_plane = config.pose.estimator.view_plane;
+        // 검증이 보장한다: 엔트리들은 한 평면이고, 녹화면 모두 같은 파일이다.
+        const pose::view_plane_t view_plane = app::view_plane_of(cameras).value();
         const app::marker_kind_t marker_kind = config.pose.detector.kind;
-
-        const std::optional<int32_t> exposure_us = config.camera.exposure_us;
-        const std::optional<int32_t> gain = config.camera.gain;
-        const std::optional<hw::roi_t> roi = config.camera.roi;
-
-        this->stop_recording();
+        const bool playback = cameras.front().source.is_recording();
 
         // A recording ignores this and replays the layout it was written with, which is what makes
         // a gray recording opened under a color profile something the tracker has to refuse.
         const auto kCameraFrameFormat = app::marker_frame_format(marker_kind);
 
-        hw::source_config_t source_config;
-        if (source_addr.is_k4a_device())
-        {
-            source_config = hw::k4a_device_config_t{
-                .device_selector = hw::device_index_t{ source_addr.k4a_device_index() },
-                .exposure_us = exposure_us,
-                .gain = gain,
-                .frame_format = kCameraFrameFormat,
-                .roi = roi,
-            };
-        }
-        else if (source_addr.is_vz_device())
-        {
-            hw::vz_device_config_t vz{
-                .device_selector = hw::device_index_t{ source_addr.vz_device_index() },
-                .exposure_us = to_optional_double(exposure_us),
-                .gain = to_optional_double(gain),
-                .frame_format = kCameraFrameFormat,
-                .roi = roi,
-            };
-
-            if (!config.camera.intrinsics_file.empty())
-            {
-                const std::filesystem::path path{ config.camera.intrinsics_file };
-                hw::intrinsic_t intr{};
-                hw::distortion_t dist{};
-                if (std::string err; io::load_camera_calibration(path, intr, dist, err)) {
-                    vz.intrinsic = intr;
-                    vz.distortion = dist;
-                    spdlog::info("pipeline: read intrinsics from '{}' ({}x{})"
-                        , path.string()
-                        , intr.calib_resolution.x(), intr.calib_resolution.y()
-                    );
-                } else {
-                    // frontal estimator will not solve tag poses, but the sagittal estimator still works off 2D tag centers
-                    spdlog::warn("pipeline: '{}': {}; opening without intrinsics", path.string(), err);
-                }
-            }
-
-            source_config = std::move(vz);
-        }
-        else
-        {
-            source_config = hw::recording_config_t{
-                .file = source_addr.recording_path(),
-                .roi = roi,
-            };
-        }
-
-        const char* kind = source_addr.is_recording() ? "recording" : "camera";
-        spdlog::info("pipeline: opening {} '{}' ({} view, {} markers, {} frames, exposure {}, gain {})"
-            , kind
-            , source_addr.to_string()
+        spdlog::info("pipeline: opening {} ({} view, {} markers, {} frames)"
+            , playback ? "a recording" : (cameras.size() == 1 ? "a camera" : std::format("{} synced cameras", cameras.size()))
             , pose::view_plane_name(view_plane)
             , app::marker_kind_name(marker_kind)
             , hw::frame_format_to_str(kCameraFrameFormat)
-            , exposure_us.has_value() ? std::format("{} us", exposure_us.value()) : "auto"
-            , gain.has_value() ? std::format("{}", gain.value()) : "auto"
         );
+        for (std::size_t stream_idx = 0; stream_idx < cameras.size(); ++stream_idx)
+        {
+            const app::camera_config_t& cam = cameras[stream_idx];
+            spdlog::info("pipeline:   stream {}: '{}' seen from {}, exposure {}, gain {}"
+                , stream_idx
+                , cam.source.to_string()
+                , pose::camera_view_name(cam.view)
+                , describe_setting(cam.exposure_us, " us")
+                , describe_setting(cam.gain, "")
+            );
+        }
+
+        // 프리런하는 카메라들은 각자 자기 상한으로 도므로 그 속도가 서로 다를 수 있다. 열리기는 하지만
+        // frameset 이 덜 맞춰지므로, 한 번은 경고한다.
+        if (!playback && cameras.size() >= 2
+            && std::ranges::none_of(cameras, [](const app::camera_config_t& cam) { return cam.frame_rate_fps.has_value(); })
+            && cameras.front().source.device_backend() != hw::sensor_backend_t::k4a)
+        {
+            spdlog::warn("pipeline: no frame rate is pinned, so each camera free-runs at its own ceiling; "
+                         "captures pair less often when the two differ");
+        }
 
         if (_provider) {
             spdlog::info("pipeline: replacing the open source '{}'", _provider->get_source_name());
         }
 
-        auto new_provider = std::make_shared<hw::sensor_frame_provider>();
-        const bool ok = new_provider->open(source_config);
-        if (!ok) {
-            spdlog::error("pipeline: failed to open {} '{}'", kind, source_addr.to_string());
-            return false;
-        }
-
-        // Read now because only an opened source reports them.
-        std::optional<hw::intrinsic_t> intrinsics = pose_solve_intrinsics(
-            view_plane, new_provider->get_calibration(kPoseStreamIdx)
-        );
-
-        if (view_plane == pose::view_plane_t::frontal && !intrinsics.has_value())
+        // 카메라는 배타적으로 열린다. 지금 쥐고 있는 장치를 다시 지목했으면 먼저 놓아야 열 수 있다.
+        // 재생은 장치를 쥐지 않으므로 대조하지 않는다(녹화 스트림도 촬영에 쓰인 시리얼을 싣는다).
+        if (_provider && !_is_playback_source && !playback && this->_holds_any_camera_of(cameras))
         {
-            spdlog::warn("pipeline: '{}' reports no intrinsics, so marker poses cannot be "
-                         "solved and the frontal estimator will track nothing",
-                new_provider->get_source_name());
-        }
-
-        // The one place that names a concrete tracker. Unlike the estimator, it is rebuilt on every
-        // open: it is built around the source it will read, so carrying one over would leave it
-        // describing the camera before.
-        //
-        // An open installs the config, so what is in effect right afterwards is what the file says.
-        // Edits made from the control panel are scratch until they are saved back.
-        if (marker_kind == app::marker_kind_t::color_marker)
-        {
-            // The colour and the blob filters were measured together on site and sit together in
-            // the profile. Absent, the detector runs on defaults that carry no colour and finds
-            // nothing, which it says once when it is built.
-            const std::optional<app::color_marker_calibration_t>& calibration =
-                config.pose.detector.color_marker.calibration;
-
-            // The blob gates are counted in pixels, so they only mean what they meant if a marker
-            // still covers as many of them. A different frame size moves every one of them at once.
-            if (const Eigen::Vector2i frame_resolution = new_provider->get_frame_resolution(kPoseStreamIdx);
-                calibration.has_value() && calibration->frame_resolution != frame_resolution)
-            {
-                spdlog::warn("pipeline: the color was measured on {}x{} frames but this source "
-                             "delivers {}x{}; the blob size gates were sized for the other one",
-                    calibration->frame_resolution.x(), calibration->frame_resolution.y(),
-                    frame_resolution.x(), frame_resolution.y());
+            // 먼저 닫는 것은 되돌릴 수 없다. 녹화 중이라면 파일까지 끝나므로, 그 선택은 사람이 한다.
+            if (this->is_recording()) {
+                spdlog::error("pipeline: '{}' is being recorded and the new profile names the same camera; "
+                              "stop the recording first", _provider->get_source_name());
+                return false;
             }
 
-            _tracker = std::make_shared<pose::color_marker_tracker>(
-                calibration.has_value() ? calibration->detector : pose::color_marker_detector::options_t{},
-                config.pose.detector.color_marker.assigner
-            );
+            spdlog::info("pipeline: the new profile names a camera this source holds; closing it first");
+            this->close_source();
+        }
+
+        auto new_provider = std::make_shared<hw::sensor_frame_provider>();
+        bool opened = false;
+        if (playback)
+        {
+            // 엔트리 i 는 파일의 스트림 i 이고, ROI 만 재생에 걸린다.
+            hw::recording_config_t recording{ .file = cameras.front().source.recording_path() };
+            for (const app::camera_config_t& cam : cameras) { recording.stream_rois.push_back(cam.roi); }
+            opened = new_provider->open(std::move(recording));
+        }
+        else if (cameras.size() == 1)
+        {
+            opened = new_provider->open(make_camera_source_config(cameras.front(), kCameraFrameFormat));
         }
         else
         {
-            _tracker = std::make_shared<pose::apriltag_tracker>(
-                config.pose.detector.apriltag.detector,
-                config.pose.detector.apriltag.tag_size_m,
-                std::move(intrinsics)
-            );
+            std::vector<hw::source_config_t> member_configs;
+            for (const app::camera_config_t& cam : cameras) {
+                member_configs.push_back(make_camera_source_config(cam, kCameraFrameFormat));
+            }
+            const app::sync_config_t& sync = config.sync.value(); // 검증이 라이브 둘 이상에 요구한다
+            hw::sync_options_t sync_options{ .reference_stream_idx = sync.reference_stream_idx };
+            if (sync.max_pair_skew.has_value()) {
+                sync_options.max_pair_skew = std::chrono::duration_cast<std::chrono::nanoseconds>(*sync.max_pair_skew);
+            }
+            opened = new_provider->open_synced(member_configs, sync_options);
+        }
+        if (!opened) {
+            spdlog::error("pipeline: failed to open the configured source");
+            return false;
         }
 
-        auto new_observer = std::make_shared<pose_frame_observer>(_tracker, _annotate_frames);
+        // 스트림 수는 열어 봐야 안다.
+        if (new_provider->stream_count() != cameras.size())
+        {
+            spdlog::error("pipeline: '{}' delivers {} stream(s) but the profile describes {} camera(s); "
+                          "a {} profile needs a source with exactly that many"
+                , new_provider->get_source_name(), new_provider->stream_count(), cameras.size()
+                , pose::view_plane_name(view_plane));
+            return false; // new_provider 가 여기서 닫힌다
+        }
+
+        // The one place that names a concrete tracker. It is built around the source it will read,
+        // so it stands for exactly as long as that source does.
+        //
+        // An open installs the config, so what is in effect right afterwards is what the file says.
+        // Edits made from the control panel are scratch until they are saved back.
+        std::vector<pose::synced_tracker_base::stream_entry_t> stream_entries;
+        for (std::size_t stream_idx = 0; stream_idx < cameras.size(); ++stream_idx)
+        {
+            const app::camera_config_t& cam = cameras[stream_idx];
+
+            std::shared_ptr<pose::marker_tracker_base> tracker;
+            if (marker_kind == app::marker_kind_t::color_marker)
+            {
+                // The colour and the blob filters were measured together on site and sit together in
+                // the profile. Absent, the detector runs on defaults that carry no colour and finds
+                // nothing, which it says once when it is built.
+                const std::optional<app::color_marker_calibration_t>& calibration =
+                    config.pose.detector.color_marker.calibration[stream_idx];
+
+                // The blob gates and the search radius are counted in pixels, so they only mean what they
+                // meant if a marker still covers as many of them. A different frame size moves every one
+                // of them at once.
+                if (const Eigen::Vector2i frame_resolution = new_provider->get_frame_resolution(stream_idx);
+                    calibration.has_value() && calibration->frame_resolution != frame_resolution)
+                {
+                    spdlog::warn("pipeline: the color was measured on {}x{} frames but stream {} "
+                                 "delivers {}x{}; the blob size gates and the search radius were sized for the other one",
+                        calibration->frame_resolution.x(), calibration->frame_resolution.y(),
+                        stream_idx, frame_resolution.x(), frame_resolution.y());
+                }
+
+                tracker = std::make_shared<pose::color_marker_tracker>(
+                    cam.view,
+                    calibration.has_value() ? calibration->detector : pose::color_marker_detector::options_t{},
+                    calibration.has_value() ? calibration->assigner : pose::color_marker_assigner::options_t{}
+                );
+            }
+            else
+            {
+                // Read now because only an opened source reports them.
+                std::optional<hw::intrinsic_t> intrinsics = pose_solve_intrinsics(
+                    view_plane, new_provider->get_calibration(stream_idx));
+                if (view_plane == pose::view_plane_t::frontal && !intrinsics.has_value())
+                {
+                    spdlog::warn("pipeline: stream {} of '{}' reports no intrinsics, so marker poses cannot be "
+                                 "solved and the frontal estimator will track nothing",
+                        stream_idx, new_provider->get_source_name());
+                }
+                tracker = std::make_shared<pose::apriltag_tracker>(
+                    config.pose.detector.apriltag.detector,
+                    config.pose.detector.apriltag.tag_size_m,
+                    std::move(intrinsics)
+                );
+            }
+
+            stream_entries.push_back({ .tracker = std::move(tracker), .view = cam.view });
+        }
+
+        // frameset 트래커가 꺼내는 측정치는 추정기가 소비하는 것이다: frontal 은 3D, sagittal 은 2D.
+        std::shared_ptr<pose::synced_tracker<pose::joint_3d_measurement_t>> new_frontal_synced_tracker;
+        std::shared_ptr<pose::synced_tracker<pose::joint_2d_measurement_t>> new_sagittal_synced_tracker;
+        std::shared_ptr<pose::synced_tracker_base> new_synced_tracker;
+        if (view_plane == pose::view_plane_t::frontal) {
+            new_frontal_synced_tracker = std::make_shared<pose::synced_tracker<pose::joint_3d_measurement_t>>(
+                std::move(stream_entries), _annotate_frames);
+            new_synced_tracker = new_frontal_synced_tracker;
+        }
+        else {
+            new_sagittal_synced_tracker = std::make_shared<pose::synced_tracker<pose::joint_2d_measurement_t>>(
+                std::move(stream_entries), _annotate_frames);
+            new_synced_tracker = new_sagittal_synced_tracker;
+        }
+
+        auto new_observer = std::make_shared<pose_frame_observer>(new_synced_tracker);
         new_provider->add_observer(new_observer);
+
+        std::vector<stream_settings_t> streams;
+        for (const app::camera_config_t& cam : cameras) {
+            streams.push_back(stream_settings_t{ .view = cam.view, .exposure_us = cam.exposure_us, .gain = cam.gain });
+        }
+
+        // 여기부터 교체가 확정된다. 녹화 중지는 옛 provider 에서 옵저버를 떼는 일이라 교체 전에 끝낸다.
+        this->stop_recording();
 
         _provider = std::move(new_provider); // old provider closes/joins here
         _observer = std::move(new_observer);
-        _is_playback_source = source_addr.is_recording();
-        _exposure_us = exposure_us;
-        _gain = gain;
+        _synced_tracker = std::move(new_synced_tracker);
+        _frontal_synced_tracker = std::move(new_frontal_synced_tracker);
+        _sagittal_synced_tracker = std::move(new_sagittal_synced_tracker);
+        _is_playback_source = playback;
+        _streams = std::move(streams);
         _has_pose = false; // whatever the previous source produced does not describe this one
-        this->_select_estimator(view_plane); // swaps the estimator only when the viewing plane changed
+        this->_build_estimator(view_plane); // rest 도 트래킹 상태도 새로 시작한다
 
-        // `_select_estimator` leaves an estimator of the same plane standing, so the config's
-        // options are assigned out here, where every open reaches them.
         if (_frontal) {
             _frontal->options() = config.pose.estimator.frontal;
         }
@@ -363,13 +424,17 @@ namespace net
             _sagittal->options() = config.pose.estimator.sagittal;
         }
 
-        _active->clear_rest_pose(); // a new source invalidates the captured rest reference
-        _active->reset_tracking();  // and its position filters/held points must not carry over
         _frame_log.reset();
 
-        const auto res = _provider->get_frame_resolution(kPoseStreamIdx);
-        spdlog::info("pipeline: {} '{}' opened ({}x{} color, {} estimator); rest pose cleared, awaiting first frame",
-            kind, _provider->get_source_name(), res.x(), res.y(), pose::view_plane_name(_view_plane));
+        std::string resolutions;
+        for (std::size_t stream_idx = 0; stream_idx < _provider->stream_count(); ++stream_idx)
+        {
+            const Eigen::Vector2i res = _provider->get_frame_resolution(stream_idx);
+            if (!resolutions.empty()) { resolutions += ", "; }
+            resolutions += std::format("{}x{}", res.x(), res.y());
+        }
+        spdlog::info("pipeline: '{}' opened ({} stream(s): {}; {} estimator); rest pose cleared, awaiting first frame",
+            _provider->get_source_name(), _provider->stream_count(), resolutions, pose::view_plane_name(_view_plane));
         return true;
     }
 
@@ -387,14 +452,24 @@ namespace net
 
         _provider.reset(); // stops/joins the worker thread
         _observer.reset();
+
+        // 트래커는 자기가 읽을 소스를 기준으로 지어지므로 그 소스와 함께 내린다.
+        _synced_tracker.reset();
+        _frontal_synced_tracker.reset();
+        _sagittal_synced_tracker.reset();
+
         _is_playback_source = false;
-        _exposure_us.reset();
-        _gain.reset();
+        _streams.clear();
         _frame_log.reset();
     }
 
     bool exo_pose_pipeline::is_source_open() const { return static_cast<bool>(_provider); }
     bool exo_pose_pipeline::is_playback_source() const { return _is_playback_source; }
+
+    std::size_t exo_pose_pipeline::stream_count() const
+    {
+        return _provider ? _provider->stream_count() : 0;
+    }
 
     bool exo_pose_pipeline::start_recording(
         const std::filesystem::path& path,
@@ -423,13 +498,14 @@ namespace net
         for (std::size_t stream_idx = 0; stream_idx < _provider->stream_count(); ++stream_idx)
         {
             const hw::stream_descriptor_t descriptor = _provider->get_stream_descriptor(stream_idx);
+            const stream_settings_t& settings = _streams.at(stream_idx);
             stream_infos.push_back(io::camera_stream_info_t{
                 .calibration = _provider->get_calibration(stream_idx),
                 .color_format = _provider->get_frame_format(stream_idx),
                 .sensor_backend = descriptor.sensor_backend,
                 .device_serial = descriptor.device_serial,
-                .exposure_us = _exposure_us,
-                .gain = _gain,
+                .exposure_us = settings.exposure_us,
+                .gain = settings.gain,
             });
         }
 
@@ -489,31 +565,20 @@ namespace net
             return false;
         }
 
-        _status_changed = true;
+        // 추정기가 거부하면 트래커의 기준도 그대로 둔다.
+        if (!_active->calibrate_rest_pose()) { return false; }
 
-        const bool ok = _active->calibrate_rest_pose();
-        if (!ok) {
-            spdlog::warn("pipeline: rest pose calibration failed; no joint had a computable local rotation "
-                         "(is the source streaming and are the tags visible?)");
-            return false;
-        }
+        _status_changed = true;
 
         // Whatever the tracker latches at calibration belongs to this same moment: it is the one
         // point where an operator is watching the annotated frame and vouching for what it shows.
-        _tracker->on_rest_pose_captured();
-
-        // Which joints are contributing a reference is the first thing to know when a calibration
-        // comes out wrong, so name the ones that actually latched (only freshly detected joints,
-        // not held ones) rather than just counting.
-        std::string joints;
-        for (const auto& def : pose::get_joint_defs())
-        {
-            if (!_active->get_rest_position(def.joint_id).has_value()) { continue; }
-            if (!joints.empty()) { joints += ", "; }
-            joints += def.name;
+        //
+        // 소스가 열려 있으면 frameset 트래커도 서 있다. 둘은 같은 자리에서 설치되고 함께 내려간다.
+        for (std::size_t stream_idx = 0; stream_idx < _synced_tracker->stream_count(); ++stream_idx) {
+            _synced_tracker->tracker(stream_idx).on_rest_pose_captured();
         }
 
-        spdlog::info("pipeline: rest pose calibrated from [{}]", joints);
+        spdlog::info("pipeline: rest pose calibrated");
         return true;
     }
 
@@ -523,12 +588,29 @@ namespace net
         _status_changed = true;
         spdlog::info("pipeline: rest pose cleared");
         _active->clear_rest_pose();
-        _tracker->on_rest_pose_cleared(); // captured together, so dropped together
+        if (_synced_tracker) // captured together, so dropped together
+        {
+            for (std::size_t stream_idx = 0; stream_idx < _synced_tracker->stream_count(); ++stream_idx) {
+                _synced_tracker->tracker(stream_idx).on_rest_pose_cleared();
+            }
+        }
     }
 
     bool exo_pose_pipeline::has_rest_pose() const
     {
         return _active && _active->has_rest_pose();
+    }
+
+    pose::marker_tracker_base* exo_pose_pipeline::tracker(const std::size_t stream_idx)
+    {
+        if (!_synced_tracker || stream_idx >= _synced_tracker->stream_count()) { return nullptr; }
+        return &_synced_tracker->tracker(stream_idx);
+    }
+
+    const pose::marker_tracker_base* exo_pose_pipeline::tracker(const std::size_t stream_idx) const
+    {
+        if (!_synced_tracker || stream_idx >= _synced_tracker->stream_count()) { return nullptr; }
+        return &_synced_tracker->tracker(stream_idx);
     }
 
     pose::pose_estimator_base* exo_pose_pipeline::estimator() { return _active; }
@@ -561,69 +643,98 @@ namespace net
         return _sagittal ? &_sagittal.value() : nullptr;
     }
 
+    bool exo_pose_pipeline::_consume_source_signals()
+    {
+        bool stream_jumped = false;
+
+        if (_observer && _observer->consume_stream_reset_signal())
+        {
+            spdlog::debug("pipeline: the stream position jumped; dropping what described the last one");
+            if (_synced_tracker)
+            {
+                for (std::size_t stream_idx = 0; stream_idx < _synced_tracker->stream_count(); ++stream_idx) {
+                    _synced_tracker->tracker(stream_idx).on_stream_reset();
+                }
+            }
+            if (_active) { _active->reset_tracking(); }
+            stream_jumped = true;
+        }
+
+        if (_observer && _observer->consume_frame_geometry_signal())
+        {
+            spdlog::debug("pipeline: the ROI changed; dropping what described the last one");
+            if (_active) { _active->on_frame_geometry_changed(); }
+
+            // The principal point moved with the window, and a tag pose is solved against it.
+            // Handing the retargeted one over is what keeps a solve in the same metric frame
+            // it was in before, which is why an estimator working in metres loses nothing.
+            if (_synced_tracker)
+            {
+                for (std::size_t stream_idx = 0; stream_idx < _synced_tracker->stream_count(); ++stream_idx)
+                {
+                    auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(&_synced_tracker->tracker(stream_idx));
+                    if (!tag_tracker) { continue; }
+                    tag_tracker->set_intrinsics(
+                        _provider ? pose_solve_intrinsics(_view_plane, _provider->get_calibration(stream_idx))
+                                  : std::nullopt);
+                }
+            }
+
+            // The reported frame size moved with it, and a client has no other way to hear
+            // that: the images it would notice on are not on the wire.
+            _status_changed = true;
+        }
+
+        return stream_jumped;
+    }
+
+    template <typename Measurement, typename Estimator>
+    bool exo_pose_pipeline::_take_and_step(
+        pose::synced_tracker<Measurement>& synced_tracker,
+        Estimator& estimator,
+        std::size_t& detections_this_frame)
+    {
+        // Take the newest bundle the frameset tracker published, ahead of stepping the estimator on it.
+        pose::synced_measurements_t<Measurement> bundle;
+        const bool took = synced_tracker.try_take_measurements(bundle);
+
+        // The stream jumped. Reading this after the take is what makes the two agree: the frame
+        // thread raises it before publishing anything of the new position, so a step that took the
+        // first such frame is a step that sees it. What it took goes with it.
+        const bool stream_jumped = this->_consume_source_signals();
+        if (!took || stream_jumped) { return false; }
+
+        bool any_measured = false;
+        for (const auto& slot : bundle.slots)
+        {
+            if (!slot.measured) { continue; }
+            any_measured = true;
+            detections_this_frame += slot.detection_count;
+        }
+        if (!any_measured) { return false; }
+
+        _last_timestamp = bundle.timestamp;
+        if constexpr (std::is_same_v<Estimator, pose::sagittal_pose_estimator>) {
+            estimator.update(bundle);
+        }
+        else {
+            estimator.update(bundle.slots.front().measurements, bundle.timestamp); // frontal 은 카메라 한 대다
+        }
+        return true;
+    }
+
     exo_pose_pipeline::poll_result_t exo_pose_pipeline::poll()
     {
         poll_result_t r{};
+        std::size_t detections_this_frame = 0; // 이번 frameset 의 모든 스트림에서 찾은 마커 수
 
-        {
-            // Take the newest frame the tracker published, ahead of stepping the estimator on it.
-            //
-            // NOTE: `update()` is not part of the estimator base; each one takes the input its algorithm
-            // needs, so the tracker is asked for the shape the built estimator consumes, and answers
-            // false when it has nothing new or cannot produce that shape at all.
-            hw::timestamp_t taken_at{};
-            std::vector<pose::joint_3d_measurement_t> m3;
-            std::vector<pose::joint_2d_measurement_t> m2;
-            bool took_3d = false;
-            bool took_2d = false;
-            if (_tracker)
-            {
-                took_3d = _frontal && _tracker->try_get_3d_measurements(m3, taken_at);
-                took_2d = !took_3d && _sagittal && _tracker->try_get_2d_measurements(m2, taken_at);
-            }
-
-            // The stream jumped. Reading this after the take is what makes the two agree: the
-            // frame thread raises it before publishing anything of the new position, so a step
-            // that took the first such frame is a step that sees it. What it took goes with it.
-            if (_observer && _observer->consume_stream_reset_signal())
-            {
-                spdlog::debug("pipeline: the stream position jumped; dropping what described the last one");
-                if (_tracker) { _tracker->on_stream_reset(); }
-                if (_active) { _active->reset_tracking(); }
-                took_3d = took_2d = false;
-            }
-
-            if (_observer && _observer->consume_frame_geometry_signal())
-            {
-                spdlog::debug("pipeline: the ROI changed; dropping what described the last one");
-                if (_active) { _active->on_frame_geometry_changed(); }
-
-                // The principal point moved with the window, and a tag pose is solved against it.
-                // Handing the retargeted one over is what keeps a solve in the same metric frame
-                // it was in before, which is why an estimator working in metres loses nothing.
-                if (auto* tag_tracker = dynamic_cast<pose::apriltag_tracker*>(_tracker.get())) {
-                    tag_tracker->set_intrinsics(
-                        _provider ? pose_solve_intrinsics(_view_plane, _provider->get_calibration(kPoseStreamIdx))
-                                  : std::nullopt);
-                }
-
-                // The reported frame size moved with it, and a client has no other way to hear
-                // that: the images it would notice on are not on the wire.
-                _status_changed = true;
-            }
-
-            if (took_3d)
-            {
-                _last_timestamp = taken_at;
-                _frontal->update(m3, _last_timestamp);
-                r.new_pose = true;
-            }
-            else if (took_2d)
-            {
-                _last_timestamp = taken_at;
-                _sagittal->update(m2, _last_timestamp);
-                r.new_pose = true;
-            }
+        // NOTE: `update()` is not part of the estimator base; each one takes the input its algorithm
+        // needs, so the frameset tracker is asked for the shape the built estimator consumes.
+        if (_frontal && _frontal_synced_tracker) {
+            r.new_pose = this->_take_and_step(*_frontal_synced_tracker, *_frontal, detections_this_frame);
+        }
+        else if (_sagittal && _sagittal_synced_tracker) {
+            r.new_pose = this->_take_and_step(*_sagittal_synced_tracker, *_sagittal, detections_this_frame);
         }
 
         if (r.new_pose)
@@ -633,11 +744,16 @@ namespace net
             spdlog::trace("pipeline: frame #{} (t={:%H:%M:%S}) with {} detection(s)"
                 , this->current_frame_seq()
                 , _last_timestamp
-                , _tracker->last_detection_count()
+                , detections_this_frame
             );
 
-            _frame_log.log_transitions(*_tracker, *_active);
-            _frame_log.log_throughput(*_tracker, *_active, this->source_fps(), this->has_rest_pose());
+            std::string stream_rates;
+            for (std::size_t stream_idx = 0; stream_idx < this->stream_count(); ++stream_idx) {
+                if (!stream_rates.empty()) { stream_rates += ", "; }
+                stream_rates += std::format("{:.1f}", this->source_fps(stream_idx));
+            }
+            _frame_log.log_transitions(*_synced_tracker, *_active);
+            _frame_log.log_throughput(detections_this_frame, *_active, stream_rates, this->has_rest_pose());
         }
 
         // Stream end: consume the one-shot signal the worker thread raises at end of stream.
@@ -670,18 +786,21 @@ namespace net
     // explain a stalled or jumpy skeleton. What a marker technology has to say about its own
     // detections it says itself.
     void exo_pose_pipeline::frame_logger::log_transitions(
-        const pose::marker_tracker_base& tracker,
+        const pose::synced_tracker_base& synced_tracker,
         const pose::pose_estimator_base& estimator)
     {
         // Whether the tracker has identified its markers is what a run whose markers are anonymous
         // hangs on: until it has, no joint is named and every one reads untracked for a reason that
         // is not the detector's.
-        if (const bool tracking = tracker.is_tracking();
-            tracking != _tracker_was_tracking)
+        _stream_was_tracking.resize(synced_tracker.stream_count(), false);
+        for (std::size_t stream_idx = 0; stream_idx < synced_tracker.stream_count(); ++stream_idx)
         {
-            if (tracking) { spdlog::debug("pipeline: the tracker identified its markers"); }
-            else { spdlog::debug("pipeline: the tracker lost its markers and is searching again"); }
-            _tracker_was_tracking = tracking;
+            const bool tracking = synced_tracker.tracker(stream_idx).is_tracking();
+            if (tracking == _stream_was_tracking[stream_idx]) { continue; }
+
+            if (tracking) { spdlog::debug("pipeline: stream {}: the tracker identified its markers", stream_idx); }
+            else { spdlog::debug("pipeline: stream {}: the tracker lost its markers and is searching again", stream_idx); }
+            _stream_was_tracking[stream_idx] = tracking;
         }
 
         // A marker can be visible while its joint still has no local rotation (the parent's is
@@ -702,13 +821,13 @@ namespace net
     // without a per-frame log. Detection rate matters as much as fps, since a stream at full
     // fps with no markers looks identical to a healthy one from the outside.
     void exo_pose_pipeline::frame_logger::log_throughput(
-        const pose::marker_tracker_base& tracker,
+        const std::size_t detections,
         const pose::pose_estimator_base& estimator,
-        const float source_fps,
+        const std::string_view stream_rates,
         const bool has_rest_pose)
     {
         ++_frames;
-        _detections += static_cast<uint32_t>(tracker.last_detection_count());
+        _detections += static_cast<uint32_t>(detections);
 
         const auto now = std::chrono::steady_clock::now();
         if (_since.time_since_epoch().count() == 0) { _since = now; return; }
@@ -723,9 +842,9 @@ namespace net
             if (estimator.get_joint_state(def.joint_id).position.has_value()) { ++tracked; }
         }
 
-        spdlog::debug("pipeline: {} frames in {:.1f} s ({:.1f} fps polled, source at {:.1f} fps), "
+        spdlog::debug("pipeline: {} frames in {:.1f} s ({:.1f} fps polled, streams at {} fps), "
                       "{:.1f} detection(s)/frame, {}/{} joint(s) tracked, rest pose {}"
-            , _frames, sec, _frames / sec, source_fps
+            , _frames, sec, _frames / sec, stream_rates
             , _frames > 0 ? static_cast<double>(_detections) / _frames : 0.0
             , tracked, pose::kNumJoints
             , has_rest_pose ? "captured" : "not captured"
@@ -742,17 +861,28 @@ namespace net
     }
 
     bool exo_pose_pipeline::try_get_annotated_frame(
-        cv::Mat& out_img, 
-        cv::Mat& out_source, 
-        uint64_t& last_seq)
+        const std::size_t stream_idx,
+        cv::Mat& out_img,
+        cv::Mat& out_source,
+        uint64_t& last_frame_id)
     {
-        return _observer && _observer->try_get_frame(out_img, out_source, last_seq);
+        return _synced_tracker
+            && _synced_tracker->try_get_annotated(stream_idx, out_img, out_source, last_frame_id);
     }
 
-    hw::sensor_backend_t exo_pose_pipeline::sensor_backend() const
+    hw::sensor_backend_t exo_pose_pipeline::sensor_backend(const std::size_t stream_idx) const
     {
         if (!_provider) { throw std::logic_error{ "pipeline: no source is open" }; }
-        return _provider->get_stream_descriptor(kPoseStreamIdx).sensor_backend;
+        if (stream_idx >= _provider->stream_count()) {
+            throw std::out_of_range{ std::format("pipeline: stream {} is not among the {} open", stream_idx, _provider->stream_count()) };
+        }
+        return _provider->get_stream_descriptor(stream_idx).sensor_backend;
+    }
+
+    pose::camera_view_t exo_pose_pipeline::camera_view(const std::size_t stream_idx) const
+    {
+        if (!_provider) { throw std::logic_error{ "pipeline: no source is open" }; }
+        return _streams.at(stream_idx).view;
     }
 
     std::string exo_pose_pipeline::source_name() const
@@ -760,45 +890,49 @@ namespace net
         return _provider ? _provider->get_source_name() : std::string{};
     }
 
-    Eigen::Vector2i exo_pose_pipeline::source_resolution() const
+    Eigen::Vector2i exo_pose_pipeline::source_resolution(const std::size_t stream_idx) const
     {
-        return _provider ? _provider->get_frame_resolution(kPoseStreamIdx) : Eigen::Vector2i::Zero();
+        if (!_provider || stream_idx >= _provider->stream_count()) { return Eigen::Vector2i::Zero(); }
+        return _provider->get_frame_resolution(stream_idx);
     }
 
-    Eigen::Vector2i exo_pose_pipeline::source_full_resolution() const
+    Eigen::Vector2i exo_pose_pipeline::source_full_resolution(const std::size_t stream_idx) const
     {
-        return _provider ? _provider->get_full_frame_resolution(kPoseStreamIdx) : Eigen::Vector2i::Zero();
+        if (!_provider || stream_idx >= _provider->stream_count()) { return Eigen::Vector2i::Zero(); }
+        return _provider->get_full_frame_resolution(stream_idx);
     }
 
-    std::optional<hw::roi_t> exo_pose_pipeline::effective_roi() const
+    std::optional<hw::roi_t> exo_pose_pipeline::effective_roi(const std::size_t stream_idx) const
     {
-        return _provider ? _provider->get_effective_roi(kPoseStreamIdx) : std::nullopt;
+        if (!_provider || stream_idx >= _provider->stream_count()) { return std::nullopt; }
+        return _provider->get_effective_roi(stream_idx);
     }
 
-    void exo_pose_pipeline::set_roi(const std::optional<hw::roi_t>& roi)
+    void exo_pose_pipeline::set_roi(const std::size_t stream_idx, const std::optional<hw::roi_t>& roi)
     {
-        if (!_provider) { return; }
+        if (!_provider || stream_idx >= _provider->stream_count()) { return; }
 
-        // A recording declares one calibration up front, frame size included, so the frames that
-        // follow have to keep it.
+        // A recording declares one calibration per stream up front, frame size included, so the
+        // frames that follow have to keep it.
         if (this->is_recording()) {
             spdlog::error("pipeline: cannot move the ROI while a recording is being written");
             return;
         }
-        _provider->set_roi(kPoseStreamIdx, roi);
+        _provider->set_roi(stream_idx, roi);
     }
 
-    float exo_pose_pipeline::source_fps() const
+    float exo_pose_pipeline::source_fps(const std::size_t stream_idx) const
     {
-        return _provider ? _provider->get_current_update_rate(kPoseStreamIdx) : 0.0f;
+        if (!_provider || stream_idx >= _provider->stream_count()) { return 0.0f; }
+        return _provider->get_current_update_rate(stream_idx);
     }
 
-    std::optional<hw::intrinsic_t> exo_pose_pipeline::intrinsics() const
+    std::optional<hw::intrinsic_t> exo_pose_pipeline::intrinsics(const std::size_t stream_idx) const
     {
         // Color intrinsics of the open source; lets a diagnostic dump reproject
         // corners independently of whatever the pipeline computed.
-        if (!_provider || !_provider->is_opened()) { return std::nullopt; }
-        return _provider->get_calibration(kPoseStreamIdx).intrinsic;
+        if (!_provider || !_provider->is_opened() || stream_idx >= _provider->stream_count()) { return std::nullopt; }
+        return _provider->get_calibration(stream_idx).intrinsic;
     }
 
     uint32_t exo_pose_pipeline::current_frame_seq() const

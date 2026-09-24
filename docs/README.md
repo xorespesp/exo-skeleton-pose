@@ -57,14 +57,17 @@ camera position. What each viewpoint decides is only where that axis falls in it
 | Sagittal, camera on the exo's right | camera `+Z` |
 
 A sagittal run converts its measurements into the rig frame itself, and which side it converts from
-follows from the marked leg. A frontal run does no conversion at all: it takes camera space as rig
-space, which makes the mount an installation requirement.
+follows from each camera's view: one camera stands on each side of the exo and measures the leg it
+faces. Install the two level and parallel to each other, since a misalignment between them lands on
+the angle difference between the two legs. A frontal run does no conversion at all: it takes camera
+space as rig space, which makes the mount an installation requirement.
 
 **Install a frontal camera level and square to the exo.** Roll about the optical axis is the one that
 reaches the angles, and there is no setting that compensates for it. The error is second order, so
 eyeballing it against a horizontal reference in the live view is enough: a 5 degree roll costs about
 0.1 degrees of flexion, 10 degrees costs about 0.4.
 
-Capture the rest pose (`Calibrate`) with the joints in a clean neutral stance.
+Capture the rest pose (`Calibrate`) with the joints in a clean neutral stance. Every marker has to be
+seen in that one frame: a capture that misses one is refused and the previous rest pose stays.
 The stance can be any neutral pose (e.g. with the foot already 90 degrees forward of the shank); 
 that offset is folded into the captured rest reference.

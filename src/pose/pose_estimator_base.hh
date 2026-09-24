@@ -116,7 +116,7 @@ namespace pose
 
         // Latch the current per-joint measurements as the rest (bind) reference. Joint rotations are
         // expressed against this reference, so none are produced until it is captured.
-        // Returns false if no joint was measured this frame.
+        // Returns false if any joint was not measured this frame, keeping the previous reference.
         virtual bool calibrate_rest_pose() = 0;
         virtual void clear_rest_pose() = 0;
         virtual bool has_rest_pose() const = 0;

@@ -6,6 +6,7 @@
 #include "pose_trace_recorder.hh"
 #include "app_config.hh"
 
+#include "hw/timestamp.hh"
 #include "io/recording_writer.hh"
 #include "pose/marker_tracker.hh"
 #include "pose/frontal_pose_estimator.hh"
@@ -21,6 +22,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -43,8 +45,9 @@ namespace gui
     };
 
     // Debugger GUI for the pose server: starts/stops the WebSocket listener and drives the pose
-    // pipeline (source open/close, rest-pose calibration) while visualizing the annotated frame
-    // and the per-joint 3D positions / reconstructed skeleton. Owns the server; the listener starts stopped.
+    // pipeline (source open/close, rest-pose calibration) while visualizing each stream's annotated
+    // frame and the per-joint 3D positions / reconstructed skeleton. Owns the server; the listener
+    // starts stopped.
     class debugger_app final : public app_base<app_renderer_sdl3>
     {
     public:
@@ -60,6 +63,9 @@ namespace gui
         // Opens the pipeline on the config as it stands and restarts what described the last source.
         void _open_source();
         void _do_close_source();
+
+        // 열려 있던 소스를 설명하던 것들(프레임, 플롯, 트레이스, 색 샘플, 고른 스트림)을 버린다.
+        void _clear_session_state();
 
         // Reads `path` over the settings this window edits, discarding what the control panel has
         // been tuned to since the last save. It fills the open dialog and reopens an open source,
@@ -77,6 +83,20 @@ namespace gui
 
         // The ROI in force, and the button that opens the camera window to place a new one.
         void _render_roi_control();
+
+        // `selected_stream_idx` 콤보. 스트림이 하나면 그리지 않는다. `id` 는 한 창 안의 둘을 가른다.
+        void _render_stream_selector(const char* id);
+
+        // 고른 스트림에 매달린 상태를 그 스트림의 것으로 다시 맞춘다. 색 샘플은 그 카메라의 픽셀이고,
+        // ROI 사각형은 그 프레임의 좌표이며, 트레이스의 태그는 그 트래커가 찾은 것이다.
+        void _on_selected_stream_changed();
+
+        // 편집할 사각형을 고른 스트림에 걸린 ROI(없으면 전체 프레임)로 놓는다.
+        void _seed_roi_edit_rect();
+
+        // 스트림마다의 어노테이트 프레임을 `area` 에 나란히 그린다. `area.y` 가 0 이면 높이는 프레임
+        // 비율에서 잡는다.
+        void _render_stream_views(const ImVec2& area);
 
         // Estimator tuning, one function per viewing plane.
         void _render_frontal_estimator_control(pose::frontal_pose_estimator::options_t& opt);
@@ -128,6 +148,9 @@ namespace gui
             // view / visualization
             bool camera_fullscreen{ false };
 
+            // 도구가 작용하는 스트림. 열 때 0 이 되고 스트림 수 안으로 묶인다.
+            std::size_t selected_stream_idx{ 0 };
+
             // What the camera window is open for; `none` is what closed means.
             view_tool_t view_tool{ view_tool_t::none };
 
@@ -156,16 +179,26 @@ namespace gui
         // so a client command and this window open a source with the same thing.
         std::unique_ptr<net::exo_pose_server> _server;
 
-        std::optional<frame_texture> _frame_texture;
         ImGui::FileBrowser _recording_save_browser{ ImGuiFileBrowserFlags_EnterNewFilename | ImGuiFileBrowserFlags_CreateNewDir };
         ImGui::FileBrowser _config_save_browser{ ImGuiFileBrowserFlags_EnterNewFilename | ImGuiFileBrowserFlags_CreateNewDir };
         log_console _log_console;
 
-        // last annotated frame pulled from the pipeline, the same capture undrawn, and its
-        // sequence number. The undrawn one is what a colour sample is taken from.
-        cv::Mat _last_frame;
-        cv::Mat _last_source_frame;
-        uint64_t _last_seq{ 0 };
+        // Per stream: the last annotated frame pulled from the pipeline, the same capture undrawn, and
+        // its frame id. The undrawn one is what a colour sample is taken from.
+        struct stream_view_t
+        {
+            std::unique_ptr<frame_texture> texture;
+            cv::Mat annotated;
+            cv::Mat source; // the same capture undrawn, for anything reading original pixels
+            uint64_t last_frame_id{ 0 };
+        };
+        std::vector<stream_view_t> _stream_views;
+
+        // 지난 프레임에 소스가 열려 있었는지. 이 창을 거치지 않은 close 를 알아채는 자리다.
+        bool _source_open{ false };
+
+        // 트레이스 링과 플롯에 마지막으로 넣은 포즈의 시각. 한 순간이 한 번만 들어가게 한다.
+        hw::timestamp_t _last_plotted_ts{};
 
         // Samples this installation's colour, accumulated across clicks and frames. What it holds
         // is a measurement in progress, discarded whenever the operator says so and no part of
@@ -176,7 +209,7 @@ namespace gui
 
         // The frame geometry the trace ring and the plot buffers were filled under. Both are read
         // in image coordinates one way or another, so a move invalidates what they already hold.
-        std::optional<hw::roi_t> _history_roi;
+        std::vector<std::optional<hw::roi_t>> _history_rois;
 
         pose_plot_panel _plot_panel; // left pane: the joint-state views and their own controls
         open_source_dialog _open_dialog;

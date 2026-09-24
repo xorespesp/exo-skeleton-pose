@@ -5,65 +5,20 @@
 
 #include "hw/calibration.hh"
 #include "hw/frame_format.hh"
-#include "hw/sensor_frame.hh"
-#include "hw/timestamp.hh"
+#include "utils/latest_value_latch.hh"
+#include "view_plane.hh"
 
 #include <opencv2/core.hpp>
 
-#include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <vector>
 
 namespace pose
 {
-    // Hands a producer's latest value to a consumer across a thread boundary. A publish overwrites
-    // whatever has not been taken, so a slow consumer gets the newest value and misses the ones
-    // between; a take gets one whole value or nothing, never a mix of two.
-    template <typename Payload>
-    class latest_value_latch
-    {
-    public:
-        void publish(Payload payload, hw::timestamp_t at)
-        {
-            std::scoped_lock lk{ _mtx };
-            _payload = std::move(payload);
-            _at = at;
-            _unread = true;
-        }
-
-        // False when nothing has been published since the last take, leaving the outputs untouched.
-        bool try_take(Payload& out, hw::timestamp_t& at)
-        {
-            std::scoped_lock lk{ _mtx };
-            if (!_unread) { return false; }
-            _unread = false;
-            out = _payload;
-            at = _at;
-            return true;
-        }
-
-        // Reads the newest frame without claiming it, which is what a readout does. `fn` runs under
-        // the lock, so it returns a copy of what it wants rather than a handle to it.
-        template <typename Fn>
-        auto read(Fn&& fn) const
-        {
-            std::scoped_lock lk{ _mtx };
-            return fn(_payload);
-        }
-
-    private:
-        mutable std::mutex _mtx;
-        Payload _payload{};
-        hw::timestamp_t _at{};
-        bool _unread{ false }; // a frame has been published that no take has claimed
-    };
-
     // ---------------------------------------------------------------------------
     // Marker tracker: one marker technology's whole path from a frame to measurements
     // ---------------------------------------------------------------------------
@@ -74,9 +29,9 @@ namespace pose
     // reaches a technology's own readouts by asking for that type.
     //
     // Two threads share one tracker, and the sections below say which member belongs to which:
-    // one runs wherever frames arrive, the other on the thread that steps the estimator. An
-    // implementation carries what has to cross in one guarded member and publishes it at the end
-    // of a frame, so a reader gets a whole frame's worth or nothing.
+    // one takes a frame in and its measurements out, the other owns the tracker. An implementation
+    // carries what has to cross in one guarded member and publishes it at the end of a frame, so a
+    // reader gets a whole frame's worth or nothing.
     class marker_tracker_base
     {
     public:
@@ -87,8 +42,8 @@ namespace pose
 
         // --- frame thread ---------------------------------------------------------
 
-        // Take one frame in. What was found is published for the estimator thread to collect, which
-        // is why nothing comes back here.
+        // Take one frame in. What was found is published for `try_get_*` to collect, which is why
+        // nothing comes back here.
         //
         // `annotated`, when non-null, is a BGR copy of this same frame to draw the detections over.
         // Drawing happens here, where the detections are still the ones this frame produced.
@@ -98,22 +53,18 @@ namespace pose
         virtual void process_frame(
             const cv::Mat& image,
             hw::frame_format_t format,
-            hw::timestamp_t timestamp,
             cv::Mat* annotated
         ) = 0;
 
-        // --- estimator thread -----------------------------------------------------
+        // The newest published frame's measurements, each already bound to the joint it belongs to.
+        // False when nothing has been published since the last call, leaving `out` untouched.
+        //
+        // A tracker that cannot produce one of the two dimensionalities always answers false for it,
+        // and a take empties the latch, so one frame gives up one of the two.
+        virtual bool try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out) = 0;
+        virtual bool try_get_3d_measurements(std::vector<joint_3d_measurement_t>& out) = 0;
 
-        // The newest published frame's measurements, each already bound to the joint it belongs to,
-        // along with the moment that frame was captured. False when nothing has been published
-        // since the last call, leaving the outputs untouched.
-        //
-        // The time comes back with the measurements so the two can never describe different frames,
-        // which is what an estimator's dt is read from.
-        //
-        // A tracker that cannot produce one of the two dimensionalities always answers false for it.
-        virtual bool try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out, hw::timestamp_t& timestamp) = 0;
-        virtual bool try_get_3d_measurements(std::vector<joint_3d_measurement_t>& out, hw::timestamp_t& timestamp) = 0;
+        // --- owner thread ---------------------------------------------------------
 
         // Markers found in the last published frame. Against `is_tracking()` this says where a
         // stalled run broke: nothing found is a detector problem, found but not tracking is a
@@ -155,7 +106,7 @@ namespace pose
         );
         ~apriltag_tracker() override;
 
-        // Estimator thread. The detector is rebuilt from these before the next detect().
+        // Owner thread. The detector is rebuilt from these before the next detect().
         void set_options(const tag_detector::options_t& opt);
         tag_detector::options_t options() const;
 
@@ -168,18 +119,17 @@ namespace pose
         // pose solve reads has moved with them. Empty leaves tag centers, with no pose solved.
         void set_intrinsics(const std::optional<hw::intrinsic_t>& intrinsics);
 
-        // Estimator thread. The last published frame's tags, for a diagnostic trace.
+        // Owner thread. The last published frame's tags, for a diagnostic trace.
         std::vector<tag_detection_t> last_detections() const;
 
         void process_frame(
             const cv::Mat& image, 
             hw::frame_format_t format,
-            hw::timestamp_t timestamp, 
             cv::Mat* annotated
         ) override;
 
-        bool try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out, hw::timestamp_t& timestamp) override;
-        bool try_get_3d_measurements(std::vector<joint_3d_measurement_t>& out, hw::timestamp_t& timestamp) override;
+        bool try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out) override;
+        bool try_get_3d_measurements(std::vector<joint_3d_measurement_t>& out) override;
 
         std::size_t last_detection_count() const override;
 
@@ -193,7 +143,7 @@ namespace pose
         double _tag_size_m;
         bool _dirty{ true }; // forces a build on the first frame, then after each stage
 
-        latest_value_latch<std::vector<tag_detection_t>> _latch;
+        utils::latest_value_latch<std::vector<tag_detection_t>> _latch;
     };
 
     // ---------------------------------------------------------------------------
@@ -202,27 +152,28 @@ namespace pose
     //
     // A marker carries no identity of its own, so a second stage names it from where it sits among
     // its neighbours. That stage carries state across frames and a reference latched at rest-pose
-    // capture, both of which live on the estimator thread beside the calibration they follow.
+    // capture, both of which sit under a lock the frame thread and the owner thread share.
     class color_marker_tracker final : public marker_tracker_base
     {
     public:
         color_marker_tracker(
+            camera_view_t view, // 이 트래커가 맡는 카메라가 장비를 보는 view type (color marker는 sagittal만 지원)
             const color_marker_detector::options_t& detector_opt,
             const color_marker_assigner::options_t& assigner_opt
         );
         ~color_marker_tracker() override;
 
-        // Estimator thread. The detector is rebuilt from these before the next detect().
+        // Owner thread. The detector is rebuilt from these before the next detect().
         void set_detector_options(const color_marker_detector::options_t& opt);
         color_marker_detector::options_t detector_options() const;
 
-        // Estimator thread. Read a copy, edit it, hand it back; the next frame uses it.
-        color_marker_assigner::options_t assigner_options() const noexcept { return _assigner.options(); }
-        void set_assigner_options(const color_marker_assigner::options_t& opt) { _assigner.options() = opt; }
+        // Owner thread. Read a copy, edit it, hand it back; the next frame uses it.
+        color_marker_assigner::options_t assigner_options() const;
+        void set_assigner_options(const color_marker_assigner::options_t& opt);
 
-        const color_marker_assigner::stats_t& assigner_stats() const noexcept { return _assigner.stats(); }
+        color_marker_assigner::stats_t assigner_stats() const;
 
-        // Estimator thread. The last published frame's blobs and why others were dropped, which is
+        // Owner thread. The last published frame's blobs and why others were dropped, which is
         // what a tuning panel shows.
         std::vector<marker_detection_t> last_detections() const;
         marker_reject_stats_t reject_stats() const;
@@ -240,15 +191,14 @@ namespace pose
         void process_frame(
             const cv::Mat& image, 
             hw::frame_format_t format,
-            hw::timestamp_t timestamp, 
             cv::Mat* annotated
         ) override;
 
-        bool try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out, hw::timestamp_t& timestamp) override;
-        bool try_get_3d_measurements(std::vector<joint_3d_measurement_t>&, hw::timestamp_t&) override { return false; } // no 3D measurements
+        bool try_get_2d_measurements(std::vector<joint_2d_measurement_t>& out) override;
+        bool try_get_3d_measurements(std::vector<joint_3d_measurement_t>&) override { return false; } // no 3D measurements
 
         std::size_t last_detection_count() const override;
-        bool is_tracking() const override { return _assigner.stats().locked; }
+        bool is_tracking() const override;
 
         void on_rest_pose_captured() override;
         void on_rest_pose_cleared() override;
@@ -258,7 +208,8 @@ namespace pose
         std::optional<color_marker_detector> _detector; // frame thread; rebuilt when `_dirty`
         bool _warned_gray{ false };                     // frame thread; this stream was refused once
 
-        color_marker_assigner _assigner; // estimator thread
+        mutable std::mutex _assigner_mtx;
+        color_marker_assigner _assigner;
 
         mutable std::mutex _mtx; // guards the tuning below, which both threads reach
         color_marker_detector::options_t _opt;
@@ -274,69 +225,7 @@ namespace pose
             marker_reject_stats_t rejects{};
             cv::Mat mask, score; // empty while `_publish_debug_images` is off
         };
-        latest_value_latch<color_frame_t> _latch;
-    };
-
-    // ---------------------------------------------------------------------------
-    // Tracker thread: runs one tracker off the thread that delivers frames
-    // ---------------------------------------------------------------------------
-    //
-    // 프레임은 newest-wins 로 넘어온다: 트래커가 아직 못 본 프레임이 있는데 새 프레임이 오면 그것으로
-    // 대체된다. 그래서 프레임을 주는 쪽(provider 의 폴링 스레드)은 트래커가 얼마나 느리든 막히지 않고,
-    // 트래커는 언제나 가장 새로운 프레임을 본다. 검출이 프레임 주기보다 오래 걸리면 처리율이 그만큼
-    // 내려갈 뿐, 오래된 프레임을 쌓아 두고 뒤따라가는 일은 없다.
-    //
-    // `marker_tracker_base` 가 "프레임 스레드"라 부르는 쪽이 이 스레드다. 측정치 읽기는 그 계약대로
-    // 다른 한 스레드(추정기 스레드)가 `tracker()` 를 통해 한다.
-    class tracker_thread final
-    {
-    public:
-        struct stats_t
-        {
-            uint64_t frames_submitted{ 0 };
-            uint64_t frames_processed{ 0 };
-            uint64_t frames_dropped{ 0 };   // 처리되기 전에 더 새로운 프레임에 밀린 것
-            double last_process_ms{ 0.0 };
-            double process_ms_ema{ 0.0 };
-            float process_rate_fps{ 0.0f }; // EMA
-        };
-
-        // `annotate` 가 켜져 있으면 처리한 프레임마다 검출을 그린 BGR 사본을 남긴다.
-        tracker_thread(std::shared_ptr<marker_tracker_base> tracker, bool annotate);
-        ~tracker_thread();
-
-        tracker_thread(const tracker_thread&) = delete;
-        tracker_thread& operator=(const tracker_thread&) = delete;
-
-        marker_tracker_base& tracker() noexcept { return *_tracker; }
-        const marker_tracker_base& tracker() const noexcept { return *_tracker; }
-
-        // 다음 처리 대상. 아직 처리 못 한 것이 있으면 그것을 대체한다. 어느 스레드에서든 부를 수 있다.
-        void submit(std::shared_ptr<hw::sensor_frame> frame);
-
-        // 마지막으로 처리된 프레임의 어노테이트 사본과 원본. 지난 호출 뒤 새로 처리된 것이 있을 때만 true.
-        bool try_take_annotated(cv::Mat& annotated, cv::Mat& source, uint64_t& frame_id);
-
-        stats_t stats() const;
-
-    private:
-        void _run(std::stop_token stop);
-
-        std::shared_ptr<marker_tracker_base> _tracker;
-        const bool _annotate;
-
-        mutable std::mutex _mtx;
-        std::condition_variable_any _cv;
-        std::shared_ptr<hw::sensor_frame> _pending;
-        cv::Mat _annotated;
-        cv::Mat _source;
-        uint64_t _annotated_frame_id{ 0 };
-        bool _annotated_unread{ false };
-        stats_t _stats;
-        std::chrono::steady_clock::time_point _last_processed_at{};
-        bool _have_last_processed_at{ false };
-
-        std::jthread _thread; // 마지막에 선언: 위의 것들이 사라지기 전에 join 된다
+        utils::latest_value_latch<color_frame_t> _latch;
     };
 
 } // namespace pose

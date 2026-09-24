@@ -304,8 +304,9 @@ namespace pose
     // color_marker_assigner
     // ---------------------------------------------------------------------------
 
-    color_marker_assigner::color_marker_assigner(const options_t& opt)
-        : _opt{ opt }
+    color_marker_assigner::color_marker_assigner(const joint_side_t leg_side, const options_t& opt)
+        : _leg_side{ leg_side }
+        , _opt{ opt }
     {
         this->_rebuild_chain();
     }
@@ -325,10 +326,9 @@ namespace pose
             last_tag = def->tag_id;
         };
         add_site(get_root_joint());
-        for (auto j = get_leg_root_joint(_opt.leg); j.has_value(); j = get_child_joint(j.value())) {
+        for (auto j = get_leg_root_joint(_leg_side); j.has_value(); j = get_child_joint(j.value())) {
             add_site(j.value());
         }
-        _chain_side = _opt.leg;
 
         _last_px.assign(_chain.size(), std::nullopt);
         _reference_px.clear();
@@ -371,8 +371,6 @@ namespace pose
     std::vector<joint_2d_measurement_t> color_marker_assigner::assign(
         const std::span<const marker_detection_t> detections)
     {
-        if (_opt.leg != _chain_side) { this->_rebuild_chain(); }
-
         const std::size_t slots = _chain.size();
         _stats = stats_t{};
         _stats.candidates = static_cast<int>(detections.size());

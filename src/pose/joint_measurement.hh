@@ -1,9 +1,15 @@
 #pragma once
 #include "joints_def.hh"
+#include "view_plane.hh"
+
+#include "hw/timestamp.hh"
 
 #include <Eigen/Core>
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace pose
 {
@@ -40,5 +46,29 @@ namespace pose
         joint_id_t joint_id{ joint_id_t::pelvis };
         Eigen::Vector3d position{ Eigen::Vector3d::Zero() };
     };
+
+    // frameset 하나의 측정치. 슬롯 i 는 스트림 i 의 것이다.
+    template <typename Measurement>
+    struct synced_measurements_t
+    {
+        struct slot_t
+        {
+            camera_view_t view{};
+
+            // 트래커가 이 프레임의 측정치를 냈는지. false 면 `measurements` 는 비어 있다.
+            // (마커를 못 찾은 프레임은 true 에 빈 벡터)
+            bool measured{ false };
+
+            std::vector<Measurement> measurements;
+
+            std::size_t detection_count{ 0 }; // 그 프레임에서 찾은 마커 수
+        };
+
+        uint64_t seq{ 0 };           // frameset 순번. 1 부터
+        hw::timestamp_t timestamp{}; // frameset 의 시각(가장 이른 캡처)
+        std::vector<slot_t> slots;   // 인덱스 = stream_idx
+    };
+
+    using synced_2d_measurements_t = synced_measurements_t<joint_2d_measurement_t>;
 
 } // namespace pose

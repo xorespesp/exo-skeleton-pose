@@ -1,5 +1,6 @@
 #pragma once
 #include "hw/clock_anchor.hh"
+#include "hw/device_enumeration.hh"
 #include "hw/sensor_frame_source.hh"
 #include "hw/source_config.hh"
 
@@ -36,6 +37,9 @@ namespace hw
         frame_format_t format,
         std::optional<roi_t> roi
     );
+
+    // NOTE: 이미 open되어있는 device들은 열거목록에 포함되지 않음
+    std::vector<device_info_t> k4a_enumerate_devices();
 
     // Live camera source.
     class k4a_device_capturer final : public sensor_frame_source {

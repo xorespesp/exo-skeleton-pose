@@ -2,7 +2,9 @@
 #include "cli_options.hh"
 #include "gui/debugger_app.hh"
 #include "gui/camera_test_app.hh"
+#include "hw/device_enumeration.hh"
 #include "net/exo_pose_server.hh"
+#include "source_address.hh"
 
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
@@ -12,6 +14,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
 
 int main(int argc, char** argv)
 {
@@ -38,6 +41,11 @@ int main(int argc, char** argv)
     CLI::App* serve = cli.add_subcommand("serve", "Run the headless WebSocket pose server");
     app::add_cli_options(*serve, serve_cli);
 
+    CLI::App* devices = cli.add_subcommand("devices", "List the cameras attached to this machine");
+    devices->excludes(cli.get_option("--config"));
+    devices->excludes(cli.get_option("--port"));
+    devices->excludes(cli.get_option("--dump-config"));
+
     int camera_test_verbosity = 0;
     CLI::App* camera_test = cli.add_subcommand("camera-test", "Run the camera test GUI");
     camera_test->add_flag("-v,--verbose", camera_test_verbosity,
@@ -59,6 +67,24 @@ int main(int argc, char** argv)
         const auto level = verbosity >= 2 ? spdlog::level::trace : spdlog::level::debug;
         for (auto& sink : spdlog::default_logger()->sinks()) { sink->set_level(level); }
         spdlog::flush_on(level);
+    }
+
+    // Plain stdout, so the listing stays readable next to the log lines enumeration writes.
+    if (devices->parsed())
+    {
+        std::size_t listed = 0;
+        for (const auto backend : { hw::sensor_backend_t::k4a, hw::sensor_backend_t::vz })
+        {
+            for (const hw::device_info_t& device : hw::enumerate_devices(backend))
+            {
+                const app::source_address address =
+                    app::source_address::device(backend, hw::device_serial_t{ device.device_serial });
+                std::cout << address.to_string() << "  " << device.display_name << '\n';
+                ++listed;
+            }
+        }
+        if (listed == 0) { std::cout << "no camera named itself; see the log above" << '\n'; }
+        return 0;
     }
 
     if (camera_test->parsed()) {

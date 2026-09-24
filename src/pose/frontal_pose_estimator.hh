@@ -85,7 +85,7 @@ namespace pose
         );
 
         // Latch the current per-joint 3D points as the rest (bind) reference.
-        // Returns false if no joint had a point this frame.
+        // Returns false if any joint had no point this frame, keeping the previous reference.
         bool calibrate_rest_pose() override;
         void clear_rest_pose() override;
         bool has_rest_pose() const override;

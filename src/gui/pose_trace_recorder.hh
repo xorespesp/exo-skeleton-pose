@@ -47,7 +47,6 @@ namespace gui
         explicit pose_trace_recorder(std::size_t capacity = 600); // ~20 s @30 fps
 
         void set_capacity(std::size_t capacity); // trims the ring if it shrinks
-        std::size_t capacity() const { return _capacity; }
         std::size_t size() const { return _frames.size(); }
         bool empty() const { return _frames.empty(); }
         void clear() { _frames.clear(); }
@@ -61,14 +60,22 @@ namespace gui
             const trace_gates_t& gates
         );
 
+        // 소스의 스트림 하나가 무엇을 내주고 있었는지. 덤프 시점에 한 번 찍힌다.
+        struct stream_info_t
+        {
+            pose::camera_view_t camera_view{ pose::camera_view_t::frontal }; // 그 카메라가 장비를 보는 자리
+            Eigen::Vector2i resolution{ Eigen::Vector2i::Zero() };
+            float fps{ 0.0f };
+            std::optional<hw::intrinsic_t> intrinsics; // empty when the stream reported none
+        };
+
         // Serialize the ring + static context to `path` (pretty-printed JSON). The source metadata
         // is stamped once at dump time. Returns false on an I/O / serialization error (logged).
         bool write_json(
             const std::filesystem::path& path,
             const std::string& source_name,
-            const Eigen::Vector2i& source_resolution,
-            float source_fps,
-            const std::optional<hw::intrinsic_t>& intrinsics, // empty when the source reported none
+            std::span<const stream_info_t> streams,
+            std::size_t detections_stream_idx, // the stream the captured detections were read off
             pose::view_plane_t view_plane // names which estimator the frames came from
         ) const;
 

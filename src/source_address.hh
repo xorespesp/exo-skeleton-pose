@@ -1,5 +1,7 @@
 #pragma once
-#include <cstdint>
+#include "hw/sensor_backend.hh"
+#include "hw/source_config.hh"
+
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -12,40 +14,39 @@ namespace app
     class source_address
     {
     public:
-        // A camera, by index within its backend's enumeration.
-        struct k4a_device_t { uint32_t index{ 0 }; };
-        struct vz_device_t { uint32_t index{ 0 }; };
+        struct device_t {
+            hw::sensor_backend_t backend{ hw::sensor_backend_t::k4a };
+            hw::device_serial_t serial;
+        };
 
-        source_address() = default; // K4A device #0
+        source_address() = default; // 시리얼 없는 카메라. 검증이 거부한다
 
-        static source_address k4a_device(uint32_t index);
-        static source_address vz_device(uint32_t index);
+        static source_address device(hw::sensor_backend_t backend, hw::device_serial_t serial);
         static source_address recording(std::filesystem::path file);
 
         // Text form:
         //
-        //   "k4a:<index>"   a K4A camera, by device index
-        //   "vz:<index>"    a VZ camera, by device index
-        //   anything else   a recording file path
+        //   "k4a:sn:<serial>"  a K4A camera
+        //   "vz:sn:<serial>"   a VZ camera
+        //   anything else      a recording file path
         //
-        // A camera always names its backend, so a bare number is nullopt rather than a guess.
         [[nodiscard]] static std::optional<source_address> try_parse(std::string_view text);
 
-        bool is_k4a_device() const noexcept;
-        bool is_vz_device() const noexcept;
+        bool is_device() const noexcept;
         bool is_recording() const noexcept;
-        bool is_device() const noexcept { return !this->is_recording(); } // either camera
 
         // Preconditions: the matching is_*() holds.
-        uint32_t k4a_device_index() const;
-        uint32_t vz_device_index() const;
+        hw::sensor_backend_t device_backend() const;
+        const hw::device_serial_t& device_serial() const;
         const std::filesystem::path& recording_path() const;
 
-        std::string to_string() const;    // round-trips through try_parse()
-        std::string display_name() const; // "k4a device #0" / "vz device #0" / "walk.mcap"
+        std::string to_string() const;
+
+        // 같은 장치를 가리키는지. 카메라는 백엔드와 시리얼이 같을 때, 녹화는 같은 파일일 때.
+        bool operator==(const source_address& other) const noexcept;
 
     private:
-        std::variant<k4a_device_t, vz_device_t, std::filesystem::path> _value{ k4a_device_t{} };
+        std::variant<device_t, std::filesystem::path> _value{ device_t{} };
     };
 
 } // namespace app

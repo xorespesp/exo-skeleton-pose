@@ -63,6 +63,15 @@ namespace hw
             }, config);
         }
 
+        std::optional<roi_t> camera_roi(const source_config_t& config)
+        {
+            return std::visit(overloaded{
+                [](const k4a_device_config_t& c) { return c.roi; },
+                [](const vz_device_config_t& c)  { return c.roi; },
+                [](const recording_config_t&)    { return std::optional<roi_t>{}; },
+            }, config);
+        }
+
         // 두 config 가 같은 카메라를 가리키는지. `describe()` 가 백엔드와 장치 선택자를 그대로 담으므로
         // 라벨이 같으면 같은 장치다.
         bool names_same_device(const source_config_t& a, const source_config_t& b)
@@ -258,6 +267,7 @@ namespace hw
 
         std::unique_ptr<frameset_synchronizer> synchronizer;
         std::shared_ptr<record_player_source> player;
+        std::vector<std::optional<roi_t>> requested_rois; // 스트림마다 하나
 
         if (const auto* recording = std::get_if<recording_config_t>(&config))
         {
@@ -268,23 +278,26 @@ namespace hw
             // 않도록 링을 순서대로 비운다.
             player = mcap_player;
             const auto recording_streams = player->get_recording_streams();
+            if (recording->stream_rois.size() > recording_streams.size())
+            {
+                spdlog::error("provider: {} names ROIs for {} stream(s) but the file holds {}"
+                    , describe(config), recording->stream_rois.size(), recording_streams.size());
+                return false;
+            }
             synchronizer = std::make_unique<frameset_synchronizer>(
                 std::vector<std::shared_ptr<sensor_frame_source>>{ recording_streams.begin(), recording_streams.end() },
                 sync_options_t{ .ring_policy = ring_policy_t::in_order });
+
+            requested_rois = recording->stream_rois;
+            requested_rois.resize(recording_streams.size()); // 이름 없는 나머지는 전체 프레임
         }
         else
         {
             std::shared_ptr<sensor_frame_source> camera = make_camera_source(config);
             if (!camera) { return false; }
             synchronizer = std::make_unique<frameset_synchronizer>(std::move(camera), ring_policy_t::newest_first);
+            requested_rois.push_back(camera_roi(config));
         }
-
-        // config 의 윈도우 하나가 소스의 모든 스트림에 걸린다.
-        const std::optional<roi_t> requested_roi = std::visit(
-            [](const auto& c) { return c.roi; },
-            config
-        );
-        const std::vector<std::optional<roi_t>> requested_rois(synchronizer->stream_count(), requested_roi);
 
         this->_install_source(
             std::move(synchronizer),
@@ -355,7 +368,7 @@ namespace hw
         std::string source_name;
         for (const source_config_t& config : member_configs)
         {
-            requested_rois.push_back(std::visit([](const auto& c) { return c.roi; }, config));
+            requested_rois.push_back(camera_roi(config));
             if (!source_name.empty()) { source_name += " + "; }
             source_name += describe(config);
         }

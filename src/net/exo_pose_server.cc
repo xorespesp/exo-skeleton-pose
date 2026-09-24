@@ -309,7 +309,7 @@ namespace net
                                 // What to open is the installation's business, not the client's.
                                 const bool ok = _imp->pipeline.open_source(_imp->config);
                                 ack = this->_serialize_ack(ok,
-                                    !_imp->config.camera.source.has_value()
+                                    _imp->config.cameras.empty()
                                         ? "the server is configured with no source"
                                         : (ok ? "streaming" : "the configured source failed to open"),
                                     req);
@@ -321,8 +321,12 @@ namespace net
                                 break;
                             case fb_proto::Payload_CalibrateRestPose:
                             {
+                                if (!_imp->pipeline.is_source_open()) {
+                                    ack = this->_serialize_ack(false, "no source is open", req);
+                                    break;
+                                }
                                 const bool ok = _imp->pipeline.calibrate_rest_pose();
-                                ack = this->_serialize_ack(ok, ok ? "rest pose calibrated" : "no computable joint rotation", req);
+                                ack = this->_serialize_ack(ok, ok ? "rest pose calibrated" : "rest pose not captured: not every joint was detected", req);
                                 break;
                             }
                             case fb_proto::Payload_ClearRestPose:
@@ -411,7 +415,7 @@ namespace net
         }
 
         // The configured source comes up with the server, device or recording alike.
-        if (_imp->config.camera.source.has_value()) {
+        if (!_imp->config.cameras.empty()) {
             spdlog::info("server: auto-opening the configured source");
             _imp->pipeline.open_source(_imp->config);
         } else {
@@ -518,17 +522,21 @@ namespace net
         const auto source_name_str = to_fb_string(
             is_streaming ? _imp->pipeline.source_name() : std::string{});
 
+        // TODO: Fix this
+        // 프로토콜은 백엔드와 프레임 크기를 하나씩만 싣고, 묶이는 카메라들은 같은 기종·포맷이므로 일단 스트림 0 의 것을 적는다.
+        constexpr std::size_t kReportedStreamIdx = 0;
+
         std::string_view source_backend_label;
         if (is_streaming) {
             source_backend_label = _imp->pipeline.is_playback_source()
                 ? std::string_view{ "recording" }
-                : hw::sensor_backend_to_str(_imp->pipeline.sensor_backend());
+                : hw::sensor_backend_to_str(_imp->pipeline.sensor_backend(kReportedStreamIdx));
         }
         const auto source_backend_str = to_fb_string(source_backend_label);
 
         int32_t w = 0, h = 0;
         if (is_streaming) {
-            const auto res = _imp->pipeline.source_resolution();
+            const auto res = _imp->pipeline.source_resolution(kReportedStreamIdx);
             w = res.x(); h = res.y();
         }
 

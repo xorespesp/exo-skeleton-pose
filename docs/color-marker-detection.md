@@ -464,8 +464,8 @@ struct joint_2d_measurement_t {
 
 ### 파이프라인 배선
 
-`exo_pose_pipeline`에 `_select_estimator()`와 같은 모양으로 `_select_detector()`를 두고
-config의 `detector.kind`로 분기한다. **기존 태그 경로는 손대지 않는다.**
+`exo_pose_pipeline`이 소스를 여는 그 자리에서 config 의 `detector.kind` 로 갈라 스트림마다 트래커를
+짓는다. **기존 태그 경로는 손대지 않는다.**
 
 관절과 마커의 매핑은 `joints_def.hh` 테이블에 그대로 둔다. `tag_id` 옆에 색 클래스 열을
 하나 추가하면 "관절 추가 = 테이블 한 줄" 성질이 유지된다.
@@ -532,32 +532,39 @@ add_executable(${VZCAM_TEST_NAME}
   "kind": "color_marker",
   "apriltag": { "...": "태그 경로도 그대로 남아 있어 전환해도 튜닝을 잃지 않는다" },
   "color_marker": {
-    "calibration": {
-      "detector": {
-        "model": {
-          "mean_ab": [62.4000, -18.1000],
-          "cov_ab": [[9.2000, 1.4000], [1.4000, 7.8000]],
-          "max_distance": 3.0000
+    "calibration": [
+      {
+        "detector": {
+          "model": {
+            "mean_ab": [62.4000, -18.1000],
+            "cov_ab": [[9.2000, 1.4000], [1.4000, 7.8000]],
+            "max_distance": 3.0000
+          },
+          "min_area_px": 60.0, "max_area_px": 6000.0,
+          "min_fill": 0.55, "max_aspect": 3.0, "min_score": 0.15,
+          "open_kernel_px": 3, "close_kernel_px": 5
         },
-        "min_area_px": 60.0, "max_area_px": 6000.0,
-        "min_fill": 0.55, "max_aspect": 3.0, "min_score": 0.15,
-        "open_kernel_px": 3, "close_kernel_px": 5
+        "assigner": {
+          "marker_diameter_m": 0.018,
+          "search_radius_px": 60.0,
+          "enable_bone_length_check": true,
+          "bone_length_tolerance": 0.35,
+          "lost_frames_before_full_search": 10
+        },
+        "frame_resolution": [2448, 2048]
       },
-      "frame_resolution": [2448, 2048]
-    },
-    "assigner": {
-      "leg": "left",
-      "marker_diameter_m": 0.018,
-      "search_radius_px": 60.0,
-      "enable_bone_length_check": true,
-      "bone_length_tolerance": 0.35,
-      "lost_frames_before_full_search": 10
-    }
+      null
+    ]
   }
 }
 ```
 
-`assigner` 블록은 `color_marker_assigner::options_t` 를 그대로 비춘다. `frontal` / `sagittal` 이
+**`calibration` 은 카메라마다 한 칸이다.** `cameras[i]` 가 스트림 i 이고 `calibration[i]` 가 그 카메라를
+잰 결과다. 같은 자리에서 같은 카메라·거리·조명으로 정해지는 값들이라 색 모델, 블롭 필터, 배정 설정이
+한 블록에 함께 있다. 아직 안 잰 카메라의 칸은 `null` 이다.
+
+`assigner` 블록은 `color_marker_assigner::options_t` 를 그대로 비춘다(다리는 위의 `view` 가 정하므로
+여기 없다). `frontal` / `sagittal` 이
 추정기 옵션을 비추는 것과 같은 형태라, 파라미터를 하나 더하면 그 구조체 안
 `DECLARE_SERIALIZABLE_FIELDS` 목록의 한 줄이 전부다. 각 타입이 자기 키 목록을 멤버 옆에 들고
 있어서(`utils/serializable.hh`), 필드와 키가 한 자리에서 같이 늘어난다.
@@ -622,7 +629,8 @@ digital shift 는 전원을 꺼도 카메라에 남는 값이라 누가 언제 �
 **`valid` 는 파일에 없다.** 파싱에 성공하고 공분산이 면적을 갖는 타원이면 그게 곧 적합된
 모델이다. 파일 안에 "이건 유효하지 않다" 고 적을 수 있게 두면 바로 옆의 숫자와 모순될 수 있다.
 
-**어느 다리인지는 `leg` 가 정한다.** 태그는 id 가 알려주지만 색은 못 한다. 여기가 그 자리다.
+**어느 다리인지는 카메라 엔트리의 `view` 가 정한다.** 태그는 id 가 알려주지만 색은 못 한다. sagittal
+카메라는 자기가 선 쪽의 다리를 찍으므로, 그 뷰가 곧 다리다.
 
 ---
 

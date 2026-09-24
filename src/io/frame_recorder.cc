@@ -68,6 +68,8 @@ namespace io
 
     void frame_recorder::stop() noexcept
     {
+        std::scoped_lock stop_lk{ _stop_mtx };
+
         // Stop accepting frames first, so the worker sees a queue that can only shrink.
         if (!_is_started.exchange(false, std::memory_order_relaxed)) { return; }
 

@@ -73,6 +73,7 @@ namespace io
 
         std::atomic_bool _is_started{ false };
         std::jthread _thread;
+        std::mutex _stop_mtx;
     };
 
 } // namespace io

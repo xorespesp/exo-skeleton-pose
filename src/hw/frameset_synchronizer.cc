@@ -109,25 +109,44 @@ namespace hw
 
     std::optional<roi_t> frameset_synchronizer::try_set_roi(const std::size_t stream_idx, const roi_t& roi)
     {
-        // 소스 자신의 락이 grabber 의 fetch 와 이 쓰기를 직렬화한다. 쓰기가 끝난 뒤의 flush 가, 그 사이
-        // 링에 들어온 옛 기하의 캡처와 fetch 도중인 것을 함께 걸러 낸다.
-        const std::optional<roi_t> granted = _slots.at(stream_idx)->source->try_set_roi(roi);
-        this->flush();
+        sensor_frame_source& source = *_slots.at(stream_idx)->source;
+        std::optional<roi_t> granted;
+        this->reposition([&] { granted = source.try_set_roi(roi); });
         return granted;
     }
 
-    void frameset_synchronizer::flush()
+    void frameset_synchronizer::reposition(const std::function<void()>& move_streams)
     {
         {
+            // grabber 들이 fetch 밖으로 나와 멈출 때까지 기다린다. 이 뒤로는 옮기는 동안 아무도 읽지 않는다.
+            std::unique_lock lk{ _mtx };
+            _repositioning = true;
+            _cv.wait(lk, [&] { return _grabbers_in_fetch == 0; });
+        }
+
+        // 락 밖에서 옮긴다. 소스에 쓰는 일은 스트림을 멈췄다 다시 시작할 수 있어 길고, 그동안 통계 조회가
+        // 막힐 이유가 없다.
+        try
+        {
+            move_streams();
+        }
+        catch (...)
+        {
+            { std::scoped_lock lk{ _mtx }; _repositioning = false; }
+            _cv.notify_all();
+            throw;
+        }
+
+        {
             std::scoped_lock lk{ _mtx };
-            ++_generation;
             for (auto& slot : _slots)
             {
-                slot->ring.clear();
+                slot->ring.clear(); // 전부 옛 위치의 것이다
                 slot->exhausted = false;
             }
             _last_fetched_reference_timestamp.reset();
             _last_emitted_timestamp.reset();
+            _repositioning = false;
         }
         _cv.notify_all();
     }
@@ -155,16 +174,17 @@ namespace hw
 
         while (!stop.stop_requested())
         {
-            uint64_t generation;
             {
                 std::unique_lock lk{ _mtx };
                 // 아무것도 못 받은 뒤에는 소비자가 그것을 본 다음에야 다시 시도한다. 카메라는 소비자의
-                // 재시도 주기로 다시 묻고, 파일은 seek 이 올 때까지 EOF 에 머문다.
+                // 재시도 주기로 다시 묻고, 파일은 seek 이 올 때까지 EOF 에 머문다. 스트림이 옮겨지는
+                // 동안은 들어가지 않는다.
                 _cv.wait(lk, stop, [&] {
-                    return _closing || (!slot.exhausted && (!waits_for_room || slot.ring.size() < _options.ring_depth_frames));
+                    return _closing || (!_repositioning && !slot.exhausted
+                        && (!waits_for_room || slot.ring.size() < _options.ring_depth_frames));
                 });
                 if (stop.stop_requested() || _closing) { return; }
-                generation = _generation;
+                ++_grabbers_in_fetch;
             }
 
             std::optional<sensor_frameset> capture;
@@ -176,6 +196,7 @@ namespace hw
             {
                 // 소스가 이어갈 수 없는 문제. 소비자의 fetch 가 다시 던져 스트림이 failed 로 끝난다.
                 std::scoped_lock lk{ _mtx };
+                --_grabbers_in_fetch;
                 _failure = std::current_exception();
                 slot.exhausted = true;
                 _cv.notify_all();
@@ -183,13 +204,13 @@ namespace hw
             }
 
             std::scoped_lock lk{ _mtx };
+            --_grabbers_in_fetch;
             if (!capture.has_value())
             {
                 slot.exhausted = true;
                 _cv.notify_all();
                 continue;
             }
-            if (generation != _generation) { continue; } // flush 를 가로질러 당긴 옛 위치의 캡처
 
             ++slot.stats.frames_fetched;
             if (is_reference) { this->_observe_reference_interval(capture->timestamp()); }
@@ -330,10 +351,17 @@ namespace hw
 
                 std::optional<sensor_frameset> partner = this->_take_partner(slot, reference_timestamp, tolerance);
 
+                // 링의 가장 오래된 캡처가 이미 기준보다 허용오차 이상 늦으면 이 스트림은 기준을 앞질렀다.
+                // 뒤에 올 캡처는 더 늦으므로 기다릴 것이 없다.
+                const auto ran_ahead = [&] {
+                    return tolerance.has_value() && !slot.ring.empty()
+                        && slot.ring.front().timestamp() > reference_timestamp + *tolerance;
+                };
+
                 // 아직 안 왔을 수 있다. 이 스트림이 기준에 뒤처져 있으면 다음 캡처가 같은 순간의 것일 수
                 // 있으므로, 새 캡처가 들어오거나 스트림이 침묵을 알릴 때까지 한도 안에서 기다린다.
                 const auto deadline = std::chrono::steady_clock::now() + this->_match_deadline();
-                while (!partner.has_value() && !slot.exhausted && !_closing && !_failure)
+                while (!partner.has_value() && !ran_ahead() && !slot.exhausted && !_closing && !_failure)
                 {
                     const uint64_t seen = slot.pushes;
                     if (!_cv.wait_until(lk, deadline, [&] { return slot.pushes != seen || slot.exhausted || _closing || _failure; })) {

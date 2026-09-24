@@ -42,7 +42,9 @@ namespace net
         // every frame regardless of listener state.
         void poll();
 
-        // Convenience blocking mode: start(), run the loop until it ends, then stop().
+        // Headless blocking mode: start(), open the configured source, and run the loop until a
+        // console exit request (Ctrl+C, window close, logoff, shutdown) ends it; then stop() and
+        // release the source, so the cameras are freed and a recording is finalized.
         int run();
 
         // The pose pipeline this server drives.

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -110,17 +111,18 @@ namespace hw
         frame_format_t get_frame_format(std::size_t stream_idx) const;
         stream_descriptor_t get_stream_descriptor(std::size_t stream_idx) const;
 
-        // `stream_idx` 의 소스에 넘기고, 들고 있던 캡처를 전부 버린다. 옛 픽셀 프레임의 캡처는 새 픽셀
-        // 프레임의 캡처와 같은 묶음에 들어갈 수 없다.
+        // `stream_idx` 의 소스에 넘긴다. 쓰는 동안 grabber 들이 멈춰 있고 들고 있던 캡처는 전부 버려지므로,
+        // 옛 픽셀 프레임의 캡처가 새 픽셀 프레임의 캡처와 같은 묶음에 들어가지 않는다.
         std::optional<roi_t> try_set_roi(std::size_t stream_idx, const roi_t& roi);
 
         // 기준 링에 캡처가 올 때까지 기다린다. 기준 스트림이 아무것도 내지 않으면 비어 있다: 녹화라면
         // 끝이고, 카메라라면 fetch 가 타임아웃한 것이다.
         [[nodiscard]] std::optional<synced_frameset> fetch_next_synced_frameset();
 
-        // 링과 fetch 사이에 들고 있던 것을 전부 버린다. 스트림들이 옮겨진 뒤에 부르면 옛 위치에서 당기던
-        // 캡처까지 걸러지고, 다음 fetch 가 새 위치에서 싱크를 잡는다.
-        void flush();
+        // 스트림들의 위치를 옮기는 `move_streams` 를 grabber 가 하나도 fetch 안에 있지 않을 때 실행하고,
+        // 링에 들고 있던 것을 전부 버린다. 재개한 grabber 의 첫 read 가 곧 새 위치의 첫 캡처이고, 다음
+        // fetch 가 거기서 싱크를 잡는다. 진행 중이던 fetch 하나가 끝날 때까지 기다린다.
+        void reposition(const std::function<void()>& move_streams);
 
         // grabber 들을 멈추고 모든 스트림을 닫는다.
         void close();
@@ -159,12 +161,12 @@ namespace hw
         std::condition_variable_any _cv;
         bool _closing{ false };
 
-        // flush 마다 오른다. grabber 는 fetch 에 들어갈 때의 세대를 기억했다가, 돌아와서 다르면 옛 위치에서
-        // 당긴 그 캡처를 버린다.
-        uint64_t _generation{ 0 };
+        // `reposition()` 이 도는 동안 참. grabber 는 이것이 내려갈 때까지 fetch 에 들어가지 않는다.
+        bool _repositioning{ false };
+        std::size_t _grabbers_in_fetch{ 0 }; // 지금 소스의 fetch 안에 있는 grabber 수
 
         // 허용오차의 출처. 최근 간격들의 중앙값이라 드롭으로 벌어진 간격이 섞여도 실제 주기가 나온다.
-        // 중앙값은 flush 를 넘어 남고, 마지막 시각은 seek 이 끊으므로 flush 에서 비운다.
+        // 중앙값은 reposition 을 넘어 남고, 마지막 시각은 seek 이 끊으므로 reposition 에서 비운다.
         std::optional<timestamp_t> _last_fetched_reference_timestamp;
         std::deque<std::chrono::nanoseconds> _reference_intervals;
         std::optional<std::chrono::nanoseconds> _reference_interval; // 위의 중앙값

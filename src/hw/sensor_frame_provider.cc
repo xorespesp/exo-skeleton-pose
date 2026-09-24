@@ -15,6 +15,7 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -165,9 +166,10 @@ namespace hw
             const std::vector<std::optional<roi_t>>& requested_rois
         );
 
-        // 프레임 기하의 유일한 writer. 한 번에 한 스트림을 쓴다. 바뀌었음을 관찰자에게 알리는 것은
-        // 호출자의 몫이다.
-        void _install_frame_geometry(
+        // 프레임 기하의 유일한 writer. 한 번에 한 스트림을 쓴다. 소스가 `requested_roi` 를 거부하면
+        // 아무것도 쓰지 않고 false 를 돌려준다: 소스의 창이 그대로이므로 설명도 그대로다. 바뀌었음을
+        // 관찰자에게 알리는 것은 호출자의 몫이다.
+        bool _install_frame_geometry(
             frameset_synchronizer& synchronizer,
             std::size_t stream_idx,
             const std::optional<roi_t>& requested_roi
@@ -225,6 +227,10 @@ namespace hw
         // 폴링 스레드가 frameset 마다 한 번 쓰고, 어디서든 읽는다.
         mutable std::mutex _stream_stats_mtx;
         std::vector<stream_delivery_stats_t> _stream_stats;
+
+        // end 통지가 나간 뒤 frameset 이 하나도 나가지 않았다. 그동안 다시 만난 끝과 close 는 통지를
+        // 되풀이하지 않는다. 폴링 스레드가 쓰고, close 는 그 스레드를 join 한 뒤에 읽는다.
+        bool _stream_end_notified{ false };
 
         // 소스가 살아 있는 동안 고정. `_geometry_mtx` 아래에서 기하와 함께 설치된다.
         std::vector<stream_info_t> _stream_infos;
@@ -310,6 +316,7 @@ namespace hw
     catch (const std::exception& e)
     {
         spdlog::error("provider: failed to open {}: {}", describe(config), e.what());
+        this->close();
         return false;
     }
 
@@ -384,6 +391,7 @@ namespace hw
     catch (const std::exception& e)
     {
         spdlog::error("provider: failed to open a synced group: {}", e.what());
+        this->close();
         return false;
     }
 
@@ -399,6 +407,7 @@ namespace hw
         {
             std::scoped_lock lk{ _geometry_mtx };
             _stream_geometries.assign(stream_count, stream_geometry_t{});
+            _stream_infos.assign(stream_count, stream_info_t{});
         }
         {
             std::scoped_lock lk{ _stream_stats_mtx };
@@ -411,7 +420,10 @@ namespace hw
         {
             const std::optional<roi_t> requested_roi =
                 stream_idx < requested_rois.size() ? requested_rois[stream_idx] : std::nullopt;
-            this->_install_frame_geometry(*synchronizer, stream_idx, requested_roi);
+            if (!this->_install_frame_geometry(*synchronizer, stream_idx, requested_roi))
+            {
+                this->_install_frame_geometry(*synchronizer, stream_idx, std::nullopt); // 막 연 소스는 전체 프레임을 낸다
+            }
 
             stream_infos.push_back(stream_info_t{
                 .frame_format = synchronizer->get_frame_format(stream_idx),
@@ -429,6 +441,7 @@ namespace hw
         _frameset_rate.store(0.0f);
         _paused.store(false);
         _need_repace.store(true);
+        _stream_end_notified = false;
         {
             // 이전 소스를 향해 올린 요청은 버린다.
             std::scoped_lock lk{ _wake_cv_mtx };
@@ -473,7 +486,7 @@ namespace hw
         }
     }
 
-    void sensor_frame_provider::impl::_install_frame_geometry(
+    bool sensor_frame_provider::impl::_install_frame_geometry(
         frameset_synchronizer& synchronizer,
         const std::size_t stream_idx,
         const std::optional<roi_t>& requested_roi)
@@ -494,6 +507,7 @@ namespace hw
                     , stream_idx
                     , full.x(), full.y()
                 );
+                return false;
             }
             else if (*granted == roi_t{ 0, 0, full.x(), full.y() })
             {
@@ -510,12 +524,13 @@ namespace hw
         // 카메라에 쓰는 일은 스트림을 멈췄다 다시 시작하므로 락 밖에서 했고, 네 값은 한 락 아래에서 함께
         // 발행한다.
         std::scoped_lock lk{ _geometry_mtx };
-        if (stream_idx >= _stream_geometries.size()) { return; }
+        if (stream_idx >= _stream_geometries.size()) { return false; }
         stream_geometry_t& geometry = _stream_geometries[stream_idx];
         geometry.calib = std::move(calib);
         geometry.full_frame_resolution = full;
         geometry.roi = granted;
         geometry.frame_resolution = geometry.calib.frame_resolution; // `apply_roi` 가 이미 줄였다
+        return true;
     }
 
     std::size_t sensor_frame_provider::impl::stream_count() const
@@ -527,56 +542,72 @@ namespace hw
     calibration_t sensor_frame_provider::impl::get_calibration(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _geometry_mtx };
-        if (stream_idx >= _stream_geometries.size()) { return calibration_t{}; }
+        if (stream_idx >= _stream_geometries.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_geometries.size()) };
+        }
         return _stream_geometries[stream_idx].calib;
     }
 
     frame_format_t sensor_frame_provider::impl::get_frame_format(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _geometry_mtx };
-        if (stream_idx >= _stream_infos.size()) { return frame_format_t{}; }
+        if (stream_idx >= _stream_infos.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_infos.size()) };
+        }
         return _stream_infos[stream_idx].frame_format;
     }
 
     stream_descriptor_t sensor_frame_provider::impl::get_stream_descriptor(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _geometry_mtx };
-        if (stream_idx >= _stream_infos.size()) { return stream_descriptor_t{}; }
+        if (stream_idx >= _stream_infos.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_infos.size()) };
+        }
         return _stream_infos[stream_idx].descriptor;
     }
 
     Eigen::Vector2i sensor_frame_provider::impl::get_frame_resolution(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _geometry_mtx };
-        if (stream_idx >= _stream_geometries.size()) { return Eigen::Vector2i::Zero(); }
+        if (stream_idx >= _stream_geometries.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_geometries.size()) };
+        }
         return _stream_geometries[stream_idx].frame_resolution;
     }
 
     Eigen::Vector2i sensor_frame_provider::impl::get_full_frame_resolution(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _geometry_mtx };
-        if (stream_idx >= _stream_geometries.size()) { return Eigen::Vector2i::Zero(); }
+        if (stream_idx >= _stream_geometries.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_geometries.size()) };
+        }
         return _stream_geometries[stream_idx].full_frame_resolution;
     }
 
     std::optional<roi_t> sensor_frame_provider::impl::get_effective_roi(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _geometry_mtx };
-        if (stream_idx >= _stream_geometries.size()) { return std::nullopt; }
+        if (stream_idx >= _stream_geometries.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_geometries.size()) };
+        }
         return _stream_geometries[stream_idx].roi;
     }
 
     float sensor_frame_provider::impl::get_current_update_rate(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _stream_stats_mtx };
-        if (stream_idx >= _stream_stats.size()) { return 0.0f; }
+        if (stream_idx >= _stream_stats.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_stats.size()) };
+        }
         return _stream_stats[stream_idx].update_rate_fps;
     }
 
     uint64_t sensor_frame_provider::impl::get_frames_delivered(const std::size_t stream_idx) const
     {
         std::scoped_lock lk{ _stream_stats_mtx };
-        if (stream_idx >= _stream_stats.size()) { return 0; }
+        if (stream_idx >= _stream_stats.size()) {
+            throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _stream_stats.size()) };
+        }
         return _stream_stats[stream_idx].frames_delivered;
     }
 
@@ -590,7 +621,9 @@ namespace hw
     {
         {
             std::scoped_lock lk{ _wake_cv_mtx };
-            if (stream_idx >= _pending_roi_reqs.size()) { return; }
+            if (stream_idx >= _pending_roi_reqs.size()) {
+                throw std::out_of_range{ std::format("provider: stream {} is not among the {} open", stream_idx, _pending_roi_reqs.size()) };
+            }
             _pending_roi_reqs[stream_idx] = roi_request_t{ .window = roi };
         }
         _wake_cv.notify_all();
@@ -627,10 +660,10 @@ namespace hw
             const roi_t want = requests[stream_idx]->window.value_or(roi_t{ 0, 0, full.x(), full.y() });
 
             const std::optional<roi_t> old_roi = this->get_effective_roi(stream_idx);
-            this->_install_frame_geometry(*_synchronizer, stream_idx, want);
+            if (!this->_install_frame_geometry(*_synchronizer, stream_idx, want)) { continue; } // 소스의 창이 그대로다
             const std::optional<roi_t> new_roi = this->get_effective_roi(stream_idx);
 
-            // 픽셀 프레임이 그대로인 요청(거부됐거나 이미 걸린 값에 스냅)은 하류에 알릴 것이 없다.
+            // 이미 걸린 값에 스냅한 요청은 픽셀 프레임이 그대로라 하류에 알릴 것이 없다.
             if (new_roi == old_roi) { continue; }
 
             spdlog::info("provider: stream {} is now framed {}", stream_idx, describe_roi(new_roi));
@@ -698,15 +731,15 @@ namespace hw
             if (!request.has_value()) { return false; }
             if (!_player) { return false; } // 라이브 카메라는 seek 할 곳이 없다
 
-            switch (request->kind) {
-            case seek_request_t::kind_t::begin:    _player->seek_begin(); break;
-            case seek_request_t::kind_t::end:      _player->seek_end(); break;
-            case seek_request_t::kind_t::timeline: _player->seek_timestamp(request->at); break;
-            }
-
-            // 스트림들이 옮겨졌으므로 synchronizer 가 들고 있던 것은 옛 위치다. 다음 fetch 가 새 위치에서
-            // 싱크를 잡는다.
-            if (_synchronizer) { _synchronizer->flush(); }
+            // grabber 가 멈춘 사이에 옮긴다. synchronizer 가 들고 있던 것은 옛 위치라 함께 버려지고, 다음
+            // fetch 가 새 위치에서 싱크를 잡는다.
+            _synchronizer->reposition([&] {
+                switch (request->kind) {
+                case seek_request_t::kind_t::begin:    _player->seek_begin(); break;
+                case seek_request_t::kind_t::end:      _player->seek_end(); break;
+                case seek_request_t::kind_t::timeline: _player->seek_timestamp(request->at); break;
+                }
+            });
             return true;
         };
 
@@ -864,6 +897,7 @@ namespace hw
             }
 
             restarted = false; // 전달 중이므로 다음 끝은 되돌릴 끝이다
+            _stream_end_notified = false; // 다음 끝은 새로 알릴 끝이다
             _frameset_seq.fetch_add(1);
 
             // EMA fps (벽시계 기준)
@@ -947,6 +981,7 @@ namespace hw
 
     void sensor_frame_provider::impl::_notify_sensor_stream_end(const stream_end_reason_t reason)
     {
+        if (std::exchange(_stream_end_notified, true)) { return; } // 끝 하나에 한 번
         for (const auto& obs : _snapshot_observers()) { obs->on_sensor_stream_end(reason); }
     }
 

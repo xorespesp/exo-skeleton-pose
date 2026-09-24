@@ -20,6 +20,7 @@ namespace io
             , _descriptor{ .sensor_backend = stream.stream_info.sensor_backend, .device_serial = stream.stream_info.device_serial }
             , _calibration{ stream.stream_info.calibration }
             , _frame_format{ stream.stream_info.color_format }
+            , _codec{ stream.codec }
         { }
 
         bool is_valid() const override
@@ -57,22 +58,32 @@ namespace io
             const std::shared_ptr<mcap_record_player> player = _player.lock();
             if (!player) { return std::nullopt; }
 
-            std::scoped_lock lk{ player->_mtx };
-            if (!player->_opened) { return std::nullopt; }
+            while (true)
+            {
+                // 파일에서 꺼내는 것만 락 아래에서 한다. 디코드는 스트림마다 자기 grabber 에서 나란히 돈다.
+                std::optional<recording_reader::encoded_frame_t> encoded;
+                std::optional<hw::roi_t> roi;
+                {
+                    std::scoped_lock lk{ player->_mtx };
+                    if (!player->_opened) { return std::nullopt; }
+                    encoded = player->_reader.fetch_next_encoded_frame(_stream_idx);
+                    roi = _roi;
+                }
+                if (!encoded.has_value()) { return std::nullopt; } // EOF
 
-            std::optional<recording_reader::frame_t> frame = player->_reader.fetch_next_frame(_stream_idx);
-            if (!frame.has_value()) { return std::nullopt; } // EOF
+                cv::Mat image = decode_frame(_codec, encoded->payload, _frame_format);
+                if (image.empty()) { continue; } // already logged; skip the bad frame rather than end playback
 
-            cv::Mat image = std::move(frame->image);
-            if (_roi.has_value()) {
-                image = image(cv::Rect{ _roi->x, _roi->y, _roi->width, _roi->height });
+                if (roi.has_value()) {
+                    image = image(cv::Rect{ roi->x, roi->y, roi->width, roi->height });
+                }
+
+                return hw::sensor_frameset{ std::make_shared<hw::sensor_frame>(
+                    std::move(image),
+                    _frame_format,
+                    encoded->timestamp
+                ) };
             }
-
-            return hw::sensor_frameset{ std::make_shared<hw::sensor_frame>(
-                std::move(image),
-                _frame_format,
-                frame->timestamp
-            ) };
         }
 
     private:
@@ -81,6 +92,7 @@ namespace io
         const hw::stream_descriptor_t _descriptor;
         const hw::calibration_t _calibration; // 전체 프레임 기준
         const hw::frame_format_t _frame_format;
+        const image_codec_t _codec;
         std::optional<hw::roi_t> _roi; // nullopt: 전체 프레임
     };
 

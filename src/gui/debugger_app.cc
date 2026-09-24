@@ -131,7 +131,7 @@ namespace gui
         // pipeline so device/algorithm testing works whether or not it's running.
         _server->poll();
 
-        // 소스는 이 창을 거치지 않고도 닫힌다: 클라이언트의 STOP, 마지막 클라이언트의 이탈, 장치 실패.
+        // 소스는 이 창을 거치지 않고도 닫힌다: 클라이언트의 STOP, 장치 실패.
         // 그 프레임들을 설명하던 세션 상태가 다음 소스의 것과 한 버퍼에 섞이지 않게 한다.
         if (const bool source_open = _server->pipeline().is_source_open(); source_open != _source_open)
         {
@@ -425,6 +425,17 @@ namespace gui
                 const cv::Mat decisions = (backdrop == 1) ? color_tracker->mask()
                                                           : color_tracker->score_image();
                 if (!decisions.empty()) { cv::cvtColor(decisions, view, cv::COLOR_GRAY2BGR); }
+            }
+
+            // 5MP 두 장을 매 프레임 그대로 올리면 업로드 오버헤드가 커지므로
+            // 화면에 그려지는 크기로 다운사이즈
+            constexpr int kMaxTextureExtent = 1280;
+            if (const int extent = std::max(view.cols, view.rows); extent > kMaxTextureExtent)
+            {
+                const double factor = static_cast<double>(kMaxTextureExtent) / extent;
+                cv::Mat shrunk;
+                cv::resize(view, shrunk, cv::Size{}, factor, factor, cv::INTER_AREA);
+                view = std::move(shrunk);
             }
 
             if (!stream_view.texture) { stream_view.texture = std::make_unique<frame_texture>(this->renderer().sdl_renderer()); }

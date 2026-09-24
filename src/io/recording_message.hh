@@ -91,7 +91,7 @@ namespace io
         std::string_view coord_frame_id
     );
 
-    // Returns a zeroed calibration_t if the payload is malformed.
-    hw::calibration_t decode_calibration(std::span<const std::byte> payload) noexcept;
+    // Throws if the payload is malformed.
+    hw::calibration_t decode_calibration(std::span<const std::byte> payload);
 
 } // namespace io

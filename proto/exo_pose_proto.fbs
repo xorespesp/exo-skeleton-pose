@@ -32,6 +32,8 @@ enum JointId : ubyte {
 
 // Handshake. (client's mandatory first message)
 // The server holds one client at a time; a second connection is closed with 1013.
+// The source and a captured rest pose outlive a connection: a client that reconnects finds them
+// as they were, and StartPoseStream then answers "already streaming".
 // On success -> the server replies Ack(ok) followed by a ServerStatus.
 // On failure -> the server closes with WebSocket code 1002 and the reason.
 table Hello {
@@ -113,6 +115,10 @@ table ServerStatus {
     is_streaming: bool;
     source_name: string;    // NOTE: empty while not streaming
     source_backend: string; // NOTE: empty while not streaming
+
+    // TODO: One frame size for the whole source, so it is stream 0's. Streams may carry different
+    //       ROIs, and then it does not hold for the others. No client computes with it (the
+    //       protocol carries no video and poses are in rig space); deprecate it or send one per stream.
     width: int;  // color frame width (Unit: [px]); 0 while not streaming
     height: int; // color frame height (Unit: [px]); 0 while not streaming
     has_rest_pose: bool;

@@ -53,20 +53,23 @@ namespace io
         hw::timestamp_t first_timestamp() const noexcept { return _first_timestamp; }
         hw::timestamp_t last_timestamp() const noexcept { return _last_timestamp; }
 
-        struct frame_t
+        // 프레임 하나의 인코딩된 메시지.
+        // `decode_frame()` 에 그 스트림의 `codec` 과 `color_format` 으로 넘기면 이미지가 된다.
+        struct encoded_frame_t
         {
             hw::timestamp_t timestamp{};
-            cv::Mat image; // in the stream's `color_format`
+            std::vector<std::byte> payload;
         };
 
-        // Each stream advances and seeks on its own cursor, 
+        // Each stream advances and seeks on its own cursor,
         // so reading or seeking one does not disturb the others.
 
         // Restarts the stream's iteration at the first frame at or after `timestamp`.
         void seek_timestamp(std::size_t stream_idx, hw::timestamp_t timestamp) noexcept;
 
-        // nullopt at the end of the stream. Only this stream's frames are decoded.
-        [[nodiscard]] std::optional<frame_t> fetch_next_frame(std::size_t stream_idx) noexcept;
+        // nullopt at the end of the stream. Only this stream's messages are read.
+        // 디코드는 호출자 몫이라, reader 를 락으로 지키는 쪽이 디코드를 락 밖에서 나란히 돌릴 수 있다.
+        [[nodiscard]] std::optional<encoded_frame_t> fetch_next_encoded_frame(std::size_t stream_idx) noexcept;
 
     private:
         // Builds a fresh cursor for the stream, positioned at `from`. 

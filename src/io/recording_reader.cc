@@ -225,26 +225,52 @@ namespace io
 
         // Each stream's calibration is a single message on its own topic, read once here so
         // the playback cursors carry only frames.
-        for (recorded_camera_stream_t& stream : streams) {
+        for (recorded_camera_stream_t& stream : streams)
+        {
             const std::string stream_name = stream_name_of(stream.stream_idx);
             const std::string topic = std::format("/camera/{}/calibration", stream_name);
 
             mcap::ReadMessageOptions options{};
             options.topicFilter = [&topic](const std::string_view candidate) { return candidate == topic; };
 
+            // writer 는 첫 프레임과 함께 캘리브레이션을 쓰므로, 없으면 그 스트림은 프레임도 없다.
             mcap::LinearMessageView view = reader->readMessages(log_problem, options);
             const auto it = view.begin();
             if (it == view.end()) {
-                spdlog::warn("recording_reader: camera stream '{}' has no calibration", stream_name);
-                continue;
+                throw std::runtime_error{ std::format("camera stream '{}' has no calibration", stream_name) };
             }
-            stream.stream_info.calibration = decode_calibration(payload_of(it->message));
+            try {
+                stream.stream_info.calibration = decode_calibration(payload_of(it->message));
+            }
+            catch (const std::exception& e) {
+                throw std::runtime_error{ std::format("camera stream '{}': {}", stream_name, e.what()) };
+            }
+        }
+
+        // 재생의 끝은 모든 스트림이 닿는 마지막 순간이다: 스트림마다 마지막 프레임 시각의 최솟값.
+        // 녹화기는 frameset 을 통째로 쓰므로 이것이 마지막 frameset 의 시각이고, 여기로 seek 하면 그
+        // frameset 의 캡처가 스트림마다 하나씩 남는다.
+        hw::timestamp_t last_moment = hw::timestamp_t::max();
+        for (const recorded_camera_stream_t& stream : streams) {
+            mcap::ReadMessageOptions options{};
+            options.readOrder = mcap::ReadMessageOptions::ReadOrder::ReverseLogTimeOrder;
+            options.topicFilter = [topic = image_topic(stream_name_of(stream.stream_idx))](const std::string_view t) {
+                return t == topic;
+            };
+
+            mcap::LinearMessageView view = reader->readMessages(log_problem, options);
+            const auto it = view.begin();
+            if (it == view.end()) {
+                throw std::runtime_error{ std::format(
+                    "camera stream '{}' has no frame", stream_name_of(stream.stream_idx)) };
+            }
+            last_moment = std::min(last_moment, hw::timestamp_t{ std::chrono::nanoseconds{ it->message.logTime } });
         }
 
         _reader = std::move(reader);
         _streams = std::move(streams);
         _first_timestamp = hw::timestamp_t{ std::chrono::nanoseconds{ statistics->messageStartTime } };
-        _last_timestamp = hw::timestamp_t{ std::chrono::nanoseconds{ statistics->messageEndTime } };
+        _last_timestamp = last_moment;
         _opened = true;
 
         _cursors.resize(_streams.size());
@@ -291,37 +317,28 @@ namespace io
         if (stream_idx < _cursors.size()) { _cursors[stream_idx].reset(); }
     }
 
-    std::optional<recording_reader::frame_t> recording_reader::fetch_next_frame(
+    std::optional<recording_reader::encoded_frame_t> recording_reader::fetch_next_encoded_frame(
         const std::size_t stream_idx) noexcept try
     {
         if (!_opened || stream_idx >= _cursors.size()) { return std::nullopt; }
 
         playback_cursor_t* cursor = _cursors[stream_idx].get();
-        if (!cursor) { return std::nullopt; }
+        if (!cursor || cursor->it == cursor->end) { return std::nullopt; }
 
-        const recorded_camera_stream_t& cam = _streams[stream_idx]; // parallel to _cursors; index already checked
+        // The payload dies when the iterator advances, so copy it out before stepping.
+        const mcap::MessageView& view = *cursor->it;
+        const std::span<const std::byte> payload = payload_of(view.message);
+        encoded_frame_t frame{
+            .timestamp = hw::timestamp_t{ std::chrono::nanoseconds{ view.message.logTime } },
+            .payload = std::vector<std::byte>{ payload.begin(), payload.end() },
+        };
+        ++cursor->it;
 
-        while (cursor->it != cursor->end) {
-            const mcap::MessageView& view = *cursor->it;
-            const auto timestamp = hw::timestamp_t{ std::chrono::nanoseconds{ view.message.logTime } };
-
-            // The payload dies when the iterator advances, so decode before stepping.
-            cv::Mat image = decode_frame(cam.codec, payload_of(view.message), cam.stream_info.color_format);
-            ++cursor->it;
-
-            if (image.empty()) { continue; } // already logged; skip the bad frame rather than end playback
-
-            return frame_t{
-                .timestamp = timestamp,
-                .image = std::move(image) 
-            };
-        }
-
-        return std::nullopt;
+        return frame;
     }
     catch (const std::exception& e)
     {
-        spdlog::error("recording_reader::fetch_next_frame failed: {}", e.what());
+        spdlog::error("recording_reader::fetch_next_encoded_frame failed: {}", e.what());
         return std::nullopt;
     }
 
@@ -336,7 +353,7 @@ namespace io
         mcap::ReadMessageOptions options{};
         options.startTime = static_cast<mcap::Timestamp>(std::max<int64_t>(0, from.time_since_epoch().count()));
         // Filter to this stream's image topic, so the cursor never touches another stream's
-        // messages and only this stream's frames reach fetch_next_frame().
+        // messages and only this stream's frames reach fetch_next_encoded_frame().
         options.readOrder = mcap::ReadMessageOptions::ReadOrder::LogTimeOrder;
         options.topicFilter = [topic = image_topic(stream_name_of(stream_idx))](const std::string_view t) {
             return t == topic;

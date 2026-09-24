@@ -322,7 +322,7 @@ namespace io
         return to_bytes(builder);
     }
 
-    hw::calibration_t decode_calibration(const std::span<const std::byte> payload) noexcept try
+    hw::calibration_t decode_calibration(const std::span<const std::byte> payload)
     {
         if (!verify_payload(payload, [](flatbuffers::Verifier& v) {
             return foxglove::VerifyCameraCalibrationBuffer(v);
@@ -338,6 +338,9 @@ namespace io
 
         const auto width = static_cast<int>(calib->width());
         const auto height = static_cast<int>(calib->height());
+        if (width <= 0 || height <= 0) {
+            throw std::runtime_error{ "CameraCalibration has no extent" };
+        }
 
         hw::calibration_t out{};
         out.intrinsic = hw::intrinsic_t{
@@ -364,11 +367,6 @@ namespace io
         out.frame_resolution = Eigen::Vector2i{ width, height };
 
         return out;
-    }
-    catch (const std::exception& e)
-    {
-        spdlog::error("decode_calibration failed: {}", e.what());
-        return {};
     }
 
 } // namespace io

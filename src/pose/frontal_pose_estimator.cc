@@ -129,9 +129,12 @@ namespace pose
                     lpf.set_derivate_cutoff(_opt.position_filter.dcutoff_hz);
                 }
 
-                // Reseed on cold start / long gap / smoothing off; else low-pass each axis.
+                // Reseed on cold start / long gap / time running backward / smoothing off; else
+                // low-pass each axis. Time runs backward when a frame from before a seek was
+                // stepped after the reset that the seek raised.
                 if (!_opt.enable_position_smoothing
                     || !fs.last_pos_out.has_value()
+                    || t < fs.last_seen
                     || (t - fs.last_seen) > _opt.reset_gap)
                 {
                     for (auto& lpf : fs.pos_smoother) { lpf.reset(); }
@@ -148,7 +151,7 @@ namespace pose
                 fs.last_seen = t;
                 st.position = fs.last_pos_out;
             }
-            else if (fs.last_pos_out.has_value() && (t - fs.last_seen) <= _opt.max_hold)
+            else if (fs.last_pos_out.has_value() && t >= fs.last_seen && (t - fs.last_seen) <= _opt.max_hold)
             {
                 st.position = fs.last_pos_out; // no fresh detection: hold within the window
             }

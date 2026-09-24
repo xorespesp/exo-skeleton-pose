@@ -10,11 +10,13 @@
 
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <functional>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <bit>
 
 namespace net
@@ -33,6 +35,24 @@ namespace net
             return fb_proto::GetMessage(data);
 #pragma pop_macro("GetMessage")
         }
+
+        std::atomic<bool> g_console_exit_requested{ false };
+        std::atomic<bool> g_console_exit_done{ false };
+
+#ifdef _WIN32
+        BOOL WINAPI on_console_ctrl(const DWORD /*ctrl_type*/)
+        {
+            g_console_exit_requested.store(true);
+
+            // 창 닫기와 시스템 종료는 핸들러가 돌아오는 순간 프로세스를 끝내므로, 정리가 끝날 때까지 여기서 기다린다.
+            // OS 가 주는 유예(약 5 s) 안에서 끊는다.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{ 4500 };
+            while (!g_console_exit_done.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{ 20 });
+            }
+            return TRUE;
+        }
+#endif
 
         // Owns the libuv loop (server lifetime) and the per-listen uWS App + timer.
         // The loop is bound to uWS once and reused across start/stop; the App and timer are
@@ -61,6 +81,9 @@ namespace net
 
             // Block on the loop until it runs out of work. (the listen socket + timer keep it alive)
             void run_blocking() { ::uv_run(&_uv_loop, UV_RUN_DEFAULT); }
+
+            // run_blocking() 을 빠져나오게 한다. 루프 스레드의 콜백 안에서 부른다.
+            void request_exit() { ::uv_stop(&_uv_loop); }
 
             bool is_listening() const { return _is_listening; }
 
@@ -162,7 +185,7 @@ namespace net
 
         uws_event_loop uws_loop;    // uWS loop + listener
         exo_pose_pipeline pipeline; // source + detection + estimator
-        size_t client_count{ 0 };   // connected clients; source released when it hits 0
+        size_t client_count{ 0 };   // connected clients
 
         impl(
             const app::app_config_t& cfg, 
@@ -352,13 +375,6 @@ namespace net
                     --_imp->client_count;
                     spdlog::info("server: client disconnected (code {}{}{})",
                         code, message.empty() ? "" : ": ", message);
-                    // Release the source once the last client leaves so a monitor GUI reflects
-                    // it and a live device is freed.
-                    if (_imp->client_count == 0)
-                    {
-                        _imp->pipeline.close_source();
-                        spdlog::info("server: last client disconnected; source released");
-                    }
                 }
             });
         };
@@ -366,6 +382,10 @@ namespace net
         // ~120 Hz pipeline tick; poll() also drives it, and the shared frame seq makes
         // whichever runs second a no-op.
         const auto on_tick = [this]() {
+            if (g_console_exit_requested.load()) {
+                _imp->uws_loop.request_exit();
+                return;
+            }
             this->_pump_pipeline();
         };
 
@@ -414,6 +434,10 @@ namespace net
             return -1;
         }
 
+#ifdef _WIN32
+        ::SetConsoleCtrlHandler(on_console_ctrl, TRUE);
+#endif
+
         // The configured source comes up with the server, device or recording alike.
         if (!_imp->config.cameras.empty()) {
             spdlog::info("server: auto-opening the configured source");
@@ -426,11 +450,19 @@ namespace net
         // Blocks while the listen socket + timer keep the loop alive.
         // (the timer drives _pump_pipeline())
         _imp->uws_loop.run_blocking();
+        if (g_console_exit_requested.load()) { spdlog::info("server: console asked to exit; shutting down"); }
         this->stop();
+
+        // 카메라를 놓고 녹화 파일을 마감한 뒤에 콘솔 핸들러를 풀어 준다.
+        _imp->pipeline.close_source();
+        g_console_exit_done.store(true);
+#ifdef _WIN32
+        ::SetConsoleCtrlHandler(on_console_ctrl, FALSE);
+#endif
         return 0;
     }
 
-    void exo_pose_server::_pump_pipeline()
+    void exo_pose_server::_pump_pipeline() try
     {
         // poll() consumes the pipeline's per-step signals; broadcast each while the listener is up.
         // A status change (from a client command or a GUI action) is dropped while stopped, since
@@ -460,6 +492,11 @@ namespace net
                 _imp->uws_loop.publish("status", this->_serialize_server_status());
             }
         }
+    }
+    catch (const std::exception& e)
+    {
+        spdlog::error("server: the pipeline step failed: {}; closing the source", e.what());
+        try { _imp->pipeline.close_source(); } catch (...) {}
     }
 
     std::string exo_pose_server::_serialize_pose_frame() const
